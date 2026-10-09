@@ -197,12 +197,17 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             for stage_idx in stage_ids
         }
         recv_input_ids = getattr(self.model, "afd_requires_input_ids", False)
+        # One-hop routed connector: Attention sends top-k ids/weights with the
+        # tokens, FFN runs only the experts it owns on the rows it received.
+        routed = bool(self.connector.is_routed)
         with _ffn_forward_context(self.vllm_config) as forward_context:
             for layer_idx in layer_indices:
                 uses_remote_experts = layer_idx in experts_layer_indices
                 routing_spec = (
                     self.model.get_experts_routing_spec(layer_idx)
-                    if uses_remote_experts and self.afd_config.compute_gate_on_attention
+                    if uses_remote_experts
+                    and self.afd_config.compute_gate_on_attention
+                    and not routed
                     else None
                 )
                 for stage_idx in stage_ids:
@@ -226,7 +231,17 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                         ]
                         forward_context.additional_kwargs["afd_metadata"] = metadata
                         _set_moe_layer_index(forward_context, layer_idx)
-                    if (
+                    if uses_remote_experts and routed:
+                        assert payload.topk_ids is not None
+                        assert payload.topk_weights is not None
+                        rank_ffn_output = self.model.compute_routed_experts_output(
+                            hidden_states,
+                            layer_idx,
+                            payload.topk_weights,
+                            payload.topk_ids,
+                            a1q_scale=payload.a1q_scale,
+                        )
+                    elif (
                         uses_remote_experts
                         and self.afd_config.compute_gate_on_attention
                     ):

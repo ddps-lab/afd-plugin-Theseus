@@ -18,11 +18,13 @@ if TYPE_CHECKING:
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
 CAMP2P_CONNECTOR: Final[str] = "CAMP2pAFDConnector"
+ROUTED_P2P_CONNECTOR: Final[str] = "P2pNcclRoutedAFDConnector"
 AFDRole = Literal["attention", "ffn"]
 
 SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
 SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
+    ROUTED_P2P_CONNECTOR,
     CAMP2P_CONNECTOR,
     AFD_ASYNC_CONNECTOR,
 )
@@ -86,6 +88,12 @@ class AFDConfig:
     @property
     def is_ffn_server(self) -> bool:
         return self.role == "ffn"
+
+    @property
+    def is_routed(self) -> bool:
+        """Whether the one-hop routed connector (tokens go straight to the
+        FFN ranks owning their experts) is selected."""
+        return self.connector == ROUTED_P2P_CONNECTOR
 
     def compute_hash(self) -> str:
         """Return a stable hash for graph-affecting AFD settings."""
@@ -316,6 +324,11 @@ def validate_afd_config(
         from afd_plugin.distributed import validate_p2p_topology
 
         validate_p2p_topology(config)
+    if config.connector == ROUTED_P2P_CONNECTOR and not config.compute_gate_on_attention:
+        raise ValueError(
+            "P2pNcclRoutedAFDConnector routes tokens by their selected experts, "
+            "so the gate must run on Attention: set compute_gate_on_attention=true",
+        )
     if not config.host:
         raise ValueError("AFD host must be non-empty")
     if not 0 < config.port < 65536:
@@ -337,6 +350,7 @@ __all__ = [
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",
     "CAMP2P_CONNECTOR",
+    "ROUTED_P2P_CONNECTOR",
     "SUPPORTED_AFD_CONNECTORS",
     "SUPPORTED_AFD_ROLES",
     "connector_extra_config_from_mapping",

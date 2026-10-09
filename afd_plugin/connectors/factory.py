@@ -91,6 +91,11 @@ AFDConnectorFactory.register_connector(
     "P2pNcclAFDConnector",
 )
 AFDConnectorFactory.register_connector(
+    "P2pNcclRoutedAFDConnector",
+    "afd_plugin.connectors.gpu.routed",
+    "P2pNcclRoutedAFDConnector",
+)
+AFDConnectorFactory.register_connector(
     "CAMP2pAFDConnector",
     "afd_plugin.connectors.npu.camp2p",
     "CAMP2pAFDConnector",

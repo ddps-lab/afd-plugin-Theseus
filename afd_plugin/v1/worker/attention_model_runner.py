@@ -529,10 +529,19 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
 
 def fail_if_unsupported_ubatching(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
+    if not bool(parallel_config.use_ubatching):
+        return
     num_ubatches = int(parallel_config.num_ubatches)
-    if bool(vllm_config.parallel_config.use_ubatching) and num_ubatches != 2:
+    if num_ubatches < 2:
         raise RuntimeError(
-            "AFD ubatching currently supports exactly two ubatches; "
+            f"AFD ubatching needs at least two ubatches; got num_ubatches={num_ubatches}",
+        )
+    # ``--enable-dbo`` is exactly two ubatches; ``--ubatch-size N`` selects N.
+    # More than two ubatches are only supported in eager mode: the CUDA graph
+    # path captures exactly two ubatch streams.
+    if num_ubatches != 2 and not bool(vllm_config.model_config.enforce_eager):
+        raise RuntimeError(
+            "AFD ubatching with more than two ubatches requires --enforce-eager; "
             f"got num_ubatches={num_ubatches}",
         )
 
