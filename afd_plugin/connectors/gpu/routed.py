@@ -17,8 +17,9 @@ Topology:
     Attention ranks own no experts. Any ``A`` and ``F`` are allowed.
 
 Data plane (per MoE layer and micro-batch stage):
-    1. Attention computes gate + top-k, quantizes the activations when the
-       model's quantization allows it (fp8 with block scales), then runs the
+    1. Attention computes gate + top-k, quantizes the activations only when
+       the FFN experts kernel wants fp8 inputs that Attention can reproduce
+       (see "Wire format" below), then runs the
        engine's plan (one count exchange, the only host sync) and dispatch on
        the *dispatch* communicator.
     2. FFN receives ``[hidden, topk_ids, topk_weights(, scale)]`` rows, runs
@@ -49,10 +50,13 @@ Requirements and limitations:
     - Attention role: ``compute_gate_on_attention=true``. With TP>1 every
       TP rank dispatches a token slice and the result is all-gathered
       (unverified).
-    - Attention-side quantization before dispatch is implemented for fp8
-      checkpoints with dynamic block-scaled activations (``Fp8Config`` with
-      ``weight_block_size``). Other quantizations send the model dtype and
-      quantize on the FFN rank.
+    - Wire format: FFN role rank 0 derives it at init from the experts
+      kernel it actually loaded and broadcasts it; Attention follows it and
+      the other FFN ranks check theirs matches. Attention quantizes before
+      the dispatch only for fp8 with dynamic per-token-group (block) or
+      per-token scales; every other case (W8A16 such as Marlin, unquantized,
+      static or per-tensor scales, int8, nvfp4/mxfp4, kernels that quantize
+      internally) sends the model dtype and the FFN quantizes after receive.
 """
 
 from __future__ import annotations
@@ -73,8 +77,6 @@ from vllm.distributed.device_communicators.p2p_nccl_all2all import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import (
     dbo_switch_to_compute,
@@ -155,20 +157,71 @@ class RoutedWireSpec:
     block_shape: tuple[int, int] | None
     # Trailing shape of the per-token scale rows, None when no scale travels.
     scale_tail: tuple[int, ...] | None
+    # Per-token (one scale per row) instead of per-token-group (block) scales.
+    per_token_quant: bool = False
 
     @property
     def quantize_on_attention(self) -> bool:
         return self.quant_dtype is not None
 
+    @property
+    def quant_mode(self) -> str:
+        if self.quant_dtype is None:
+            return "none"
+        return "per_token" if self.per_token_quant else "block"
+
+    def model_fields(self) -> tuple:
+        return (self.hidden_size, self.top_k, self.num_experts, self.model_dtype)
+
     def encode(self) -> list[int]:
+        mode = {"none": 0, "block": 1, "per_token": 2}[self.quant_mode]
         return [
             self.hidden_size,
             self.top_k,
             self.num_experts,
+            _WIRE_DTYPES.index(self.model_dtype),
             _WIRE_DTYPES.index(self.act_dtype),
-            self.scale_tail[0] if self.scale_tail else -1,
+            mode,
+            self.block_shape[0] if self.block_shape else -1,
             self.block_shape[1] if self.block_shape else -1,
+            self.scale_tail[0] if self.scale_tail else -1,
         ]
+
+    @classmethod
+    def decode(cls, values: list[int]) -> RoutedWireSpec:
+        hidden, top_k, num_experts, mdt, adt, mode, bn, bk, tail = (
+            int(v) for v in values
+        )
+        model_dtype = _WIRE_DTYPES[mdt]
+        if mode == 0:
+            return _unquantized_spec(hidden, top_k, num_experts, model_dtype)
+        act_dtype = _WIRE_DTYPES[adt]
+        return cls(
+            hidden_size=hidden,
+            top_k=top_k,
+            num_experts=num_experts,
+            model_dtype=model_dtype,
+            act_dtype=act_dtype,
+            quant_dtype=act_dtype,
+            block_shape=(bn, bk) if mode == 1 else None,
+            scale_tail=(tail,),
+            per_token_quant=mode == 2,
+        )
+
+
+def _unquantized_spec(
+    hidden_size: int, top_k: int, num_experts: int, model_dtype: torch.dtype
+) -> RoutedWireSpec:
+    return RoutedWireSpec(
+        hidden_size=hidden_size,
+        top_k=top_k,
+        num_experts=num_experts,
+        model_dtype=model_dtype,
+        act_dtype=model_dtype,
+        quant_dtype=None,
+        block_shape=None,
+        scale_tail=None,
+    )
 
 
 def _num_routed_experts(text_config: PretrainedConfig) -> int:
@@ -180,61 +233,111 @@ def _num_routed_experts(text_config: PretrainedConfig) -> int:
     raise RuntimeError("cannot determine the number of routed experts")
 
 
-def _attention_quant_plan(
-    quant_config: QuantizationConfig | None,
-) -> tuple[torch.dtype, tuple[int, int]] | None:
-    """Return ``(quant_dtype, block_shape)`` when Attention can quantize.
-
-    Only fp8 with dynamic block-scaled activations is quantized on Attention:
-    its per-token-group scales travel with the tokens. Static input scales
-    live in the expert weights (not loaded on Attention) and dynamic
-    per-tensor scales depend on the whole batch, so those checkpoints send the
-    model dtype and the FFN rank quantizes, as vLLM's DeepEP backend does.
-    """
-    if not isinstance(quant_config, Fp8Config):
-        return None
-    if quant_config.activation_scheme != "dynamic":
-        return None
-    block_shape = quant_config.weight_block_size
-    if not block_shape:
-        return None
-    return current_platform.fp8_dtype(), (int(block_shape[0]), int(block_shape[1]))
-
-
 def resolve_wire_spec(vllm_config: VllmConfig) -> RoutedWireSpec:
+    """Model-level part of the wire spec, without quantization.
+
+    Both roles derive it from their own config. The quantization part is
+    decided by FFN role rank 0 at init (``ffn_wire_spec``) because only the
+    FFN role holds the experts kernel and knows which inputs it wants.
+    """
     text_config = vllm_config.model_config.hf_text_config
-    hidden_size = int(text_config.hidden_size)
-    top_k = int(text_config.num_experts_per_tok)
-    num_experts = _num_routed_experts(text_config)
-    model_dtype = vllm_config.model_config.dtype
-    plan = _attention_quant_plan(vllm_config.quant_config)
+    return _unquantized_spec(
+        int(text_config.hidden_size),
+        int(text_config.num_experts_per_tok),
+        _num_routed_experts(text_config),
+        vllm_config.model_config.dtype,
+    )
+
+
+def _find_moe_kernels(model: Any) -> list[Any]:
+    """The modular MoE kernels of a loaded model (one per MoE layer)."""
+    root = model
+    for _ in range(4):
+        if isinstance(root, torch.nn.Module):
+            break
+        root = (
+            getattr(root, "runnable", None)
+            or getattr(root, "model", None)
+            or getattr(root, "module", None)
+        )
+    if not isinstance(root, torch.nn.Module):
+        raise RuntimeError(f"cannot find the FFN model module in {type(model)}")
+    kernels: list[Any] = []
+    for module in root.modules():
+        quant_method = getattr(module, "quant_method", None)
+        kernel = getattr(quant_method, "moe_kernel", None)
+        if kernel is not None and all(kernel is not k for k in kernels):
+            kernels.append(kernel)
+    return kernels
+
+
+def _kernel_wire_plan(
+    kernel: Any,
+) -> tuple[torch.dtype, tuple[int, int] | None, bool] | None:
+    """``(fp8 dtype, block shape, per_token)`` if Attention may quantize.
+
+    Mirrors the non-AFD ``p2p_nccl`` rule (quantize before the dispatch only
+    when the scales travel per row), restricted to what Attention can
+    reproduce without FFN state: fp8 with dynamic per-token-group or
+    per-token scales. Static scales live in the FFN weights, per-tensor
+    scales depend on the FFN's whole batch, and kernels that quantize
+    internally want the model dtype.
+    """
+    fused_experts = kernel.fused_experts
+    if fused_experts.expects_unquantized_inputs:
+        return None
+    qc = fused_experts.quant_config
+    quant_dtype = qc.quant_dtype
+    if quant_dtype is None or isinstance(quant_dtype, str):
+        return None
+    if quant_dtype != current_platform.fp8_dtype() or qc.a1_scale is not None:
+        return None
+    if qc.block_shape is not None and not qc.per_act_token_quant:
+        return quant_dtype, (int(qc.block_shape[0]), int(qc.block_shape[1])), False
+    if qc.per_act_token_quant and qc.block_shape is None:
+        return quant_dtype, None, True
+    return None
+
+
+def ffn_wire_spec(base: RoutedWireSpec, model: Any) -> RoutedWireSpec:
+    """Wire spec the FFN experts kernel of ``model`` wants (FFN role only)."""
+    kernels = _find_moe_kernels(model)
+    if not kernels:
+        raise RuntimeError("routed AFD FFN role: the model has no MoE kernels")
+    plans = {_kernel_wire_plan(k) for k in kernels}
+    if len(plans) != 1:
+        # Layers disagree: send the model dtype, each layer quantizes itself.
+        logger.warning(
+            "routed AFD: MoE layers want different input quantizations %s; "
+            "sending %s and quantizing on the FFN rank",
+            plans,
+            base.model_dtype,
+        )
+        return base
+    plan = plans.pop()
     if plan is None:
-        return RoutedWireSpec(
-            hidden_size=hidden_size,
-            top_k=top_k,
-            num_experts=num_experts,
-            model_dtype=model_dtype,
-            act_dtype=model_dtype,
-            quant_dtype=None,
-            block_shape=None,
-            scale_tail=None,
-        )
-    quant_dtype, block_shape = plan
-    block_k = block_shape[1]
-    if hidden_size % block_k != 0:
-        raise RuntimeError(
-            f"hidden size {hidden_size} is not a multiple of the fp8 block "
-            f"size {block_k}",
-        )
+        return base
+    quant_dtype, block_shape, per_token = plan
+    if block_shape is not None:
+        block_k = block_shape[1]
+        if base.hidden_size % block_k != 0:
+            raise RuntimeError(
+                f"hidden size {base.hidden_size} is not a multiple of the fp8 "
+                f"block size {block_k}",
+            )
+        scale_tail = (base.hidden_size // block_k,)
+    else:
+        scale_tail = (1,)
     return RoutedWireSpec(
-        hidden_size=hidden_size,
-        top_k=top_k,
-        num_experts=num_experts,
-        model_dtype=model_dtype,
+        hidden_size=base.hidden_size,
+        top_k=base.top_k,
+        num_experts=base.num_experts,
+        model_dtype=base.model_dtype,
         act_dtype=quant_dtype,
         quant_dtype=quant_dtype,
         block_shape=block_shape,
-        scale_tail=(hidden_size // block_k,),
+        scale_tail=scale_tail,
+        per_token_quant=per_token,
     )
 
 
@@ -335,8 +438,11 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         # AFD world: FFN ranks first, then Attention ranks.
         self.world_rank = role_rank if self.is_ffn else self.ffn_size + role_rank
         self.device = torch.device(f"cuda:{local_rank}")
+        # Model-level fields only; init_afd_connector() fills in the
+        # quantization that FFN role rank 0 derives from its experts kernel.
         self.spec = resolve_wire_spec(vllm_config)
         _validate_routed_runtime(vllm_config, afd_config, self.spec)
+        self._ffn_model: Any | None = None
         self.num_local_experts = self.spec.num_experts // self.ffn_size
         self.max_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
 
@@ -363,6 +469,10 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         self.control_plane = P2pNcclRoutedControlPlane(self)
 
     # ------------------------------------------------------------ lifecycle
+    def bind_ffn_model(self, model: Any) -> None:
+        """FFN role: hand over the loaded model before init_afd_connector()."""
+        self._ffn_model = model
+
     def close(self) -> None:
         # Like the two-hop connector, the NCCL groups are left to process
         # teardown; destroying them here can hang when peers already exited.
@@ -409,7 +519,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                 group_name="afd_routed_control",
                 timeout=timedelta(minutes=30),
             )
-        self._check_wire_spec()
+        self._exchange_wire_spec()
         self.engine = P2pAll2AllEngine(
             group=self.dispatch_pg,
             rank=self.world_rank,
@@ -444,7 +554,8 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             )
         logger.info(
             "routed AFD connector ready: role=%s role_rank=%d world_rank=%d/%d "
-            "experts=%d (%d local per FFN rank) top_k=%d wire=%s scale_tail=%s",
+            "experts=%d (%d local per FFN rank) top_k=%d wire=%s quant=%s "
+            "scale_tail=%s",
             self.afd_config.role,
             self.role_rank,
             self.world_rank,
@@ -453,23 +564,45 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             self.num_local_experts,
             spec.top_k,
             spec.act_dtype,
+            spec.quant_mode,
             spec.scale_tail,
         )
         self._initialized = True
 
-    def _check_wire_spec(self) -> None:
-        """Compare this rank's wire spec with Attention role rank 0's."""
+    def _exchange_wire_spec(self) -> None:
+        """Adopt the wire spec of FFN role rank 0 (world rank 0).
+
+        FFN ranks derive the spec from the experts kernel they loaded; the
+        other ranks only check the model-level fields. FFN ranks must agree
+        with rank 0 (same kernel everywhere).
+        """
         assert self.dispatch_pg is not None
-        mine = torch.tensor(self.spec.encode(), dtype=torch.int64, device=self.device)
-        reference = mine.clone()
-        dist.broadcast(reference, src=self.ffn_size, group=self.dispatch_pg)
-        if not torch.equal(reference.cpu(), mine.cpu()):
+        base = self.spec
+        if self.is_ffn:
+            if self._ffn_model is None:
+                raise RuntimeError(
+                    "routed AFD FFN role: bind_ffn_model() must be called "
+                    "before init_afd_connector()",
+                )
+            mine = ffn_wire_spec(base, self._ffn_model)
+        else:
+            mine = base
+        reference = torch.tensor(mine.encode(), dtype=torch.int64, device=self.device)
+        dist.broadcast(reference, src=0, group=self.dispatch_pg)
+        spec = RoutedWireSpec.decode(reference.cpu().tolist())
+        if spec.model_fields() != base.model_fields():
             raise RuntimeError(
-                "routed AFD wire spec mismatch: attention rank 0 has "
-                f"{reference.tolist()} but this rank derived {mine.tolist()} "
-                "(hidden, top_k, num_experts, dtype, scale_tail, block_k); "
-                "check that both roles use the same model and quantization",
+                "routed AFD wire spec mismatch: FFN rank 0 has (hidden, top_k, "
+                f"num_experts, dtype)={spec.model_fields()} but this rank has "
+                f"{base.model_fields()}; check that both roles serve the same model",
             )
+        if self.is_ffn and spec != mine:
+            raise RuntimeError(
+                f"routed AFD: FFN rank 0 wants wire {spec} but FFN rank "
+                f"{self.role_rank} derived {mine}; all FFN ranks must load the "
+                "same experts kernel (check --kernel-config and GPU types)",
+            )
+        self.spec = spec
 
     @property
     def is_initialized(self) -> bool:
@@ -484,13 +617,12 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         spec = self.spec
         if not spec.quantize_on_attention:
             return hidden_states, None
-        assert spec.block_shape is not None
         a1q, a1q_scale = moe_kernel_quantize_input(
             hidden_states,
             None,
             quant_dtype=spec.quant_dtype,
-            per_act_token_quant=False,
-            block_shape=list(spec.block_shape),
+            per_act_token_quant=spec.per_token_quant,
+            block_shape=list(spec.block_shape) if spec.block_shape else None,
             is_scale_swizzled=False,
         )
         return a1q, a1q_scale
@@ -780,5 +912,6 @@ __all__ = [
     "P2pNcclRoutedControlPlane",
     "RoutedTransferState",
     "RoutedWireSpec",
+    "ffn_wire_spec",
     "resolve_wire_spec",
 ]

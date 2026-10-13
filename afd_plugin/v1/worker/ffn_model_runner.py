@@ -103,6 +103,11 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         return self.model
 
     def initialize_afd_connector(self) -> None:
+        # The routed connector decides the wire format from the experts kernel
+        # this FFN rank loaded, so it needs the model before the handshake.
+        bind_ffn_model = getattr(self.connector, "bind_ffn_model", None)
+        if bind_ffn_model is not None:
+            bind_ffn_model(self.model)
         self.connector.init_afd_connector()
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
