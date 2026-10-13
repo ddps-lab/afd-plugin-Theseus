@@ -62,6 +62,8 @@ Requirements and limitations:
 from __future__ import annotations
 
 import os
+import socket
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -492,6 +494,8 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         if self._initialized:
             return
         init_method = f"tcp://{self.afd_config.host}:{self.afd_config.port}"
+        if self.world_rank != 0:
+            self._wait_for_rendezvous()
         self.dispatch_pg = init_afd_process_group(
             backend="nccl",
             init_method=init_method,
@@ -568,6 +572,29 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             spec.scale_tail,
         )
         self._initialized = True
+
+    def _wait_for_rendezvous(self) -> None:
+        """Wait until FFN role rank 0 opens the rendezvous port.
+
+        The roles reach init_afd_connector at different times: Attention
+        loads only the attention weights, FFN loads the experts and profiles
+        first. The process groups use a short timeout so that a stalled peer
+        is detected quickly during serving; only this initial wait is long.
+        """
+        host, port = self.afd_config.host, int(self.afd_config.port)
+        wait_s = float(os.environ.get("AFD_RENDEZVOUS_WAIT_S", "1800"))
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                with socket.create_connection((host, port), timeout=5):
+                    return
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"routed AFD: rendezvous {host}:{port} did not open within "
+                        f"{wait_s:.0f}s (FFN role rank 0 not up?)",
+                    ) from None
+                time.sleep(2)
 
     def _exchange_wire_spec(self) -> None:
         """Adopt the wire spec of FFN role rank 0 (world rank 0).

@@ -215,6 +215,15 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     and not routed
                     else None
                 )
+                if uses_remote_experts and routed:
+                    rank_ffn_output = self._run_routed_layer(
+                        layer_idx,
+                        stage_ids,
+                        ffn_dp_metadata_list,
+                        forward_context,
+                        recv_input_ids,
+                    )
+                    continue
                 for stage_idx in stage_ids:
                     recv_kwargs: dict[str, Any] = {}
                     if routing_spec is not None:
@@ -264,6 +273,50 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                             input_ids=payload.input_ids,
                         )
                     self.connector.send_ffn_output(rank_ffn_output, context)
+        return rank_ffn_output
+
+    def _run_routed_layer(
+        self,
+        layer_idx: int,
+        stage_ids: list[int],
+        ffn_dp_metadata_list: dict[int, Any],
+        forward_context: Any,
+        recv_input_ids: bool,
+    ) -> torch.Tensor:
+        """One MoE layer of the routed connector: receive every stage first.
+
+        The Attention ranks' micro-batch schedule dispatches all stages of a
+        layer before it combines any of them. The dispatch and combine NCCL
+        communicators must see their operations in the same order on every
+        rank, otherwise a combine kernel waiting for a peer can block the
+        dispatch the peer is waiting for (deadlock with >= 2 stages). So the
+        FFN receives all stages, then computes and returns them in order.
+        """
+        recv_kwargs: dict[str, Any] = {"recv_input_ids": True} if recv_input_ids else {}
+        payloads = [
+            (stage_idx, self.connector.recv_attn_output(ubatch_idx=stage_idx, **recv_kwargs))
+            for stage_idx in stage_ids
+        ]
+        rank_ffn_output = None
+        for stage_idx, payload in payloads:
+            metadata = payload.context.metadata
+            metadata.layer_idx = layer_idx
+            metadata.stage_idx = stage_idx
+            if forward_context is not None:
+                forward_context.dp_metadata = ffn_dp_metadata_list[stage_idx]
+                forward_context.additional_kwargs["afd_metadata"] = metadata
+                _set_moe_layer_index(forward_context, layer_idx)
+            assert payload.topk_ids is not None
+            assert payload.topk_weights is not None
+            rank_ffn_output = self.model.compute_routed_experts_output(
+                payload.hidden_states,
+                layer_idx,
+                payload.topk_weights,
+                payload.topk_ids,
+                a1q_scale=payload.a1q_scale,
+            )
+            self.connector.send_ffn_output(rank_ffn_output, payload.context)
+        assert rank_ffn_output is not None
         return rank_ffn_output
 
     def _execute_eager_mode(
