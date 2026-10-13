@@ -283,22 +283,19 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         forward_context: Any,
         recv_input_ids: bool,
     ) -> torch.Tensor:
-        """One MoE layer of the routed connector: receive every stage first.
+        """One MoE layer of the routed connector: per stage receive, compute, return.
 
-        The Attention ranks' micro-batch schedule dispatches all stages of a
-        layer before it combines any of them. The dispatch and combine NCCL
-        communicators must see their operations in the same order on every
-        rank, otherwise a combine kernel waiting for a peer can block the
-        dispatch the peer is waiting for (deadlock with >= 2 stages). So the
-        FFN receives all stages, then computes and returns them in order.
+        Each stage's partial sums go back as soon as they are computed. The
+        Attention side posts the receive for stage i right after dispatching
+        it, so both roles issue dispatch(i), combine(i), dispatch(i+1), ... in
+        the same order on the two NCCL communicators (no cross-communicator
+        deadlock), and stage i's expert compute overlaps the Attention side's
+        work on the later stages.
         """
         recv_kwargs: dict[str, Any] = {"recv_input_ids": True} if recv_input_ids else {}
-        payloads = [
-            (stage_idx, self.connector.recv_attn_output(ubatch_idx=stage_idx, **recv_kwargs))
-            for stage_idx in stage_ids
-        ]
         rank_ffn_output = None
-        for stage_idx, payload in payloads:
+        for stage_idx in stage_ids:
+            payload = self.connector.recv_attn_output(ubatch_idx=stage_idx, **recv_kwargs)
             metadata = payload.context.metadata
             metadata.layer_idx = layer_idx
             metadata.stage_idx = stage_idx

@@ -82,7 +82,7 @@ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import (
     dbo_switch_to_compute,
-    dbo_yield_and_switch_from_comm_to_compute,
+    dbo_yield,
     dbo_yield_and_switch_from_compute_to_comm,
 )
 
@@ -107,7 +107,8 @@ from afd_plugin.distributed import init_afd_process_group
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-logger = init_logger(__name__)
+# Under the ``vllm`` namespace: vLLM only configures handlers for ``vllm.*``.
+logger = init_logger(f"vllm.{__name__}")
 
 # DEBUG(p2p_nccl): remove after GPU validation. VLLM_P2P_NCCL_DEBUG=1 logs the
 # first stages of every step (counts, bytes, host wait) on both roles.
@@ -454,6 +455,9 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         self.engine: P2pAll2AllEngine | None = None
         # Attention: plans of the stages whose dispatch is in flight.
         self._plans: dict[int, P2pAll2AllPlan] = {}
+        # Attention: stage -> (plan, result buffer, result-received event).
+        self._pending: dict[int, tuple[P2pAll2AllPlan, torch.Tensor, torch.cuda.Event]] = {}
+        self._result_stream: torch.cuda.Stream | None = None
         self._empty_partial: torch.Tensor | None = None
         # FFN: one CUDA stream per stage plus per-communicator ordering chains.
         self._stage_streams: dict[int, torch.cuda.Stream] = {}
@@ -480,6 +484,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         # teardown; destroying them here can hang when peers already exited.
         self.engine = None
         self._plans.clear()
+        self._pending.clear()
         self._stage_streams.clear()
         self._dispatch_chain = None
         self._combine_chain = None
@@ -705,7 +710,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             tensors.append(a1q_scale.to(_SCALE_DTYPE))
 
         stage = int(context.metadata.stage_idx)
-        if stage in self._plans:
+        if stage in self._pending:
             raise RuntimeError(f"stage {stage} already has a dispatch in flight")
         engine = self.engine
         pending = engine.begin_plan(tensors[1], slot=stage)
@@ -716,7 +721,21 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         engine.exchange_counts(pending)
         plan = engine.finish_plan(pending)
         engine.dispatch(plan, tuple(tensors))
-        self._plans[stage] = plan
+        # Post this stage's result receive right away, on its own stream, and
+        # use the result only when the stage needs it (recv_ffn_output). Every
+        # rank then issues dispatch(i), combine(i), dispatch(i+1), ... in the
+        # same order across the two NCCL communicators (no cross-communicator
+        # deadlock), and the FFN can return stage i as soon as it is computed
+        # while this rank keeps dispatching and computing the other stages
+        # (ping-pong / 3BO pipeline, as in MegaScale-Infer and Step-3).
+        result_stream = self._attn_result_stream()
+        result_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(result_stream):
+            assert self._empty_partial is not None
+            back = engine.combine_send(plan, self._empty_partial)
+            received = torch.cuda.Event()
+            received.record(result_stream)
+        self._pending[stage] = (plan, back, received)
         # Back to the compute stream without waiting for the dispatch: the
         # shared experts can run while the rows are on the wire.
         dbo_switch_to_compute()
@@ -749,21 +768,29 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         """
         if self.engine is None:
             raise RuntimeError("routed connector is not initialized")
-        plan = self._plans.pop(int(ubatch_idx), None)
-        if plan is None:
+        pending = self._pending.pop(int(ubatch_idx), None)
+        if pending is None:
             raise RuntimeError(f"no dispatch in flight for stage {ubatch_idx}")
+        plan, back, received = pending
         if ref_tensor.shape[0] != plan.num_tokens:
             raise ValueError(
                 f"ref_tensor has {ref_tensor.shape[0]} rows, stage {ubatch_idx} "
                 f"dispatched {plan.num_tokens}",
             )
-        assert self._empty_partial is not None
         output = torch.empty_like(ref_tensor)
-        dbo_yield_and_switch_from_compute_to_comm()
-        back = self.engine.combine_send(plan, self._empty_partial)
+        # Let the other micro-batches dispatch and compute while this stage's
+        # results travel back; the receive itself was posted at dispatch time.
+        dbo_yield()
+        compute = torch.cuda.current_stream(self.device)
+        compute.wait_event(received)
+        back.record_stream(compute)
         self.engine.combine_accumulate(plan, back, output)
-        dbo_yield_and_switch_from_comm_to_compute()
         return output
+
+    def _attn_result_stream(self) -> torch.cuda.Stream:
+        if self._result_stream is None:
+            self._result_stream = torch.cuda.Stream(device=self.device)
+        return self._result_stream
 
     # ------------------------------------------------------- ffn data path
     def _stage_stream(self, stage: int) -> torch.cuda.Stream:
