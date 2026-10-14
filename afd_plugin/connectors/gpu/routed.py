@@ -81,9 +81,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import (
+    dbo_enabled,
+    dbo_switch_to_comm_sync,
     dbo_switch_to_compute,
     dbo_yield,
-    dbo_yield_and_switch_from_compute_to_comm,
 )
 
 from afd_plugin.config import AFDConfig
@@ -133,7 +134,8 @@ _WIRE_DTYPES: tuple[torch.dtype, ...] = tuple(
 
 
 def _should_log(n: int) -> bool:
-    return n < 8 or n % 64 == 0
+    # A prime period samples every micro-batch index (64 hit only stage 0 at 4).
+    return n < 8 or n % 61 == 0
 
 
 # ==============================
@@ -400,6 +402,23 @@ class RoutedTransferState(AFDTransferState):
     stream: torch.cuda.Stream
 
 
+@dataclass(frozen=True)
+class RoutedPrefetch:
+    """FFN-side receive of one stage, posted but not yet waited on.
+
+    Returned by ``prefetch_attn_output`` and consumed by ``recv_attn_output``.
+    ``received`` holds the per-tensor receive buffers (valid until the next
+    dispatch on the same stage), ``ready`` is recorded on ``stream`` right
+    after the receive.
+    """
+
+    stage: int
+    plan: P2pAll2AllPlan
+    received: list[torch.Tensor]
+    stream: torch.cuda.Stream
+    ready: torch.cuda.Event
+
+
 # ==============================
 # Connector
 # ==============================
@@ -458,6 +477,11 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         # Attention: stage -> (plan, result buffer, result-received event).
         self._pending: dict[int, tuple[P2pAll2AllPlan, torch.Tensor, torch.cuda.Event]] = {}
         self._result_stream: torch.cuda.Stream | None = None
+        # Attention: (stage, plan) whose result receive waits for the next
+        # dispatch (see send_attn_output), and the last MoE layer of a forward
+        # (set by the Attention model runner after loading the model).
+        self._deferred_result: tuple[int, P2pAll2AllPlan] | None = None
+        self._last_moe_layer: int | None = None
         self._empty_partial: torch.Tensor | None = None
         # FFN: one CUDA stream per stage plus per-communicator ordering chains.
         self._stage_streams: dict[int, torch.cuda.Stream] = {}
@@ -485,6 +509,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         self.engine = None
         self._plans.clear()
         self._pending.clear()
+        self._deferred_result = None
         self._stage_streams.clear()
         self._dispatch_chain = None
         self._combine_chain = None
@@ -714,28 +739,48 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             raise RuntimeError(f"stage {stage} already has a dispatch in flight")
         engine = self.engine
         pending = engine.begin_plan(tensors[1], slot=stage)
-        # Dual batch overlap: give the CPU to the other micro-batch while the
-        # counts travel, and run the collectives on the communication stream.
-        # Without ubatching these calls are no-ops.
-        dbo_yield_and_switch_from_compute_to_comm()
+        # Each micro-batch runs its count exchange and dispatch within its own
+        # turn and gives the CPU away once, in recv_ffn_output (send, then
+        # yield, as vLLM's DBO does with DeepEP low-latency). The next layer's
+        # first dispatch therefore precedes the previous layer's last result,
+        # which lets the FFN prefetch across layers (see below), and every
+        # micro-batch thread yields the same number of times. The comm stream
+        # waits for this micro-batch's compute before the count exchange.
+        dbo_switch_to_comm_sync()
         engine.exchange_counts(pending)
         plan = engine.finish_plan(pending)
         engine.dispatch(plan, tuple(tensors))
-        # Post this stage's result receive right away, on its own stream, and
-        # use the result only when the stage needs it (recv_ffn_output). Every
-        # rank then issues dispatch(i), combine(i), dispatch(i+1), ... in the
-        # same order across the two NCCL communicators (no cross-communicator
-        # deadlock), and the FFN can return stage i as soon as it is computed
-        # while this rank keeps dispatching and computing the other stages
-        # (ping-pong / 3BO pipeline, as in MegaScale-Infer and Step-3).
-        result_stream = self._attn_result_stream()
-        result_stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(result_stream):
-            assert self._empty_partial is not None
-            back = engine.combine_send(plan, self._empty_partial)
-            received = torch.cuda.Event()
-            received.record(result_stream)
-        self._pending[stage] = (plan, back, received)
+        # Result receives, posted on their own stream and consumed only when
+        # the stage needs them (recv_ffn_output). The FFN posts the receive
+        # of the next stage before it launches the experts of the current
+        # one (so those rows travel while the current stage is computed),
+        # also across layers, and returns the current stage after that.
+        # Every rank must launch the NCCL operations of the two communicators
+        # in the same order, so the receive of a stage is posted right after
+        # the next dispatch; only the last stage of the last MoE layer (and a
+        # forward without micro-batches) posts its own right away:
+        #   D0 D1 C0 D2 C1 | D0' C2 D1' C0' D2' C1' | ... C2''
+        num_stages = max(1, len(self.dp_metadata_list)) if dbo_enabled() else 1
+        deferred = self._deferred_result
+        self._deferred_result = None
+        if deferred is not None:
+            expected = stage - 1 if stage > 0 else num_stages - 1
+            if deferred[0] != expected:
+                raise RuntimeError(
+                    f"stage {stage} dispatched after stage {deferred[0]}; "
+                    "stages must be dispatched in order",
+                )
+            self._post_result_recv(*deferred)
+        if stage + 1 < num_stages:
+            self._deferred_result = (stage, plan)
+        elif num_stages > 1 and int(context.metadata.layer_idx) != self._last_moe_layer:
+            if self._last_moe_layer is None:
+                raise RuntimeError(
+                    "routed connector needs set_moe_layer_indices() with micro-batches",
+                )
+            self._deferred_result = (stage, plan)
+        else:
+            self._post_result_recv(stage, plan)
         # Back to the compute stream without waiting for the dispatch: the
         # shared experts can run while the rows are on the wire.
         dbo_switch_to_compute()
@@ -755,6 +800,24 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             )
         self._num_sends += 1
 
+    def set_moe_layer_indices(self, layer_indices: Any) -> None:
+        """Record the MoE layers of the model (the last one ends a forward)."""
+        indices = [int(idx) for idx in layer_indices]
+        self._last_moe_layer = max(indices) if indices else None
+
+    def _post_result_recv(self, stage: int, plan: P2pAll2AllPlan) -> None:
+        """Post the receive of ``stage``'s partial sums on the result stream."""
+        assert self.engine is not None and self._empty_partial is not None
+        result_stream = self._attn_result_stream()
+        # Ordered after everything launched so far on the communication
+        # stream, so the GPU runs the NCCL operations in launch order.
+        result_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(result_stream):
+            back = self.engine.combine_send(plan, self._empty_partial)
+            received = torch.cuda.Event()
+            received.record(result_stream)
+        self._pending[stage] = (plan, back, received)
+
     def recv_ffn_output(
         self,
         ref_tensor: torch.Tensor,
@@ -768,6 +831,12 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         """
         if self.engine is None:
             raise RuntimeError("routed connector is not initialized")
+        # Let the other micro-batches compute and dispatch while this stage's
+        # results travel back. The receive of this stage is posted by the next
+        # dispatch: the next stage's in the same layer, or for the last stage
+        # the first stage's of the next layer. Both run in the turns of the
+        # other micro-batches before this one gets the CPU back.
+        dbo_yield()
         pending = self._pending.pop(int(ubatch_idx), None)
         if pending is None:
             raise RuntimeError(f"no dispatch in flight for stage {ubatch_idx}")
@@ -778,12 +847,12 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                 f"dispatched {plan.num_tokens}",
             )
         output = torch.empty_like(ref_tensor)
-        # Let the other micro-batches dispatch and compute while this stage's
-        # results travel back; the receive itself was posted at dispatch time.
-        dbo_yield()
         compute = torch.cuda.current_stream(self.device)
         compute.wait_event(received)
+        # ``perm`` was allocated on the communication stream; the plan may be
+        # released before the compute stream reads it below.
         back.record_stream(compute)
+        plan.perm.record_stream(compute)
         self.engine.combine_accumulate(plan, back, output)
         return output
 
@@ -800,16 +869,14 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             self._stage_streams[stage] = stream
         return stream
 
-    def recv_attn_output(
-        self,
-        ubatch_idx: int = 0,
-        **kwargs: Any,
-    ) -> AFDA2FTransferPayload:
-        """Receive the rows routed to this FFN rank for one stage.
+    def prefetch_attn_output(self, ubatch_idx: int = 0) -> RoutedPrefetch:
+        """Run the count exchange of one stage and post its dispatch receive.
 
-        Runs the count exchange and the dispatch on the stage's own CUDA
-        stream (chained after the previous stage's dispatch) and makes the
-        current stream wait for the data.
+        Both run on the stage's own CUDA stream, chained after the previous
+        stage's receive so every rank keeps the same NCCL order. The current
+        stream does not wait: the FFN posts stage i+1 before it launches the
+        experts of stage i, so the rows of i+1 travel while i is computed.
+        ``recv_attn_output`` makes the compute stream wait for them.
         """
         if self.engine is None or self._empty_send is None:
             raise RuntimeError("routed connector is not initialized")
@@ -823,13 +890,9 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             engine.exchange_counts(pending)
             plan = engine.finish_plan(pending)
             received = engine.dispatch(plan, self._empty_send)
-            chain = torch.cuda.Event()
-            chain.record(stream)
-            self._dispatch_chain = chain
-        torch.cuda.current_stream(self.device).wait_stream(stream)
-
-        hidden_states, topk_ids, topk_weights = received[0], received[1], received[2]
-        a1q_scale = received[3] if self.spec.scale_tail is not None else None
+            ready = torch.cuda.Event()
+            ready.record(stream)
+            self._dispatch_chain = ready
         # DEBUG(p2p_nccl): remove after GPU validation.
         if _DEBUG and _should_log(self._num_recvs):
             logger.info(
@@ -842,6 +905,34 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                 plan.host_wait_ms,
             )
         self._num_recvs += 1
+        return RoutedPrefetch(
+            stage=stage, plan=plan, received=received, stream=stream, ready=ready,
+        )
+
+    def recv_attn_output(
+        self,
+        ubatch_idx: int = 0,
+        prefetched: RoutedPrefetch | None = None,
+        **kwargs: Any,
+    ) -> AFDA2FTransferPayload:
+        """Receive the rows routed to this FFN rank for one stage.
+
+        Uses ``prefetched`` (from ``prefetch_attn_output``) when given,
+        otherwise posts the receive now, then makes the current stream wait
+        for the data.
+        """
+        stage = int(ubatch_idx)
+        if prefetched is None:
+            prefetched = self.prefetch_attn_output(stage)
+        elif prefetched.stage != stage:
+            raise RuntimeError(
+                f"prefetched stage {prefetched.stage} consumed as stage {stage}",
+            )
+        plan, received, stream = prefetched.plan, prefetched.received, prefetched.stream
+        torch.cuda.current_stream(self.device).wait_event(prefetched.ready)
+
+        hidden_states, topk_ids, topk_weights = received[0], received[1], received[2]
+        a1q_scale = received[3] if self.spec.scale_tail is not None else None
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=0,
             stage_idx=stage,
@@ -915,6 +1006,13 @@ class P2pNcclRoutedControlPlane(AFDControlPlane):
         # previous one, so the per-communicator chains start afresh.
         connector._dispatch_chain = None
         connector._combine_chain = None
+        if connector._deferred_result is not None:
+            logger.warning(
+                "routed AFD connector: result receive of stage %d of the "
+                "previous step was never posted",
+                connector._deferred_result[0],
+            )
+            connector._deferred_result = None
         if connector._plans:
             logger.warning(
                 "routed AFD connector: %d dispatches of the previous step were "

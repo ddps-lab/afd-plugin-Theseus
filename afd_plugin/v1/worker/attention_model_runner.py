@@ -104,6 +104,10 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         use_ubatching = bool(self.vllm_config.parallel_config.use_ubatching)
         with _use_afd_ubatch_wrapper_during_load(use_ubatching):
             super().load_model(load_dummy_weights)
+        set_layers = getattr(self.connector, "set_moe_layer_indices", None)
+        if set_layers is not None:
+            model = self.model.unwrap() if hasattr(self.model, "unwrap") else self.model
+            set_layers(model.get_experts_layer_indices())
         if use_ubatching:
             self._install_afd_ubatch_wrapper()
         # Wrapper installation is local and non-blocking; the connector

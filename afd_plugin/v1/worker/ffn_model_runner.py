@@ -205,6 +205,10 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         # One-hop routed connector: Attention sends top-k ids/weights with the
         # tokens, FFN runs only the experts it owns on the rows it received.
         routed = bool(self.connector.is_routed)
+        # Routed: the receive of the next layer's first stage is posted before
+        # the last stage of a layer is computed (with micro-batches only).
+        routed_layers = [idx for idx in layer_indices if idx in experts_layer_indices]
+        prefetched = None
         with _ffn_forward_context(self.vllm_config) as forward_context:
             for layer_idx in layer_indices:
                 uses_remote_experts = layer_idx in experts_layer_indices
@@ -216,12 +220,16 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     else None
                 )
                 if uses_remote_experts and routed:
-                    rank_ffn_output = self._run_routed_layer(
+                    rank_ffn_output, prefetched = self._run_routed_layer(
                         layer_idx,
                         stage_ids,
                         ffn_dp_metadata_list,
                         forward_context,
                         recv_input_ids,
+                        prefetched=prefetched,
+                        prefetch_next_layer=(
+                            len(stage_ids) > 1 and layer_idx != routed_layers[-1]
+                        ),
                     )
                     continue
                 for stage_idx in stage_ids:
@@ -282,20 +290,37 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         ffn_dp_metadata_list: dict[int, Any],
         forward_context: Any,
         recv_input_ids: bool,
-    ) -> torch.Tensor:
+        prefetched: Any = None,
+        prefetch_next_layer: bool = False,
+    ) -> tuple[torch.Tensor, Any]:
         """One MoE layer of the routed connector: per stage receive, compute, return.
 
-        Each stage's partial sums go back as soon as they are computed. The
-        Attention side posts the receive for stage i right after dispatching
-        it, so both roles issue dispatch(i), combine(i), dispatch(i+1), ... in
-        the same order on the two NCCL communicators (no cross-communicator
-        deadlock), and stage i's expert compute overlaps the Attention side's
-        work on the later stages.
+        The receive of the next stage is posted before the experts of the
+        current stage are launched, so its rows travel while the current stage
+        is computed, and each stage's partial sums go back as soon as they are
+        computed. With micro-batches the last stage prefetches the next
+        layer's first stage (``prefetch_next_layer``) and returns it, so the
+        pipeline does not drain at layer boundaries. Both roles then launch the
+        NCCL operations of the two communicators in the same order
+        (D0 D1 C0 D2 C1 | D0' C2 D1' C0' ...), which the Attention side
+        matches by posting each result receive after the next dispatch.
+        Returns the layer output and the prefetched next-layer stage (or None).
         """
         recv_kwargs: dict[str, Any] = {"recv_input_ids": True} if recv_input_ids else {}
         rank_ffn_output = None
-        for stage_idx in stage_ids:
-            payload = self.connector.recv_attn_output(ubatch_idx=stage_idx, **recv_kwargs)
+        connector = self.connector
+        if prefetched is None:
+            prefetched = connector.prefetch_attn_output(stage_ids[0])
+        next_layer_prefetched = None
+        for k, stage_idx in enumerate(stage_ids):
+            next_prefetched = None
+            if k + 1 < len(stage_ids):
+                next_prefetched = connector.prefetch_attn_output(stage_ids[k + 1])
+            elif prefetch_next_layer:
+                next_layer_prefetched = connector.prefetch_attn_output(stage_ids[0])
+            payload = connector.recv_attn_output(
+                ubatch_idx=stage_idx, prefetched=prefetched, **recv_kwargs
+            )
             metadata = payload.context.metadata
             metadata.layer_idx = layer_idx
             metadata.stage_idx = stage_idx
@@ -313,8 +338,9 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                 a1q_scale=payload.a1q_scale,
             )
             self.connector.send_ffn_output(rank_ffn_output, payload.context)
+            prefetched = next_prefetched
         assert rank_ffn_output is not None
-        return rank_ffn_output
+        return rank_ffn_output, next_layer_prefetched
 
     def _execute_eager_mode(
         self,
