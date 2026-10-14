@@ -15,10 +15,15 @@ import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config, GlmMoeDsaConfig
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
+from vllm.model_executor.layers.fused_moe.router.router_factory import (
+    create_fused_moe_router,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models import deepseek_v2 as native
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
@@ -29,6 +34,12 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
 )
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
+from afd_plugin.model_executor.models.routed_moe import (
+    RoutedExpertsProxy,
+    is_routed_afd,
+    routed_moe_forward,
+    run_prerouted_experts,
+)
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 logger = init_logger(__name__)
@@ -71,6 +82,7 @@ def _checkpoint_weight_roles(
     config: _DeepseekAdapterConfig,
     *,
     compute_gate_on_attention: bool,
+    routed: bool = False,
 ) -> frozenset[str]:
     """Classify one native checkpoint path by its AFD execution owner."""
     layer_path = _weight_layer_path(name)
@@ -86,6 +98,12 @@ def _checkpoint_weight_roles(
     if not _is_moe_layer(config, layer_idx):
         return _ATTENTION_ROLE if compute_gate_on_attention else _FFN_ROLE
 
+    if routed:
+        # One-hop routed connector: the gate and the shared experts live on
+        # Attention, only the routed experts live on FFN.
+        is_routed_experts = bool(remainder) and remainder[0] == "experts"
+        return _FFN_ROLE if is_routed_experts else _ATTENTION_ROLE
+
     is_moe_gate = bool(remainder) and remainder[0] == "gate"
     if is_moe_gate and compute_gate_on_attention:
         return _BOTH_ROLES
@@ -98,6 +116,7 @@ def _iter_role_weights(
     role: str,
     config: _DeepseekAdapterConfig,
     compute_gate_on_attention: bool,
+    routed: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Consume a checkpoint iterator once and retain this role's paths."""
     for name, loaded_weight in weights:
@@ -105,6 +124,7 @@ def _iter_role_weights(
             name,
             config,
             compute_gate_on_attention=compute_gate_on_attention,
+            routed=routed,
         ):
             yield name, loaded_weight
 
@@ -289,6 +309,201 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         # ### PATCH END: construct a remote-experts native MoE shell.
 
 
+class AFDDeepseekV2RoutedAttentionMoE(native.DeepseekV2MoE):
+    """Attention-side DeepSeek MoE for the one-hop routed connector.
+
+    Owns the gate, the top-k router and the shared experts under the native
+    attribute names (``gate``, ``shared_experts``, ``experts``) so that the
+    checkpoint loads unchanged; the routed experts are executed by the FFN
+    ranks that own them through ``RoutedExpertsProxy``.
+    """
+
+    # Patch reason: native DeepseekV2MoE constructs local routed experts and
+    # runs the router inside FusedMoE.
+    # Patch functionality: keep the native module layout but replace the
+    # local FusedMoE with a parameter-free proxy that dispatches tokens to
+    # their owning FFN ranks; the router is the native one.
+    # Signature: AFD-owned; adds layer_idx and omits reduce_results.
+    # Upstream: vLLM v0.26.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    def __init__(
+        self,
+        *,
+        config: _DeepseekAdapterConfig,
+        parallel_config: ParallelConfig,
+        quant_config: QuantizationConfig | None,
+        layer_idx: int,
+        prefix: str,
+    ) -> None:
+        nn.Module.__init__(self)
+        del parallel_config  # EPLB and sequence parallelism are not supported.
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.is_sequence_parallel = False
+        if config.hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {config.hidden_act}. "
+                "Only silu is supported for now."
+            )
+        self.n_routed_experts = int(config.n_routed_experts)
+        self.n_shared_experts = int(config.n_shared_experts or 0)
+        self.n_redundant_experts = 0
+        self.n_logical_experts = self.n_routed_experts
+        self.n_physical_experts = self.n_routed_experts
+        self.n_local_physical_experts = 0
+
+        self.router_dtype = native._get_moe_router_dtype(config)
+        self.gate = native.GateLinear(
+            config.hidden_size,
+            config.n_routed_experts,
+            out_dtype=self.router_dtype,
+            prefix=f"{prefix}.gate",
+        )
+        if getattr(config, "topk_method", None) == "noaux_tc":
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+            )
+        else:
+            self.gate.e_score_correction_bias = None
+        # The same router the native FusedMoE builds. routed_scaling_factor is
+        # applied to the routed output (apply_routed_scale_to_output), so the
+        # router runs with 1.0 like the native CUDA path.
+        self.router = create_fused_moe_router(
+            top_k=int(config.num_experts_per_tok),
+            global_num_experts=self.n_routed_experts,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=getattr(config, "n_group", 1),
+            topk_group=getattr(config, "topk_group", 1),
+            scoring_func=getattr(config, "scoring_func", "softmax"),
+            routed_scaling_factor=1.0,
+            e_score_correction_bias=self.gate.e_score_correction_bias,
+        )
+        if self.n_shared_experts > 0:
+            self.shared_experts = native.DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size * self.n_shared_experts,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=True,
+                prefix=f"{prefix}.shared_experts",
+            )
+        else:
+            self.shared_experts = None
+        self.experts = RoutedExpertsProxy(layer_idx=layer_idx)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        return routed_moe_forward(
+            hidden_states,
+            gate=self.gate,
+            router=self.router,
+            proxy=self.experts,
+            shared_experts=self.shared_experts,
+            routed_scaling_factor=self.routed_scaling_factor,
+            tp_size=self.tp_size,
+        )
+
+
+class AFDDeepseekV2RoutedFFNMoE(native.DeepseekV2MoE):
+    """FFN-side DeepSeek MoE for the one-hop routed connector: experts only.
+
+    The gate and the shared experts live on Attention; this module owns the
+    native ``experts`` FusedMoE (built with the ``prerouted`` all2all backend)
+    and runs it on rows that were routed here with their top-k selection.
+    """
+
+    # Patch reason: native DeepseekV2MoE constructs the gate and the shared
+    # experts and routes inside FusedMoE.
+    # Patch functionality: construct only the routed experts and feed them the
+    # routing received from Attention.
+    # Signature: AFD-owned; omits reduce_results and apply_routed_scale_to_output.
+    # Upstream: vLLM v0.26.0, vllm/model_executor/models/deepseek_v2.py
+    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    def __init__(
+        self,
+        *,
+        config: _DeepseekAdapterConfig,
+        parallel_config: ParallelConfig,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        nn.Module.__init__(self)
+        del parallel_config  # EPLB and sequence parallelism are not supported.
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.ep_group = native.get_ep_group().device_group
+        self.ep_rank = native.get_ep_group().rank_in_group
+        self.ep_size = self.ep_group.size()
+        self.n_routed_experts = int(config.n_routed_experts)
+        self.n_shared_experts = int(config.n_shared_experts or 0)
+        self.is_sequence_parallel = False
+        if config.hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {config.hidden_act}. "
+                "Only silu is supported for now."
+            )
+        self.router_dtype = native._get_moe_router_dtype(config)
+        self.enable_eplb = False
+        self.n_redundant_experts = 0
+        self.n_logical_experts = self.n_routed_experts
+        self.n_physical_experts = self.n_routed_experts
+        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
+        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
+        self.physical_expert_end = (
+            self.physical_expert_start + self.n_local_physical_experts
+        )
+        # Gate and shared experts are Attention-owned in the routed layout.
+        self.gate = None
+        self.shared_experts = None
+        self.experts = fused_moe.FusedMoE(
+            num_experts=self.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+            use_grouped_topk=True,
+            num_expert_group=getattr(config, "n_group", 1),
+            topk_group=getattr(config, "topk_group", 1),
+            prefix=f"{prefix}.experts",
+            scoring_func=getattr(config, "scoring_func", "softmax"),
+            # Applied on Attention together with the shared experts.
+            routed_scaling_factor=1.0,
+            enable_eplb=False,
+            num_redundant_experts=0,
+            is_sequence_parallel=False,
+            router_logits_dtype=self.router_dtype,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        raise RuntimeError(
+            "routed FFN MoE is driven by compute_routed_experts_output",
+        )
+
+    def compute_routed_experts_output(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        a1q_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return run_prerouted_experts(
+            self.experts,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            a1q_scale,
+        )
+
+
 class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     """DeepSeek decoder layer with separable Attention and FFN execution."""
 
@@ -356,6 +571,9 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         self.compute_gate_on_attention = bool(
             afd_config.compute_gate_on_attention,
         )
+        # One-hop routed connector: tokens go straight to the FFN ranks that
+        # own their experts; the gate and the shared experts stay on Attention.
+        self.routed = is_routed_afd(afd_config)
         device_type = native.current_platform.device_type
         self.uses_remote_experts = device_type == "cuda" and self.is_moe_layer
         if (
@@ -400,7 +618,15 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 reduce_results=not self.use_sequence_parallel_moe,
             )
 
-            if self.uses_remote_experts:
+            if self.uses_remote_experts and self.routed:
+                self.mlp = AFDDeepseekV2RoutedAttentionMoE(
+                    config=config,
+                    parallel_config=parallel_config,
+                    quant_config=quant_config,
+                    layer_idx=layer_idx,
+                    prefix=f"{prefix}.mlp",
+                )
+            elif self.uses_remote_experts:
                 self.mlp = AFDDeepseekV2RemoteExpertsMoE(
                     config=config,
                     parallel_config=parallel_config,
@@ -430,6 +656,13 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             self.self_attn = native.PPMissingLayer()
             if self.compute_gate_on_attention and not self.is_moe_layer:
                 self.mlp = native.PPMissingLayer()
+            elif self.is_moe_layer and self.routed:
+                self.mlp = AFDDeepseekV2RoutedFFNMoE(
+                    config=config,
+                    parallel_config=parallel_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.mlp",
+                )
             elif self.is_moe_layer:
                 # vLLM models bind FusedMoE at module import time. AFD can import
                 # native DeepSeek before vLLM-Ascend patches the package factory,
@@ -598,6 +831,27 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             router_logits=router_logits,
         )
 
+    def compute_routed_experts_output(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        a1q_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the experts this FFN rank owns on the rows routed to it."""
+        if not self.routed or not self.is_moe_layer:
+            raise RuntimeError(
+                "compute_routed_experts_output requires a routed MoE layer",
+            )
+        if not isinstance(self.mlp, AFDDeepseekV2RoutedFFNMoE):
+            raise RuntimeError("FFN role does not own a routed DeepSeek MoE")
+        return self.mlp.compute_routed_experts_output(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            a1q_scale=a1q_scale,
+        )
+
 
 @native.support_torch_compile
 class AFDDeepseekV2Model(native.DeepseekV2Model):
@@ -744,6 +998,21 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             router_logits,
         )
 
+    def compute_routed_experts_output(
+        self,
+        hidden_states: torch.Tensor,
+        layer_idx: int,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        a1q_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.layers[layer_idx].compute_routed_experts_output(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            a1q_scale=a1q_scale,
+        )
+
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(
             layer_idx
@@ -810,6 +1079,22 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
             router_logits,
         )
 
+    def compute_routed_experts_output(
+        self,
+        hidden_states: torch.Tensor,
+        layer_idx: int,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        a1q_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model.compute_routed_experts_output(
+            hidden_states,
+            layer_idx,
+            topk_weights,
+            topk_ids,
+            a1q_scale=a1q_scale,
+        )
+
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return self.model.get_experts_layer_indices()
 
@@ -826,6 +1111,7 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
                 role=self.afd_role,
                 config=self.config,
                 compute_gate_on_attention=self.afd_config.compute_gate_on_attention,
+                routed=is_routed_afd(self.afd_config),
             )
         )
 

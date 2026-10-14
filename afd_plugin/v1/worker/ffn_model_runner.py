@@ -103,6 +103,11 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         return self.model
 
     def initialize_afd_connector(self) -> None:
+        # The routed connector decides the wire format from the experts kernel
+        # this FFN rank loaded, so it needs the model before the handshake.
+        bind_ffn_model = getattr(self.connector, "bind_ffn_model", None)
+        if bind_ffn_model is not None:
+            bind_ffn_model(self.model)
         self.connector.init_afd_connector()
 
     def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
@@ -197,14 +202,36 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             for stage_idx in stage_ids
         }
         recv_input_ids = getattr(self.model, "afd_requires_input_ids", False)
+        # One-hop routed connector: Attention sends top-k ids/weights with the
+        # tokens, FFN runs only the experts it owns on the rows it received.
+        routed = bool(self.connector.is_routed)
+        # Routed: the receive of the next layer's first stage is posted before
+        # the last stage of a layer is computed (with micro-batches only).
+        routed_layers = [idx for idx in layer_indices if idx in experts_layer_indices]
+        prefetched = None
         with _ffn_forward_context(self.vllm_config) as forward_context:
             for layer_idx in layer_indices:
                 uses_remote_experts = layer_idx in experts_layer_indices
                 routing_spec = (
                     self.model.get_experts_routing_spec(layer_idx)
-                    if uses_remote_experts and self.afd_config.compute_gate_on_attention
+                    if uses_remote_experts
+                    and self.afd_config.compute_gate_on_attention
+                    and not routed
                     else None
                 )
+                if uses_remote_experts and routed:
+                    rank_ffn_output, prefetched = self._run_routed_layer(
+                        layer_idx,
+                        stage_ids,
+                        ffn_dp_metadata_list,
+                        forward_context,
+                        recv_input_ids,
+                        prefetched=prefetched,
+                        prefetch_next_layer=(
+                            len(stage_ids) > 1 and layer_idx != routed_layers[-1]
+                        ),
+                    )
+                    continue
                 for stage_idx in stage_ids:
                     recv_kwargs: dict[str, Any] = {}
                     if routing_spec is not None:
@@ -226,7 +253,17 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                         ]
                         forward_context.additional_kwargs["afd_metadata"] = metadata
                         _set_moe_layer_index(forward_context, layer_idx)
-                    if (
+                    if uses_remote_experts and routed:
+                        assert payload.topk_ids is not None
+                        assert payload.topk_weights is not None
+                        rank_ffn_output = self.model.compute_routed_experts_output(  # type: ignore[union-attr]
+                            hidden_states,
+                            layer_idx,
+                            payload.topk_weights,
+                            payload.topk_ids,
+                            a1q_scale=payload.a1q_scale,
+                        )
+                    elif (
                         uses_remote_experts
                         and self.afd_config.compute_gate_on_attention
                     ):
@@ -245,6 +282,65 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                         )
                     self.connector.send_ffn_output(rank_ffn_output, context)
         return rank_ffn_output
+
+    def _run_routed_layer(
+        self,
+        layer_idx: int,
+        stage_ids: list[int],
+        ffn_dp_metadata_list: dict[int, Any],
+        forward_context: Any,
+        recv_input_ids: bool,
+        prefetched: Any = None,
+        prefetch_next_layer: bool = False,
+    ) -> tuple[torch.Tensor, Any]:
+        """One MoE layer of the routed connector: per stage receive, compute, return.
+
+        The receive of the next stage is posted before the experts of the
+        current stage are launched, so its rows travel while the current stage
+        is computed, and each stage's partial sums go back as soon as they are
+        computed. With micro-batches the last stage prefetches the next
+        layer's first stage (``prefetch_next_layer``) and returns it, so the
+        pipeline does not drain at layer boundaries. Both roles then launch the
+        NCCL operations of the two communicators in the same order
+        (D0 D1 C0 D2 C1 | D0' C2 D1' C0' ...), which the Attention side
+        matches by posting each result receive after the next dispatch.
+        Returns the layer output and the prefetched next-layer stage (or None).
+        """
+        recv_kwargs: dict[str, Any] = {"recv_input_ids": True} if recv_input_ids else {}
+        rank_ffn_output = None
+        connector = self.connector
+        if prefetched is None:
+            prefetched = connector.prefetch_attn_output(stage_ids[0])  # type: ignore[attr-defined]
+        next_layer_prefetched = None
+        for k, stage_idx in enumerate(stage_ids):
+            next_prefetched = None
+            if k + 1 < len(stage_ids):
+                next_prefetched = connector.prefetch_attn_output(stage_ids[k + 1])  # type: ignore[attr-defined]
+            elif prefetch_next_layer:
+                next_layer_prefetched = connector.prefetch_attn_output(stage_ids[0])  # type: ignore[attr-defined]
+            payload = connector.recv_attn_output(
+                ubatch_idx=stage_idx, prefetched=prefetched, **recv_kwargs
+            )
+            metadata = payload.context.metadata
+            metadata.layer_idx = layer_idx
+            metadata.stage_idx = stage_idx
+            if forward_context is not None:
+                forward_context.dp_metadata = ffn_dp_metadata_list[stage_idx]
+                forward_context.additional_kwargs["afd_metadata"] = metadata
+                _set_moe_layer_index(forward_context, layer_idx)
+            assert payload.topk_ids is not None
+            assert payload.topk_weights is not None
+            rank_ffn_output = self.model.compute_routed_experts_output(  # type: ignore[union-attr]
+                payload.hidden_states,
+                layer_idx,
+                payload.topk_weights,
+                payload.topk_ids,
+                a1q_scale=payload.a1q_scale,
+            )
+            self.connector.send_ffn_output(rank_ffn_output, payload.context)
+            prefetched = next_prefetched
+        assert rank_ffn_output is not None
+        return rank_ffn_output, next_layer_prefetched
 
     def _execute_eager_mode(
         self,
