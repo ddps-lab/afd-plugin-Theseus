@@ -60,6 +60,9 @@ class AFDConnectorBase(ABC):
     control_plane: AFDControlPlane | None = None
     attn_size: int = 0
     ffn_size: int = 0
+    # One-hop routed connectors deliver tokens straight to the FFN ranks that
+    # own their experts; the FFN runner and model wrappers switch on this.
+    is_routed: bool = False
 
     @classmethod
     @abstractmethod
