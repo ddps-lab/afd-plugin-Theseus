@@ -449,7 +449,7 @@ class AFDQwen3MoeForCausalLM(native.Qwen3MoeForCausalLM):
         self.quant_config = quant_config
         # Only perform the following mapping when Qwen3MoeMLP exists
         # ### PATCH START: keep the inherited class mapping immutable.
-        self.packed_modules_mapping = dict(self.packed_modules_mapping)
+        self.packed_modules_mapping = dict(self.packed_modules_mapping)  # type: ignore[has-type]
         # ### PATCH END: keep the inherited class mapping immutable.
         if getattr(config, "mlp_only_layers", []):
             self.packed_modules_mapping["gate_up_proj"] = [

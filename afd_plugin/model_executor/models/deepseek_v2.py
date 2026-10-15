@@ -185,7 +185,7 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
         super().__init__(layer_idx=layer_idx)
         self.is_internal_router = is_internal_router
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,

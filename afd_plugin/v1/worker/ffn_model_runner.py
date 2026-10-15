@@ -159,7 +159,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             graph_exists=cuda_graph_info is not None,
         )
         if run_mode is AFDGraphRunMode.REPLAY:
-            cuda_graph_info["graph"].replay()
+            cuda_graph_info["graph"].replay()  # type: ignore[index]
             return None
 
         self._ffn_forward(
@@ -178,7 +178,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         update_connector_state: bool = True,
     ) -> torch.Tensor | None:
         if update_connector_state:
-            self.connector.control_plane.update_state_from_dp_metadata(
+            self.connector.control_plane.update_state_from_dp_metadata(  # type: ignore[union-attr]
                 _make_dp_metadata_payload(
                     dp_metadata_list,
                     is_graph_capturing=is_graph_capturing,
@@ -189,7 +189,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         rank_ffn_output = None
         num_layers = max(int(self.num_layers or 0), 1)
         experts_layer_indices = frozenset(
-            self.model.get_experts_layer_indices(),
+            self.model.get_experts_layer_indices(),  # type: ignore[union-attr]
         )
         layer_indices = (
             tuple(sorted(experts_layer_indices))
@@ -213,7 +213,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             for layer_idx in layer_indices:
                 uses_remote_experts = layer_idx in experts_layer_indices
                 routing_spec = (
-                    self.model.get_experts_routing_spec(layer_idx)
+                    self.model.get_experts_routing_spec(layer_idx)  # type: ignore[union-attr]
                     if uses_remote_experts
                     and self.afd_config.compute_gate_on_attention
                     and not routed
@@ -269,7 +269,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     ):
                         router_logits = payload.router_logits
                         assert router_logits is not None
-                        rank_ffn_output = self.model.compute_experts_output(
+                        rank_ffn_output = self.model.compute_experts_output(  # type: ignore[union-attr]
                             hidden_states,
                             layer_idx,
                             router_logits,
@@ -350,8 +350,8 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_ids is None:
-            return self.model.compute_ffn_output(hidden_states, layer_idx)
-        return self.model.compute_ffn_output(
+            return self.model.compute_ffn_output(hidden_states, layer_idx)  # type: ignore[union-attr]
+        return self.model.compute_ffn_output(  # type: ignore[union-attr]
             hidden_states,
             layer_idx,
             input_ids=input_ids,
@@ -403,7 +403,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             cudagraph = torch.cuda.CUDAGraph()
             # DP metadata receive/update is a control-plane side effect and must
             # complete before CUDA graph capture starts.
-            self.connector.control_plane.update_state_from_dp_metadata(
+            self.connector.control_plane.update_state_from_dp_metadata(  # type: ignore[union-attr]
                 _make_dp_metadata_payload(
                     dp_metadata_list,
                     is_graph_capturing=is_attn_graph_capturing,
@@ -445,7 +445,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         try:
             with graph_capture(device=self.device):
                 if is_warmup:
-                    self.connector.control_plane.update_state_from_dp_metadata(
+                    self.connector.control_plane.update_state_from_dp_metadata(  # type: ignore[union-attr]
                         _make_dp_metadata_payload(
                             dp_metadata_list,
                             is_graph_capturing=False,
@@ -533,14 +533,14 @@ def _ffn_forward_context(vllm_config: VllmConfig):
 
 
 def _set_moe_layer_index(forward_context: object, layer_idx: int) -> None:
-    all_moe_layers = forward_context.all_moe_layers
+    all_moe_layers = forward_context.all_moe_layers  # type: ignore[attr-defined]
     if not all_moe_layers:
         return
 
     target = f".layers.{int(layer_idx)}."
     for idx, layer_name in enumerate(all_moe_layers):
         if target in f".{layer_name}.":
-            forward_context.moe_layer_index = idx
+            forward_context.moe_layer_index = idx  # type: ignore[attr-defined]
             return
 
 

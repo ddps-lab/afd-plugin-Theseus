@@ -83,7 +83,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         self._is_warmup = False
         self._afd_is_graph_capturing = False
         self._afd_is_graph_replaying = False
-        self._afd_pending_metadata: AFDForwardContextMetadata | None = None
+        self._afd_pending_metadata: AFDForwardContextMetadata | None = None  # type: ignore[assignment]
         self._afd_suppress_metadata_send = False
         self._afd_transaction_counter = 0
         self.prof = create_afd_gpu_profiler("attention")
@@ -118,13 +118,13 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             self.connector.init_afd_connector()
 
     def _install_afd_ubatch_wrapper(self) -> None:
-        if isinstance(self.model, AFDUBatchWrapper):
-            self.model.configure_afd_context_provider(
+        if isinstance(self.model, AFDUBatchWrapper):  # type: ignore[has-type]
+            self.model.configure_afd_context_provider(  # type: ignore[has-type]
                 self.install_afd_metadata_on_forward_context,
             )
             return
 
-        model = self.model
+        model = self.model  # type: ignore[has-type]
         if isinstance(model, UBatchWrapper):
             model = model.unwrap()
         self.model = AFDUBatchWrapper(
