@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
@@ -54,6 +55,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
     """Attention model runner that injects AFD metadata into forward context."""
 
     afd_expected_role = "attention"
+    model: Callable[..., Any]
 
     def __init__(
         self,
@@ -83,7 +85,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         self._is_warmup = False
         self._afd_is_graph_capturing = False
         self._afd_is_graph_replaying = False
-        self._afd_pending_metadata: AFDForwardContextMetadata | None = None  # type: ignore[assignment]
+        self._afd_pending_metadata: AFDForwardContextMetadata | None = None
         self._afd_suppress_metadata_send = False
         self._afd_transaction_counter = 0
         self.prof = create_afd_gpu_profiler("attention")
@@ -106,7 +108,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             super().load_model(load_dummy_weights)
         set_layers = getattr(self.connector, "set_moe_layer_indices", None)
         if set_layers is not None:
-            model = self.model.unwrap() if hasattr(self.model, "unwrap") else self.model  # type: ignore[has-type]
+            model = self.model.unwrap() if hasattr(self.model, "unwrap") else self.model
             set_layers(model.get_experts_layer_indices())
         if use_ubatching:
             self._install_afd_ubatch_wrapper()
@@ -118,13 +120,13 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             self.connector.init_afd_connector()
 
     def _install_afd_ubatch_wrapper(self) -> None:
-        if isinstance(self.model, AFDUBatchWrapper):  # type: ignore[has-type]
-            self.model.configure_afd_context_provider(  # type: ignore[has-type]
+        if isinstance(self.model, AFDUBatchWrapper):
+            self.model.configure_afd_context_provider(
                 self.install_afd_metadata_on_forward_context,
             )
             return
 
-        model = self.model  # type: ignore[has-type]
+        model = self.model
         if isinstance(model, UBatchWrapper):
             model = model.unwrap()
         self.model = AFDUBatchWrapper(
