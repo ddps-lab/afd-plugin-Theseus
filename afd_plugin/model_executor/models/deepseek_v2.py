@@ -185,6 +185,8 @@ class AFDAttentionFusedMoE(RemoteFFNProxy):
         super().__init__(layer_idx=layer_idx)
         self.is_internal_router = is_internal_router
 
+    # Native FusedMoE passes router_logits at this boundary; only the proxy's
+    # transport is reused, not its hidden-states-only forward contract.
     def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -28,6 +28,7 @@ from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDControlPayload,
+    AFDControlPlane,
     AFDDPMetadata,
 )
 from afd_plugin.v1.worker.attention_model_runner import (
@@ -45,9 +46,12 @@ from afd_plugin.v1.worker.ffn_metadata import (
 )
 
 if TYPE_CHECKING:
+    from vllm.forward_context import ForwardContext
     from vllm.sequence import IntermediateTensors
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+
+    from afd_plugin.connectors.gpu.routed import P2pNcclRoutedAFDConnector
 
 
 class GPUFFNModelRunner(LoRAModelRunnerMixin):
@@ -159,7 +163,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             graph_exists=cuda_graph_info is not None,
         )
         if run_mode is AFDGraphRunMode.REPLAY:
-            cuda_graph_info["graph"].replay()  # type: ignore[index]
+            self._cuda_graphs[graph_key]["graph"].replay()
             return None
 
         self._ffn_forward(
@@ -178,7 +182,9 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         update_connector_state: bool = True,
     ) -> torch.Tensor | None:
         if update_connector_state:
-            self.connector.control_plane.update_state_from_dp_metadata(  # type: ignore[union-attr]
+            cast(
+                AFDControlPlane, self.connector.control_plane
+            ).update_state_from_dp_metadata(
                 _make_dp_metadata_payload(
                     dp_metadata_list,
                     is_graph_capturing=is_graph_capturing,
@@ -186,10 +192,11 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                 ),
             )
 
+        model = self.get_model()
         rank_ffn_output = None
         num_layers = max(int(self.num_layers or 0), 1)
         experts_layer_indices = frozenset(
-            self.model.get_experts_layer_indices(),  # type: ignore[union-attr]
+            model.get_experts_layer_indices(),
         )
         layer_indices = (
             tuple(sorted(experts_layer_indices))
@@ -201,7 +208,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             stage_idx: self._make_ffn_dp_metadata(dp_metadata_list[stage_idx])
             for stage_idx in stage_ids
         }
-        recv_input_ids = getattr(self.model, "afd_requires_input_ids", False)
+        recv_input_ids = getattr(model, "afd_requires_input_ids", False)
         # One-hop routed connector: Attention sends top-k ids/weights with the
         # tokens, FFN runs only the experts it owns on the rows it received.
         routed = bool(self.connector.is_routed)
@@ -213,7 +220,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             for layer_idx in layer_indices:
                 uses_remote_experts = layer_idx in experts_layer_indices
                 routing_spec = (
-                    self.model.get_experts_routing_spec(layer_idx)  # type: ignore[union-attr]
+                    model.get_experts_routing_spec(layer_idx)
                     if uses_remote_experts
                     and self.afd_config.compute_gate_on_attention
                     and not routed
@@ -256,7 +263,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     if uses_remote_experts and routed:
                         assert payload.topk_ids is not None
                         assert payload.topk_weights is not None
-                        rank_ffn_output = self.model.compute_routed_experts_output(  # type: ignore[union-attr]
+                        rank_ffn_output = model.compute_routed_experts_output(
                             hidden_states,
                             layer_idx,
                             payload.topk_weights,
@@ -269,7 +276,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     ):
                         router_logits = payload.router_logits
                         assert router_logits is not None
-                        rank_ffn_output = self.model.compute_experts_output(  # type: ignore[union-attr]
+                        rank_ffn_output = model.compute_experts_output(
                             hidden_states,
                             layer_idx,
                             router_logits,
@@ -308,16 +315,17 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         """
         recv_kwargs: dict[str, Any] = {"recv_input_ids": True} if recv_input_ids else {}
         rank_ffn_output = None
-        connector = self.connector
+        model = self.get_model()
+        connector = cast("P2pNcclRoutedAFDConnector", self.connector)
         if prefetched is None:
-            prefetched = connector.prefetch_attn_output(stage_ids[0])  # type: ignore[attr-defined]
+            prefetched = connector.prefetch_attn_output(stage_ids[0])
         next_layer_prefetched = None
         for k, stage_idx in enumerate(stage_ids):
             next_prefetched = None
             if k + 1 < len(stage_ids):
-                next_prefetched = connector.prefetch_attn_output(stage_ids[k + 1])  # type: ignore[attr-defined]
+                next_prefetched = connector.prefetch_attn_output(stage_ids[k + 1])
             elif prefetch_next_layer:
-                next_layer_prefetched = connector.prefetch_attn_output(stage_ids[0])  # type: ignore[attr-defined]
+                next_layer_prefetched = connector.prefetch_attn_output(stage_ids[0])
             payload = connector.recv_attn_output(
                 ubatch_idx=stage_idx, prefetched=prefetched, **recv_kwargs
             )
@@ -330,7 +338,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                 _set_moe_layer_index(forward_context, layer_idx)
             assert payload.topk_ids is not None
             assert payload.topk_weights is not None
-            rank_ffn_output = self.model.compute_routed_experts_output(  # type: ignore[union-attr]
+            rank_ffn_output = model.compute_routed_experts_output(
                 payload.hidden_states,
                 layer_idx,
                 payload.topk_weights,
@@ -349,9 +357,10 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         *,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        model = self.get_model()
         if input_ids is None:
-            return self.model.compute_ffn_output(hidden_states, layer_idx)  # type: ignore[union-attr]
-        return self.model.compute_ffn_output(  # type: ignore[union-attr]
+            return model.compute_ffn_output(hidden_states, layer_idx)
+        return model.compute_ffn_output(
             hidden_states,
             layer_idx,
             input_ids=input_ids,
@@ -403,7 +412,9 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             cudagraph = torch.cuda.CUDAGraph()
             # DP metadata receive/update is a control-plane side effect and must
             # complete before CUDA graph capture starts.
-            self.connector.control_plane.update_state_from_dp_metadata(  # type: ignore[union-attr]
+            cast(
+                AFDControlPlane, self.connector.control_plane
+            ).update_state_from_dp_metadata(
                 _make_dp_metadata_payload(
                     dp_metadata_list,
                     is_graph_capturing=is_attn_graph_capturing,
@@ -445,7 +456,9 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         try:
             with graph_capture(device=self.device):
                 if is_warmup:
-                    self.connector.control_plane.update_state_from_dp_metadata(  # type: ignore[union-attr]
+                    cast(
+                        AFDControlPlane, self.connector.control_plane
+                    ).update_state_from_dp_metadata(
                         _make_dp_metadata_payload(
                             dp_metadata_list,
                             is_graph_capturing=False,
@@ -532,15 +545,15 @@ def _ffn_forward_context(vllm_config: VllmConfig):
         yield get_forward_context()
 
 
-def _set_moe_layer_index(forward_context: object, layer_idx: int) -> None:
-    all_moe_layers = forward_context.all_moe_layers  # type: ignore[attr-defined]
+def _set_moe_layer_index(forward_context: ForwardContext, layer_idx: int) -> None:
+    all_moe_layers = forward_context.all_moe_layers
     if not all_moe_layers:
         return
 
     target = f".layers.{int(layer_idx)}."
     for idx, layer_name in enumerate(all_moe_layers):
         if target in f".{layer_name}.":
-            forward_context.moe_layer_index = idx  # type: ignore[attr-defined]
+            forward_context.moe_layer_index = idx
             return
 
 
