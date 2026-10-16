@@ -13,8 +13,10 @@ all2all backend, which performs no communication at all.
 Topology:
     One NCCL world ordered ``[F0, ..., F(F-1), A0, ..., A(A-1)]`` (FFN ranks
     first). With ``E`` routed experts, FFN rank ``r`` owns experts
-    ``[r * E / F, (r + 1) * E / F)`` (vLLM's linear expert placement) and
-    Attention ranks own no experts. Any ``A`` and ``F`` are allowed.
+    ``[r * E / F, (r + 1) * E / F)`` (vLLM's linear expert placement), or the
+    ``counts[r]`` experts after those of the lower FFN ranks with
+    ``--expert-placement-counts``, and Attention ranks own no experts. Any
+    ``A`` and ``F`` are allowed.
 
 Data plane (per MoE layer and micro-batch stage):
     1. Attention computes gate + top-k, quantizes the activations only when
@@ -46,7 +48,8 @@ Control plane:
 Requirements and limitations:
     - Eager mode on both roles: the count exchange is a host sync.
     - FFN role: ``--data-parallel-size F --enable-expert-parallel
-      --all2all-backend prerouted``, TP=1, ``E % F == 0``.
+      --all2all-backend prerouted``, TP=1, ``E % F == 0`` unless every rank
+      of both roles gets the same ``--expert-placement-counts``.
     - Attention role: ``compute_gate_on_attention=true``. With TP>1 every
       TP rank dispatches a token slice and the result is all-gathered
       (unverified).
@@ -363,10 +366,18 @@ def _validate_routed_runtime(
         raise RuntimeError("P2pNcclRoutedAFDConnector does not support PP")
     if int(parallel.prefill_context_parallel_size) != 1:
         raise RuntimeError("P2pNcclRoutedAFDConnector does not support PCP")
-    if spec.num_experts % ffn_size != 0:
+    counts = parallel.expert_placement_counts
+    if counts is None and spec.num_experts % ffn_size != 0:
         raise RuntimeError(
             f"P2pNcclRoutedAFDConnector needs num_experts ({spec.num_experts}) "
-            f"divisible by num_ffn_ranks ({ffn_size})",
+            f"divisible by num_ffn_ranks ({ffn_size}) or expert_placement_counts",
+        )
+    if counts is not None and (
+        len(counts) != ffn_size or sum(counts) != spec.num_experts
+    ):
+        raise RuntimeError(
+            f"expert_placement_counts {counts} needs one entry per FFN rank "
+            f"({ffn_size}) summing to num_experts ({spec.num_experts})",
         )
     if afd_config.role != "ffn":
         return
@@ -466,6 +477,8 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         _validate_routed_runtime(vllm_config, afd_config, self.spec)
         self._ffn_model: Any | None = None
         self.num_local_experts = self.spec.num_experts // self.ffn_size
+        # Experts per FFN rank when the placement is uneven (None: even).
+        self.expert_counts = vllm_config.parallel_config.expert_placement_counts
         self.max_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
 
         self.dispatch_pg: ProcessGroup | None = None
@@ -556,6 +569,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                 timeout=timedelta(minutes=30),
             )
         self._exchange_wire_spec()
+        self._check_expert_counts()
         self.engine = P2pAll2AllEngine(
             group=self.dispatch_pg,
             rank=self.world_rank,
@@ -564,6 +578,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             max_tokens_per_rank=self.max_tokens,
             device=self.device,
             combine_group=self.combine_pg,
+            expert_counts=self.expert_counts,
         )
         spec = self.spec
         if self.is_ffn:
@@ -592,14 +607,14 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             )
         logger.info(
             "routed AFD connector ready: role=%s role_rank=%d world_rank=%d/%d "
-            "experts=%d (%d local per FFN rank) top_k=%d wire=%s quant=%s "
+            "experts=%d (per FFN rank %s) top_k=%d wire=%s quant=%s "
             "scale_tail=%s",
             self.afd_config.role,
             self.role_rank,
             self.world_rank,
             self.world_size,
             spec.num_experts,
-            self.num_local_experts,
+            self.expert_counts or self.num_local_experts,
             spec.top_k,
             spec.act_dtype,
             spec.quant_mode,
@@ -664,6 +679,26 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                 "same experts kernel (check --kernel-config and GPU types)",
             )
         self.spec = spec
+
+    def _check_expert_counts(self) -> None:
+        """Check that every rank routes by the placement of FFN role rank 0.
+
+        Attention routes by its own ``--expert-placement-counts`` while the
+        FFN expert maps follow theirs, so the lists must agree everywhere.
+        """
+        mine = torch.tensor(
+            self.expert_counts or [0] * self.ffn_size,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        reference = mine.clone()
+        dist.broadcast(reference, src=0, group=self.dispatch_pg)
+        if not torch.equal(reference, mine):
+            raise RuntimeError(
+                "routed AFD: expert_placement_counts differ from FFN rank 0 "
+                f"({reference.tolist()}, this rank {mine.tolist()}); pass the "
+                "same list to every Attention and FFN rank",
+            )
 
     @property
     def is_initialized(self) -> bool:
