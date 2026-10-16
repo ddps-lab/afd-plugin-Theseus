@@ -111,8 +111,8 @@ if TYPE_CHECKING:
 # Under the ``vllm`` namespace: vLLM only configures handlers for ``vllm.*``.
 logger = init_logger(f"vllm.{__name__}")
 
-# DEBUG(p2p_nccl): remove after GPU validation. VLLM_P2P_NCCL_DEBUG=1 logs the
-# first stages of every step (counts, bytes, host wait) on both roles.
+# DEBUG(p2p_nccl): off by default. VLLM_P2P_NCCL_DEBUG=1 logs the first
+# stages of every step (counts, bytes, host wait) on both roles.
 _DEBUG = int(os.environ.get("VLLM_P2P_NCCL_DEBUG", "0") or 0)
 
 _IDS_DTYPE = torch.int32
@@ -475,7 +475,9 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         # Attention: plans of the stages whose dispatch is in flight.
         self._plans: dict[int, P2pAll2AllPlan] = {}
         # Attention: stage -> (plan, result buffer, result-received event).
-        self._pending: dict[int, tuple[P2pAll2AllPlan, torch.Tensor, torch.cuda.Event]] = {}
+        self._pending: dict[
+            int, tuple[P2pAll2AllPlan, torch.Tensor, torch.cuda.Event]
+        ] = {}
         self._result_stream: torch.cuda.Stream | None = None
         # Attention: (stage, plan) whose result receive waits for the next
         # dispatch (see send_attn_output), and the last MoE layer of a forward
@@ -571,7 +573,9 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                 (0, spec.top_k), dtype=_IDS_DTYPE, device=self.device
             )
             empty: list[torch.Tensor] = [
-                torch.empty((0, spec.hidden_size), dtype=spec.act_dtype, device=self.device),
+                torch.empty(
+                    (0, spec.hidden_size), dtype=spec.act_dtype, device=self.device
+                ),
                 self._empty_ids,
                 torch.empty((0, spec.top_k), dtype=_WEIGHTS_DTYPE, device=self.device),
             ]
@@ -784,7 +788,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         # Back to the compute stream without waiting for the dispatch: the
         # shared experts can run while the rows are on the wire.
         dbo_switch_to_compute()
-        # DEBUG(p2p_nccl): remove after GPU validation.
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(self._num_sends):
             logger.info(
                 "routed[A%d] send#%d layer=%d stage=%d T=%d send=%s rows=%d "
@@ -893,7 +897,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             ready = torch.cuda.Event()
             ready.record(stream)
             self._dispatch_chain = ready
-        # DEBUG(p2p_nccl): remove after GPU validation.
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(self._num_recvs):
             logger.info(
                 "routed[F%d] recv#%d stage=%d rows=%d recv=%s host_wait=%.3fms",
@@ -906,7 +910,11 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             )
         self._num_recvs += 1
         return RoutedPrefetch(
-            stage=stage, plan=plan, received=received, stream=stream, ready=ready,
+            stage=stage,
+            plan=plan,
+            received=received,
+            stream=stream,
+            ready=ready,
         )
 
     def recv_attn_output(
@@ -1020,7 +1028,7 @@ class P2pNcclRoutedControlPlane(AFDControlPlane):
                 len(connector._plans),
             )
             connector._plans.clear()
-        # DEBUG(p2p_nccl): remove after GPU validation.
+        # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(connector._num_steps):
             logger.info(
                 "routed[%s%d] step#%d stages=%s warmup=%s capture=%s profile=%s",

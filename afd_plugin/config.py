@@ -324,7 +324,10 @@ def validate_afd_config(
         from afd_plugin.distributed import validate_p2p_topology
 
         validate_p2p_topology(config)
-    if config.connector == ROUTED_P2P_CONNECTOR and not config.compute_gate_on_attention:
+    if (
+        config.connector == ROUTED_P2P_CONNECTOR
+        and not config.compute_gate_on_attention
+    ):
         raise ValueError(
             "P2pNcclRoutedAFDConnector routes tokens by their selected experts, "
             "so the gate must run on Attention: set compute_gate_on_attention=true",

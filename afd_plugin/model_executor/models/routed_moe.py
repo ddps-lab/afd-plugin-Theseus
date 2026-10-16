@@ -19,6 +19,7 @@ Qwen3 share one implementation of the exchange.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -38,6 +39,9 @@ from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.model_executor.models.forward_context import (
     get_afd_metadata_from_forward_context,
 )
+
+if TYPE_CHECKING:
+    from afd_plugin.connectors.gpu.routed import P2pNcclRoutedAFDConnector
 
 
 def is_routed_afd(afd_config: AFDConfig) -> bool:
@@ -72,7 +76,7 @@ class RoutedExpertsProxy(nn.Module):
             getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
         )
         afd_metadata.stage_idx = stage_idx
-        connector = afd_metadata.connector
+        connector = cast("P2pNcclRoutedAFDConnector", afd_metadata.connector)
         a1q, a1q_scale = connector.quantize_for_dispatch(hidden_states)
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=self.layer_idx,

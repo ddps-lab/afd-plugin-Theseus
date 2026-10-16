@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
@@ -54,6 +55,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
     """Attention model runner that injects AFD metadata into forward context."""
 
     afd_expected_role = "attention"
+    model: Callable[..., Any]
 
     def __init__(
         self,
@@ -259,7 +261,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         )
         kwargs: dict[str, Any] = {}
 
-        # determin if ubatch should be activated.
+        # determine if ubatch should be activated.
         # 1. For dp = 1, vLLM hardcodes `should_ubatch=False`.
         # This is the extra support for dp = 1
         if self.vllm_config.parallel_config.data_parallel_size == 1:
@@ -538,7 +540,8 @@ def fail_if_unsupported_ubatching(vllm_config: VllmConfig) -> None:
     num_ubatches = int(parallel_config.num_ubatches)
     if num_ubatches < 2:
         raise RuntimeError(
-            f"AFD ubatching needs at least two ubatches; got num_ubatches={num_ubatches}",
+            "AFD ubatching needs at least two ubatches; "
+            f"got num_ubatches={num_ubatches}",
         )
     # ``--enable-dbo`` is exactly two ubatches; ``--ubatch-size N`` selects N.
     # More than two ubatches are only supported in eager mode: the CUDA graph
