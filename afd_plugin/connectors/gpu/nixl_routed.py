@@ -224,7 +224,12 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         self._writes.append(handle)
 
     def _finish_writes(self) -> None:
-        """Wait until every posted WRITE is done, so its rows can be reused."""
+        """Poll every posted WRITE to completion.
+
+        NIXL sends the notification of a WRITE that was still in flight when it
+        was posted only once its state is checked, so the peer waits on this
+        before it sees the rows. The rows can be reused afterwards.
+        """
         assert self.agent is not None
         deadline = time.monotonic() + TRANSFER_TIMEOUT_S
         for handle in self._writes:
@@ -280,8 +285,6 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         ]
         plan = self.engine.plan(tensors[1], slot=stage)
         with torch.profiler.record_function("afd_nixl.dispatch_write"):
-            # The send rows of the previous layer may still be on the wire.
-            self._finish_writes()
             # Destination-major packing, as the NCCL engine's dispatch does.
             for src, packed in zip(tensors, self._rows, strict=True):
                 torch.index_select(src, 0, plan.perm, out=packed[: plan.num_send])
@@ -318,6 +321,10 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 f"ref_tensor has {ref_tensor.shape[0]} rows, stage {ubatch_idx} "
                 f"dispatched {plan.num_tokens}",
             )
+        # Posted in send_attn_output; polled here so the shared experts are
+        # already enqueued while the rows travel.
+        with torch.profiler.record_function("afd_nixl.dispatch_finish"):
+            self._finish_writes()
         with torch.profiler.record_function("afd_nixl.combine_wait"):
             notif = f"c{plan.seq}".encode()
             self._wait_notifs(
@@ -388,8 +395,6 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 f"{plan.slot} received {plan.num_recv}",
             )
         with torch.profiler.record_function("afd_nixl.combine_write"):
-            # The partial sums of the previous layer may still be on the wire.
-            self._finish_writes()
             self._results[: plan.num_recv].copy_(ffn_output)
             torch.cuda.current_stream(self.device).synchronize()
             offset = 0
@@ -403,6 +408,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                         f"c{plan.seq}".encode(),
                     )
                 offset += count
+            # Nothing else runs before the next layer's rows arrive, and the
+            # notifications only go out once the WRITEs are polled.
+            self._finish_writes()
 
 
 __all__ = ["NixlRoutedAFDConnector"]
