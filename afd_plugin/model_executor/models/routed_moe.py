@@ -34,7 +34,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
-from afd_plugin.config import ROUTED_P2P_CONNECTOR, AFDConfig
+from afd_plugin.config import ROUTED_CONNECTORS, AFDConfig
 from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.model_executor.models.forward_context import (
     get_afd_metadata_from_forward_context,
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 
 def is_routed_afd(afd_config: AFDConfig) -> bool:
-    return afd_config.connector == ROUTED_P2P_CONNECTOR
+    return afd_config.connector in ROUTED_CONNECTORS
 
 
 class RoutedExpertsProxy(nn.Module):
