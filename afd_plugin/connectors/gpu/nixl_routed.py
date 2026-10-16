@@ -67,6 +67,10 @@ TRANSFER_TIMEOUT_S = 120.0
 NIXL_BACKEND = "UCX"
 
 
+def _agent_name(world_rank: int) -> str:
+    return f"afd-routed-{world_rank}"
+
+
 class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
     """``P2pNcclRoutedAFDConnector`` with the rows carried by NIXL WRITEs."""
 
@@ -133,7 +137,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             (rows, spec.hidden_size), dtype=spec.model_dtype, device=self.device
         )
         self.agent = nixl_agent(
-            f"afd-routed-{self.world_rank}",
+            _agent_name(self.world_rank),
             nixl_agent_config(backends=[NIXL_BACKEND]),
         )
         self.agent.register_memory([*self._rows, self._results])
@@ -161,7 +165,10 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         )
         for peer in peer_ranks:
             metadata, regions, device, _ = everyone[peer]
-            self._peer_agents[peer] = self.agent.add_remote_agent(metadata)
+            # add_remote_agent returns the name as bytes while notifications
+            # are keyed by str, so peers are addressed by the known name.
+            self.agent.add_remote_agent(metadata)
+            self._peer_agents[peer] = _agent_name(peer)
             self._peer_regions[peer] = regions
             self._peer_devices[peer] = device
         logger.info(
