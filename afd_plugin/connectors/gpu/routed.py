@@ -564,6 +564,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             max_tokens_per_rank=self.max_tokens,
             device=self.device,
             combine_group=self.combine_pg,
+            row_bytes=self.spec.hidden_size * self.spec.act_dtype.itemsize,
         )
         spec = self.spec
         if self.is_ffn:
