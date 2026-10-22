@@ -45,6 +45,18 @@ Control plane:
     warmup/profile flags) to every FFN rank over a separate NCCL group,
     like ``P2pNcclAFDConnector``.
 
+Fixed-size experts launch (FFN):
+    The number of rows an FFN rank receives changes every stage, and the
+    Triton experts kernel is compiled again for every new shape, so each FFN
+    rank would stop at a different time to compile. The FFN therefore hands
+    the experts its whole receive buffer (Attention ranks x max tokens per
+    rank rows, the most it can receive in one stage): rows past the received
+    ones get expert id -1 and the experts are told how many rows are real
+    (vLLM ``fused_moe/fixed_launch.py``); the partial sums of the real rows
+    go back. Only the unquantized Triton experts kernel takes this path; a
+    stage that receives more rows than the fixed size is launched at the
+    received size.
+
 Requirements and limitations:
     - Eager mode on both roles: the count exchange is a host sync.
     - FFN role: ``--data-parallel-size F --enable-expert-parallel
@@ -81,6 +93,7 @@ from vllm.distributed.device_communicators.p2p_nccl_all2all import (
     P2pAll2AllPlan,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import fixed_launch
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import (
@@ -307,6 +320,23 @@ def _kernel_wire_plan(
     return None
 
 
+def fixed_launch_supported(model: Any) -> bool:
+    """Whether every MoE layer of the FFN model can take a fixed-size launch.
+
+    Only the unquantized Triton experts kernel reads the real-row count
+    (vLLM ``fused_moe/fixed_launch.py``); with activation quantization a
+    dynamic scale would be computed over the padding rows, and other kernels
+    would compute the padding.
+    """
+    kernels = _find_moe_kernels(model)
+    return bool(kernels) and all(
+        type(k.fused_experts).__name__ == "TritonExperts"
+        and k.fused_experts.quant_config.quant_dtype is None
+        and getattr(k.fused_experts, "_lora_context", None) is None
+        for k in kernels
+    )
+
+
 def ffn_wire_spec(base: RoutedWireSpec, model: Any) -> RoutedWireSpec:
     """Wire spec the FFN experts kernel of ``model`` wants (FFN role only)."""
     kernels = _find_moe_kernels(model)
@@ -428,6 +458,8 @@ class RoutedPrefetch:
     received: list[torch.Tensor]
     stream: torch.cuda.Stream
     ready: torch.cuda.Event
+    # ``received`` are fixed-size views (rows past plan.num_recv are padding).
+    fixed: bool = False
 
 
 # ==============================
@@ -480,6 +512,11 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         # Experts per FFN rank when the placement is uneven (None: even).
         self.expert_counts = vllm_config.parallel_config.expert_placement_counts
         self.max_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
+        # FFN: rows handed to the experts kernel per stage (fixed-size launch;
+        # every token of every Attention rank is the most one stage brings).
+        self._fixed_rows = self.attn_size * self.max_tokens
+        self._fixed_ok = False  # set at init from the FFN experts kernel
+        self._fixed_overflow_logged = False
 
         self.dispatch_pg: ProcessGroup | None = None
         self.combine_pg: ProcessGroup | None = None
@@ -620,6 +657,13 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             spec.quant_mode,
             spec.scale_tail,
         )
+        if self.is_ffn:
+            logger.info(
+                "routed[F%d]: fixed-size experts launch %s, %d rows",
+                self.role_rank,
+                "on" if self._fixed_ok else "off (not unquantized TritonExperts)",
+                self._fixed_rows,
+            )
         self._initialized = True
 
     def _wait_for_rendezvous(self) -> None:
@@ -661,6 +705,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                     "before init_afd_connector()",
                 )
             mine = ffn_wire_spec(base, self._ffn_model)
+            self._fixed_ok = fixed_launch_supported(self._ffn_model)
         else:
             mine = base
         reference = torch.tensor(mine.encode(), dtype=torch.int64, device=self.device)
@@ -928,7 +973,21 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             pending = engine.begin_plan(self._empty_send[1], slot=stage)
             engine.exchange_counts(pending)
             plan = engine.finish_plan(pending)
-            received = engine.dispatch(plan, self._empty_send)
+            fixed = self._fixed_ok and plan.num_recv <= self._fixed_rows
+            if plan.num_recv > self._fixed_rows and not self._fixed_overflow_logged:
+                logger.warning(
+                    "routed[F%d]: received %d rows > fixed launch size %d; "
+                    "launching at the received size",
+                    self.role_rank,
+                    plan.num_recv,
+                    self._fixed_rows,
+                )
+                self._fixed_overflow_logged = True
+            received = engine.dispatch(
+                plan, self._empty_send, min_rows=self._fixed_rows if fixed else 0
+            )
+            if not fixed:
+                received = [r[: plan.num_recv] for r in received]
             ready = torch.cuda.Event()
             ready.record(stream)
             self._dispatch_chain = ready
@@ -950,6 +1009,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             received=received,
             stream=stream,
             ready=ready,
+            fixed=fixed,
         )
 
     def recv_attn_output(
@@ -975,6 +1035,14 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         torch.cuda.current_stream(self.device).wait_event(prefetched.ready)
 
         hidden_states, topk_ids, topk_weights = received[0], received[1], received[2]
+        if prefetched.fixed:
+            # Fixed-size launch: the rows past num_recv get expert id -1 and
+            # the experts kernel learns how many rows are real.
+            assert self.engine is not None
+            self.engine.mask_rows_past(plan.slot, topk_ids, plan.num_recv)
+            fixed_launch.set_valid_rows(plan.num_recv, topk_ids.shape[0])
+        else:
+            fixed_launch.clear_valid_rows()
         a1q_scale = received[3] if self.spec.scale_tail is not None else None
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=0,
@@ -1007,6 +1075,9 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         if not isinstance(state, RoutedTransferState):
             raise RuntimeError("send_ffn_output needs the state of recv_attn_output")
         plan, stream = state.plan, state.stream
+        if ffn_output.shape[0] > plan.num_recv:
+            # Fixed-size launch: only the first num_recv rows are real.
+            ffn_output = ffn_output[: plan.num_recv]
         if ffn_output.shape[0] != plan.num_recv:
             raise ValueError(
                 f"ffn_output has {ffn_output.shape[0]} rows, stage "
