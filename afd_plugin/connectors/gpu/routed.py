@@ -978,7 +978,9 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                 logger.warning(
                     "routed[F%d]: received %d rows > fixed launch size %d; "
                     "launching at the received size",
-                    self.role_rank, plan.num_recv, self._fixed_rows,
+                    self.role_rank,
+                    plan.num_recv,
+                    self._fixed_rows,
                 )
                 self._fixed_overflow_logged = True
             received = engine.dispatch(
