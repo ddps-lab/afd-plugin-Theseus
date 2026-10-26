@@ -32,6 +32,12 @@ rank takes part in every count exchange. That exchange is also what makes a
 region safe to rewrite: a rank only reaches the next layer's exchange after it
 has consumed this one.
 
+With the parent's fixed-size experts launch (unquantized Triton experts), the
+FFN gathers the received rows into buffers of the regions' total size
+(Attention ranks x R rows) instead of tensors of the received size, so the
+experts kernel always sees one shape; the regions themselves are not handed
+over because their rows are not contiguous.
+
 Limitations: one micro-batch (no DBO), unquantized rows, Attention TP=1.
 """
 
@@ -106,6 +112,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         self._notifs: dict[str, list[bytes]] = {}
         # Attention: stage -> plan of the dispatch whose results are pending.
         self._nixl_pending: dict[int, P2pAll2AllPlan] = {}
+        # FFN, fixed-size experts launch: the buffers the received rows are
+        # gathered into (empty when the launch is off).
+        self._fixed_received: list[torch.Tensor] = []
 
     # ------------------------------------------------------------ lifecycle
     def init_afd_connector(self) -> None:
@@ -136,6 +145,18 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         self._results = torch.empty(
             (rows, spec.hidden_size), dtype=spec.model_dtype, device=self.device
         )
+        if self.is_ffn and self._fixed_ok:
+            # Allocated once and reused by every stage: recv_attn_output masks
+            # the rows past the received ones, and mask_rows_past tracks which
+            # rows still need it per buffer address.
+            self._fixed_received = [
+                torch.empty(
+                    (self._fixed_rows, *region.shape[1:]),
+                    dtype=region.dtype,
+                    device=self.device,
+                )
+                for region in self._rows
+            ]
         self.agent = nixl_agent(
             _agent_name(self.world_rank),
             nixl_agent_config(backends=[NIXL_BACKEND]),
@@ -359,21 +380,32 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 }
             )
         # Gather the receive regions into one block grouped by source rank,
-        # the order the NCCL engine's dispatch returns.
-        received = [
-            torch.cat(
-                [
-                    region[attn * self.max_tokens : attn * self.max_tokens + count]
-                    for attn, count in enumerate(attn_counts)
-                ]
-            )
-            for region in self._rows
-        ]
+        # the order the NCCL engine's dispatch returns. With the fixed-size
+        # launch the block is the head of a fixed-size buffer and the whole
+        # buffer goes on (recv_attn_output masks the rest); the regions
+        # together are that size, so the block always fits.
+        fixed = bool(self._fixed_received)
+        received: list[torch.Tensor] = []
+        for i, region in enumerate(self._rows):
+            parts = [
+                region[attn * self.max_tokens : attn * self.max_tokens + count]
+                for attn, count in enumerate(attn_counts)
+            ]
+            if fixed:
+                torch.cat(parts, out=self._fixed_received[i][: plan.num_recv])
+                received.append(self._fixed_received[i])
+            else:
+                received.append(torch.cat(parts))
         stream = torch.cuda.current_stream(self.device)
         ready = torch.cuda.Event()
         ready.record(stream)
         return RoutedPrefetch(
-            stage=stage, plan=plan, received=received, stream=stream, ready=ready
+            stage=stage,
+            plan=plan,
+            received=received,
+            stream=stream,
+            ready=ready,
+            fixed=fixed,
         )
 
     def send_ffn_output(
@@ -389,6 +421,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         if not isinstance(state, RoutedTransferState):
             raise RuntimeError("send_ffn_output needs the state of recv_attn_output")
         plan = state.plan
+        if ffn_output.shape[0] > plan.num_recv:
+            # Fixed-size launch: only the first num_recv rows are real.
+            ffn_output = ffn_output[: plan.num_recv]
         if ffn_output.shape[0] != plan.num_recv:
             raise ValueError(
                 f"ffn_output has {ffn_output.shape[0]} rows, stage "
