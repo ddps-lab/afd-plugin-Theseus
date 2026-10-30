@@ -1101,6 +1101,35 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             chain.record(stream)
             self._combine_chain = chain
 
+    def reset_step_state(self) -> None:
+        """Drop what a step that did not run to its end left in flight.
+
+        Called by the control plane when the next step's payload arrives.
+        """
+        if self._deferred_result is not None:
+            logger.warning(
+                "routed AFD connector: result receive of stage %d of the "
+                "previous step was never posted",
+                self._deferred_result[0],
+            )
+            self._deferred_result = None
+        if self._plans:
+            logger.warning(
+                "routed AFD connector: %d dispatches of the previous step were "
+                "never collected",
+                len(self._plans),
+            )
+            self._plans.clear()
+
+    def flush_ffn_output(self) -> None:
+        """Send whatever ``send_ffn_output`` may still hold back.
+
+        The NCCL combine is posted on the stage stream at once, so there is
+        nothing to do; the FFN runner calls this after the last MoE layer for
+        connectors that defer the send (``NixlRoutedAFDConnector``).
+        """
+        return None
+
 
 class P2pNcclRoutedControlPlane(AFDControlPlane):
     """Per-step control payload: Attention role rank 0 -> every FFN rank."""
@@ -1120,20 +1149,7 @@ class P2pNcclRoutedControlPlane(AFDControlPlane):
         # previous one, so the per-communicator chains start afresh.
         connector._dispatch_chain = None
         connector._combine_chain = None
-        if connector._deferred_result is not None:
-            logger.warning(
-                "routed AFD connector: result receive of stage %d of the "
-                "previous step was never posted",
-                connector._deferred_result[0],
-            )
-            connector._deferred_result = None
-        if connector._plans:
-            logger.warning(
-                "routed AFD connector: %d dispatches of the previous step were "
-                "never collected",
-                len(connector._plans),
-            )
-            connector._plans.clear()
+        connector.reset_step_state()
         # DEBUG(p2p_nccl): only with VLLM_P2P_NCCL_DEBUG.
         if _DEBUG and _should_log(connector._num_steps):
             logger.info(
