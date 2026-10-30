@@ -288,6 +288,11 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                             input_ids=payload.input_ids,
                         )
                     self.connector.send_ffn_output(rank_ffn_output, context)
+            if routed:
+                # Routed connectors may hold the last partial sums back until
+                # their experts kernel is done (NIXL); nothing polls after the
+                # last layer, so send them now.
+                cast("P2pNcclRoutedAFDConnector", self.connector).flush_ffn_output()
         return rank_ffn_output
 
     def _run_routed_layer(
