@@ -95,6 +95,10 @@ def test_create_gpu_profiler_uses_configured_schedule(monkeypatch):
     assert profiler_module.profile_kwargs["record_shapes"] is True
     assert profiler_module.profile_kwargs["profile_memory"] is False
     assert profiler_module.profile_kwargs["with_stack"] is False
+    # DBO micro-batches run on threads other than the one starting the profiler.
+    assert profiler_module.profile_kwargs["experimental_config"] == {
+        "profile_all_threads": True,
+    }
     assert profiler_module.trace_dir == "/tmp/afd-ffn"
 
 
@@ -196,6 +200,10 @@ class _FakeTorchProfiler:
 
     def schedule(self, **kwargs):
         self.schedule_kwargs = kwargs
+        return kwargs
+
+    @staticmethod
+    def _ExperimentalConfig(**kwargs):  # noqa: N802 - mirrors torch.profiler
         return kwargs
 
     def tensorboard_trace_handler(self, trace_dir):

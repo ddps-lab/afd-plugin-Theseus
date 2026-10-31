@@ -138,6 +138,12 @@ def create_afd_gpu_profiler(
         record_shapes=True,
         profile_memory=False,
         with_stack=False,
+        # vLLM DBO runs each micro-batch on its own Python thread, started per
+        # forward; by default the profiler records ops of the starting thread
+        # only, so the micro-batches' ranges and ops would be missing.
+        experimental_config=torch.profiler._ExperimentalConfig(
+            profile_all_threads=True,
+        ),
     )
     if config.trigger is not None:
         logger.info(
