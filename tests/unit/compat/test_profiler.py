@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from afd_plugin.compat.profiler import (
+    TriggeredProfiler,
     afd_gpu_profiler_config,
     create_afd_gpu_profiler,
     step_afd_gpu_profiler,
@@ -20,6 +21,7 @@ _ENV_NAMES = (
     "AFD_GPU_ATTENTION_PROFILER_REPEAT",
     "AFD_GPU_ATTENTION_PROFILER_SKIP_FIRST",
     "AFD_GPU_ATTENTION_PROFILER_DIR",
+    "AFD_GPU_ATTENTION_PROFILER_TRIGGER",
     "AFD_GPU_FFN_PROFILER_ENABLE",
     "AFD_GPU_FFN_PROFILER_WAIT",
     "AFD_GPU_FFN_PROFILER_WARMUP",
@@ -27,6 +29,7 @@ _ENV_NAMES = (
     "AFD_GPU_FFN_PROFILER_REPEAT",
     "AFD_GPU_FFN_PROFILER_SKIP_FIRST",
     "AFD_GPU_FFN_PROFILER_DIR",
+    "AFD_GPU_FFN_PROFILER_TRIGGER",
     "VLLM_TORCH_PROFILER_DIR",
 )
 
@@ -50,6 +53,7 @@ def test_gpu_profiler_defaults_are_disabled():
     assert attention.trace_dir == "./profiler_logs/attn"
     assert ffn.enabled is False
     assert ffn.trace_dir == "./profiler_logs/ffn"
+    assert attention.trigger is None
 
 
 def test_gpu_profiler_dir_falls_back_to_vllm_torch_profiler_dir(monkeypatch):
@@ -92,6 +96,57 @@ def test_create_gpu_profiler_uses_configured_schedule(monkeypatch):
     assert profiler_module.profile_kwargs["profile_memory"] is False
     assert profiler_module.profile_kwargs["with_stack"] is False
     assert profiler_module.trace_dir == "/tmp/afd-ffn"
+
+
+def test_triggered_gpu_profiler_starts_when_trigger_file_exists(monkeypatch, tmp_path):
+    profiler_module = _FakeTorchProfiler()
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(profiler=profiler_module),
+    )
+    trigger = tmp_path / "go"
+    monkeypatch.setenv("AFD_GPU_ATTENTION_PROFILER_ENABLE", "1")
+    monkeypatch.setenv("AFD_GPU_ATTENTION_PROFILER_TRIGGER", str(trigger))
+
+    profiler = create_afd_gpu_profiler("attention")
+    inner = profiler_module.created_profiler
+
+    assert isinstance(profiler, TriggeredProfiler)
+    assert inner.started is False
+    step_afd_gpu_profiler(profiler)
+    step_afd_gpu_profiler(profiler)
+    assert inner.started is False
+    assert inner.steps == 0
+
+    trigger.touch()
+    step_afd_gpu_profiler(profiler)  # starts; start() takes schedule step 0
+    assert inner.started is True
+    assert inner.steps == 0
+    step_afd_gpu_profiler(profiler)
+    step_afd_gpu_profiler(profiler)
+    assert inner.steps == 2
+
+    stop_afd_gpu_profiler(profiler)
+    assert inner.stopped is True
+
+
+def test_triggered_gpu_profiler_never_started_is_not_stopped(monkeypatch, tmp_path):
+    profiler_module = _FakeTorchProfiler()
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(profiler=profiler_module),
+    )
+    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_ENABLE", "1")
+    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_TRIGGER", str(tmp_path / "never"))
+
+    profiler = create_afd_gpu_profiler("ffn")
+    step_afd_gpu_profiler(profiler)
+    stop_afd_gpu_profiler(profiler)
+
+    assert profiler_module.created_profiler.started is False
+    assert profiler_module.created_profiler.stopped is False
 
 
 def test_step_gpu_profiler_ignores_disabled_profiler():
