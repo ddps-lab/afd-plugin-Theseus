@@ -109,10 +109,13 @@ logger = init_logger(f"vllm.{__name__}")
 # as an error instead of a hang.
 TRANSFER_TIMEOUT_S = 120.0
 NIXL_BACKEND = "UCX"
-# AFD_NIXL_DEBUG=1: log every count exchange, WRITE and notification of the
-# first _DEBUG_PLANS plans, and what a host wait is still waiting for every
-# _DEBUG_WAIT_S seconds; also lets SIGUSR1 dump every thread's stack.
-_DEBUG = os.environ.get("AFD_NIXL_DEBUG", "0") == "1"
+# AFD_NIXL_DEBUG=1: a host wait longer than _DEBUG_WAIT_S logs what it is
+# still waiting for every _DEBUG_WAIT_S seconds, and SIGUSR1 dumps every
+# thread's stack (no cost while nothing waits that long). =2 also logs every
+# count exchange, WRITE and notification of the first _DEBUG_PLANS plans
+# (adds host time on the hot path).
+_DEBUG_LEVEL = int(os.environ.get("AFD_NIXL_DEBUG", "0") or 0)
+_DEBUG = _DEBUG_LEVEL >= 1
 _DEBUG_PLANS = 400
 _DEBUG_WAIT_S = 5.0
 
@@ -201,8 +204,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
 
     # ---------------------------------------------------------------- debug
     def _dbg(self, fmt: str, *args: Any) -> None:
-        """Log while the first _DEBUG_PLANS plans are handled (AFD_NIXL_DEBUG)."""
-        if _DEBUG and self._dbg_plan < _DEBUG_PLANS:
+        """Log while the first _DEBUG_PLANS plans are handled (AFD_NIXL_DEBUG=2)."""
+        if _DEBUG_LEVEL >= 2 and self._dbg_plan < _DEBUG_PLANS:
             self._dbg_always(fmt, *args)
 
     def _dbg_always(self, fmt: str, *args: Any) -> None:
