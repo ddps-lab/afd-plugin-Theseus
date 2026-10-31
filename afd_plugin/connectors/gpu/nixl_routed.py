@@ -68,6 +68,9 @@ Limitations: unquantized rows, Attention TP=1.
 
 from __future__ import annotations
 
+import faulthandler
+import os
+import signal
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -106,6 +109,12 @@ logger = init_logger(f"vllm.{__name__}")
 # as an error instead of a hang.
 TRANSFER_TIMEOUT_S = 120.0
 NIXL_BACKEND = "UCX"
+# AFD_NIXL_DEBUG=1: log every count exchange, WRITE and notification of the
+# first _DEBUG_PLANS plans, and what a host wait is still waiting for every
+# _DEBUG_WAIT_S seconds; also lets SIGUSR1 dump every thread's stack.
+_DEBUG = os.environ.get("AFD_NIXL_DEBUG", "0") == "1"
+_DEBUG_PLANS = 400
+_DEBUG_WAIT_S = 5.0
 
 
 def _agent_name(world_rank: int) -> str:
@@ -144,6 +153,11 @@ class PendingCombineWrite:
 
 class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
     """``P2pNcclRoutedAFDConnector`` with the rows carried by NIXL WRITEs."""
+
+    # AFD_NIXL_DEBUG: seq of the plan being handled, count exchanges posted
+    # (class defaults so connectors built without __init__ in tests have them).
+    _dbg_plan = -1
+    _dbg_exchanges = 0
 
     def __init__(
         self,
@@ -184,6 +198,22 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # FFN, fixed-size experts launch: per slot, the buffers the received
         # rows are gathered into (empty when the launch is off).
         self._fixed_received: list[list[torch.Tensor]] = []
+
+    # ---------------------------------------------------------------- debug
+    def _dbg(self, fmt: str, *args: Any) -> None:
+        """Log while the first _DEBUG_PLANS plans are handled (AFD_NIXL_DEBUG)."""
+        if _DEBUG and self._dbg_plan < _DEBUG_PLANS:
+            self._dbg_always(fmt, *args)
+
+    def _dbg_always(self, fmt: str, *args: Any) -> None:
+        if _DEBUG:
+            logger.info(
+                "nixl-debug[%s r%d plan%d] %s",
+                self.afd_config.role,
+                self.world_rank,
+                self._dbg_plan,
+                fmt % args,
+            )
 
     # ------------------------------------------------------------ lifecycle
     def init_afd_connector(self) -> None:
@@ -279,6 +309,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             self.num_slots,
             NIXL_BACKEND,
         )
+        if _DEBUG:
+            # kill -USR1 <pid>: every thread's stack, the process keeps running.
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
 
     def close(self) -> None:
         if self.agent is not None:
@@ -341,9 +374,19 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             self._peer_agents[peer],
             notif,
         )
-        if self.agent.transfer(handle) == "ERR":
+        state = self.agent.transfer(handle)
+        if state == "ERR":
             raise RuntimeError(f"NIXL WRITE to world rank {peer} failed to post")
         self._writes.setdefault(slot, []).append(handle)
+        self._dbg(
+            "WRITE posted slot=%d peer=%d rows=%d region_row=%d notif=%s -> %s",
+            slot,
+            peer,
+            num_rows,
+            region_row,
+            notif,
+            state,
+        )
 
     def _service_writes(self) -> None:
         """Make progress without blocking: post the partial sums whose experts
@@ -375,11 +418,36 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
 
     def _wait_until(self, done: Callable[[], bool], what: str) -> None:
         """Poll ``done`` (servicing the WRITEs meanwhile) until it holds."""
-        deadline = time.monotonic() + TRANSFER_TIMEOUT_S
+        start = time.monotonic()
+        deadline = start + TRANSFER_TIMEOUT_S
+        report = start + _DEBUG_WAIT_S
         while True:
             self._service_writes()
             if done():
+                if _DEBUG and time.monotonic() - start > _DEBUG_WAIT_S:
+                    self._dbg_always(
+                        "%s done after %.1f s", what, time.monotonic() - start
+                    )
                 return
+            if _DEBUG and time.monotonic() > report:
+                report += _DEBUG_WAIT_S
+                self._dbg_always(
+                    "still waiting %s for %.1f s: writes=%s pending_combines=%s "
+                    "unconsumed_notifs=%s",
+                    what,
+                    time.monotonic() - start,
+                    {
+                        slot: [self.agent.check_xfer_state(h) for h in hs]
+                        for slot, hs in self._writes.items()
+                    }
+                    if self.agent is not None
+                    else {},
+                    [
+                        (p.slot, p.notif, p.ready.query())
+                        for p in self._pending_combines
+                    ],
+                    {k: v for k, v in self._notifs.items() if v},
+                )
             if time.monotonic() > deadline:
                 raise RuntimeError(
                     f"NIXL routed connector: {what} did not finish in time"
@@ -406,6 +474,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
 
         def done() -> bool:
             for name, notifs in agent.get_new_notifs().items():
+                self._dbg("notifs from %s: %s", name, notifs)
                 self._notifs.setdefault(name, []).extend(notifs)
             for name in [n for n in missing if missing[n] in self._notifs.get(n, [])]:
                 self._notifs[name].remove(missing.pop(name))
@@ -465,6 +534,14 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         with torch.profiler.record_function(f"afd_nixl.count_wait[{stage}]"):
             self._wait_event(exchanged, "count exchange")
         plan = engine.finish_plan(pending)
+        self._dbg_plan = plan.seq
+        self._dbg(
+            "A send stage=%d seq=%d tokens=%d send=%s",
+            stage,
+            plan.seq,
+            plan.num_tokens,
+            plan.send_counts,
+        )
         # This stage's block of the send buffers: a token is packed once per
         # FFN rank it visits, so a stage packs up to ffn_size * max_tokens
         # rows. Its previous WRITEs were completed in recv_ffn_output before
@@ -521,6 +598,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             )
         with torch.profiler.record_function(f"afd_nixl.dispatch_finish[{stage}]"):
             self._finish_writes(stage)
+        self._dbg("A wait combine stage=%d seq=%d", stage, plan.seq)
         with torch.profiler.record_function(f"afd_nixl.combine_wait[{stage}]"):
             notif = f"c{plan.seq}".encode()
             self._wait_notifs(
@@ -571,6 +649,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             exchanged = torch.cuda.Event()
             exchanged.record(stream)
         self._dispatch_chain = exchanged
+        self._dbg_exchanges += 1
+        self._dbg("F prefetch stage=%d exchange#%d", stage, self._dbg_exchanges)
         self._service_writes()
         return NixlPrefetch(
             stage=stage, pending=pending, stream=stream, exchanged=exchanged
@@ -585,6 +665,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         with torch.cuda.stream(stream):
             plan = self.engine.finish_plan(prefetched.pending)
         attn_counts = plan.recv_counts[self.ffn_size :]
+        self._dbg_plan = plan.seq
+        self._dbg("F recv stage=%d seq=%d counts=%s", stage, plan.seq, attn_counts)
         with torch.profiler.record_function(f"afd_nixl.dispatch_wait[{stage}]"):
             notif = f"d{plan.seq}".encode()
             self._wait_notifs(
@@ -650,6 +732,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         )
 
     def _post_combine(self, pending: PendingCombineWrite) -> None:
+        self._dbg("F post combine slot=%d notif=%s", pending.slot, pending.notif)
         for peer, rows, region_row in pending.shares:
             self._write(
                 pending.slot, peer, [rows], region_row, rows.shape[0], pending.notif
@@ -725,6 +808,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             PendingCombineWrite(
                 slot=slot, ready=ready, shares=shares, notif=f"c{plan.seq}".encode()
             )
+        )
+        self._dbg(
+            "F staged combine slot=%d seq=%d rows=%d", slot, plan.seq, plan.num_recv
         )
         self._service_writes()
 
