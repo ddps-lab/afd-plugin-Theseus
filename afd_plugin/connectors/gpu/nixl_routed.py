@@ -118,6 +118,12 @@ _DEBUG_LEVEL = int(os.environ.get("AFD_NIXL_DEBUG", "0") or 0)
 _DEBUG = _DEBUG_LEVEL >= 1
 _DEBUG_PLANS = 400
 _DEBUG_WAIT_S = 5.0
+# AFD_NIXL_PROGRESS_THREAD=0: create the NIXL agent without its progress
+# thread. NIXL 1.3.x polls the UCX worker from that thread with no wait and
+# shares the worker (UCX multi-thread mode) with the calling thread; without
+# it the worker is single-threaded and progresses in this connector's host
+# waits, which poll NIXL the whole time.
+_PROGRESS_THREAD = os.environ.get("AFD_NIXL_PROGRESS_THREAD", "1") != "0"
 
 
 def _agent_name(world_rank: int) -> str:
@@ -268,7 +274,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             ]
         self.agent = nixl_agent(
             _agent_name(self.world_rank),
-            nixl_agent_config(backends=[NIXL_BACKEND]),
+            nixl_agent_config(
+                backends=[NIXL_BACKEND], enable_prog_thread=_PROGRESS_THREAD
+            ),
         )
         self.agent.register_memory([*self._rows, self._results])
 
@@ -304,13 +312,14 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             self._peer_devices[peer] = device
         logger.info(
             "NIXL routed AFD connector ready: role=%s world_rank=%d peers=%s "
-            "region_rows=%d slots=%d backend=%s",
+            "region_rows=%d slots=%d backend=%s progress_thread=%s",
             self.afd_config.role,
             self.world_rank,
             list(self._peer_agents),
             self.max_tokens,
             self.num_slots,
             NIXL_BACKEND,
+            _PROGRESS_THREAD,
         )
         if _DEBUG:
             # kill -USR1 <pid>: every thread's stack, the process keeps running.
