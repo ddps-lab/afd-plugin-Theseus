@@ -462,7 +462,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         engine.exchange_counts(pending)
         exchanged = torch.cuda.Event()
         exchanged.record(stream)
-        self._wait_event(exchanged, "count exchange")
+        with torch.profiler.record_function(f"afd_nixl.count_wait[{stage}]"):
+            self._wait_event(exchanged, "count exchange")
         plan = engine.finish_plan(pending)
         # This stage's block of the send buffers: a token is packed once per
         # FFN rank it visits, so a stage packs up to ffn_size * max_tokens
@@ -471,7 +472,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         block_rows = self.ffn_size * self.max_tokens
         block = slice(stage * block_rows, (stage + 1) * block_rows)
         send_rows = [t[block] for t in self._rows]
-        with torch.profiler.record_function("afd_nixl.dispatch_write"):
+        with torch.profiler.record_function(f"afd_nixl.dispatch_write[{stage}]"):
             # Destination-major packing, as the NCCL engine's dispatch does.
             for src, packed in zip(tensors, send_rows, strict=True):
                 torch.index_select(src, 0, plan.perm, out=packed[: plan.num_send])
@@ -518,9 +519,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 f"ref_tensor has {ref_tensor.shape[0]} rows, stage {stage} "
                 f"dispatched {plan.num_tokens}",
             )
-        with torch.profiler.record_function("afd_nixl.dispatch_finish"):
+        with torch.profiler.record_function(f"afd_nixl.dispatch_finish[{stage}]"):
             self._finish_writes(stage)
-        with torch.profiler.record_function("afd_nixl.combine_wait"):
+        with torch.profiler.record_function(f"afd_nixl.combine_wait[{stage}]"):
             notif = f"c{plan.seq}".encode()
             self._wait_notifs(
                 {ffn: notif for ffn in range(self.ffn_size) if plan.send_counts[ffn]}
@@ -579,11 +580,12 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         """Read the counts, wait for the rows and gather them on the stage stream."""
         assert self.engine is not None
         stage, stream = prefetched.stage, prefetched.stream
-        self._wait_event(prefetched.exchanged, "count exchange")
+        with torch.profiler.record_function(f"afd_nixl.count_wait[{stage}]"):
+            self._wait_event(prefetched.exchanged, "count exchange")
         with torch.cuda.stream(stream):
             plan = self.engine.finish_plan(prefetched.pending)
         attn_counts = plan.recv_counts[self.ffn_size :]
-        with torch.profiler.record_function("afd_nixl.dispatch_wait"):
+        with torch.profiler.record_function(f"afd_nixl.dispatch_wait[{stage}]"):
             notif = f"d{plan.seq}".encode()
             self._wait_notifs(
                 {
@@ -700,7 +702,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         self._flush_combines(slot)
         base = slot * self.attn_size * self.max_tokens
         staged = self._results[base : base + plan.num_recv]
-        with torch.profiler.record_function("afd_nixl.combine_stage"):
+        with torch.profiler.record_function(f"afd_nixl.combine_stage[{slot}]"):
             staged.copy_(ffn_output)
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream(self.device))

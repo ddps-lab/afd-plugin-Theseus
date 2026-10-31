@@ -41,6 +41,9 @@ class AFDGPUProfilerConfig:
     repeat: int
     skip_first: int
     trace_dir: str
+    # When set, the profiler (and its wait/warmup/active schedule) starts at
+    # the first step on which this file exists instead of at runner init.
+    trigger: str | None = None
 
 
 def afd_gpu_profiler_config(role: AFDGPUProfilerRole) -> AFDGPUProfilerConfig:
@@ -58,11 +61,55 @@ def afd_gpu_profiler_config(role: AFDGPUProfilerRole) -> AFDGPUProfilerConfig:
             default=_DEFAULT_SKIP_FIRST_STEPS,
         ),
         trace_dir=_env_dir(f"{prefix}_DIR", default=_DEFAULT_DIR[role]),
+        trigger=os.getenv(f"{prefix}_TRIGGER") or None,
     )
 
 
-def create_afd_gpu_profiler(role: AFDGPUProfilerRole) -> torch.profiler.profile | None:
-    """Create a torch profiler when the plugin-owned env enables it."""
+class TriggeredProfiler:
+    """A torch profiler that starts once a trigger file exists.
+
+    The step-counted schedule of a profiler started at runner init lands
+    wherever the request mix puts it; a run script can instead create the
+    trigger file in every Attention and FFN pod once the load it wants to see
+    is running, and all roles then record the same steps from there on.
+    """
+
+    def __init__(
+        self,
+        profiler: torch.profiler.profile,
+        trigger: str,
+        role: AFDGPUProfilerRole,
+    ) -> None:
+        self.profiler = profiler
+        self.trigger = trigger
+        self.role = role
+        self.started = False
+
+    def step(self) -> None:
+        if self.started:
+            self.profiler.step()
+        elif os.path.exists(self.trigger):
+            self.profiler.start()
+            self.started = True
+            logger.info(
+                "AFD GPU %s profiler started: %s exists",
+                self.role,
+                self.trigger,
+            )
+
+    def stop(self) -> None:
+        if self.started:
+            self.profiler.stop()
+
+
+def create_afd_gpu_profiler(
+    role: AFDGPUProfilerRole,
+) -> torch.profiler.profile | TriggeredProfiler | None:
+    """Create a torch profiler when the plugin-owned env enables it.
+
+    With ``<prefix>_TRIGGER`` set, the profiler is returned unstarted inside a
+    ``TriggeredProfiler`` and starts at the first step its file exists.
+    """
 
     config = afd_gpu_profiler_config(role)
     if not config.enabled:
@@ -92,16 +139,27 @@ def create_afd_gpu_profiler(role: AFDGPUProfilerRole) -> torch.profiler.profile 
         profile_memory=False,
         with_stack=False,
     )
+    if config.trigger is not None:
+        logger.info(
+            "AFD GPU %s profiler waits for %s before its schedule starts",
+            role,
+            config.trigger,
+        )
+        return TriggeredProfiler(profiler, config.trigger, role)
     profiler.start()
     return profiler
 
 
-def step_afd_gpu_profiler(profiler: torch.profiler.profile | None) -> None:
+def step_afd_gpu_profiler(
+    profiler: torch.profiler.profile | TriggeredProfiler | None,
+) -> None:
     if profiler is not None:
         profiler.step()
 
 
-def stop_afd_gpu_profiler(profiler: torch.profiler.profile | None) -> None:
+def stop_afd_gpu_profiler(
+    profiler: torch.profiler.profile | TriggeredProfiler | None,
+) -> None:
     if profiler is not None:
         profiler.stop()
 
@@ -134,6 +192,7 @@ def _env_dir(name: str, *, default: str) -> str:
 
 __all__ = [
     "AFDGPUProfilerConfig",
+    "TriggeredProfiler",
     "afd_gpu_profiler_config",
     "create_afd_gpu_profiler",
     "step_afd_gpu_profiler",
