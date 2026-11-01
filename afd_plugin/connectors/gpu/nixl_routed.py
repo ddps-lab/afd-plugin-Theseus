@@ -14,7 +14,8 @@ differently, as NIXL WRITEs followed by a notification:
 
 Every rank registers its receive buffers once at init, split into one region
 of ``R = max_num_batched_tokens`` rows per (micro-batch stage, peer), so
-nothing is registered per layer. With two ranks per role and two stages:
+nothing is registered per layer. The registered buffers are pinned host
+memory (host staging, below). With two ranks per role and two stages:
 
     FFN f (written by Attention)              Attention a (written by FFN)
                   hidden  ids  weights                      results
@@ -33,29 +34,40 @@ rows sends no WRITE and waits for no notification. A notification carries the
 plan sequence number, which advances identically on every rank because every
 rank takes part in every count exchange, in stage order. That exchange is also
 what makes a region safe to rewrite: a rank only reaches the next layer's
-exchange of a stage after it has consumed that stage's rows.
+exchange of a stage after it has consumed that stage's rows (enqueued their
+copy to the GPU on a stream the exchange is ordered after).
 
 Pipeline (the micro-batch stages of a layer overlap as four independent
 resources: Attention GPU, Attention->FFN link, FFN GPU, FFN->Attention link,
 and every step starts as soon as its input has arrived):
 
-* Attention, per stage: count exchange, pack, WRITE, then the shared experts;
-  ``recv_ffn_output`` hands the CPU to the other micro-batches once
-  (``dbo_yield``) and polls for the partial sums when it gets it back. No
-  receive has to be posted for a WRITE, so a stage's partial sums leave the
-  FFN the moment its experts are done, whatever the other stages do (the NCCL
-  parent has to post each result receive after the next dispatch).
+* Attention, per stage: count exchange, pack (and copy into the pinned send
+  buffers), WRITE, then the shared experts; ``recv_ffn_output`` hands the
+  CPU to the other micro-batches once (``dbo_yield``) and polls for the
+  partial sums when it gets it back. No receive has to be posted for a
+  WRITE, so a stage's partial sums leave the FFN the moment its experts are
+  done, whatever the other stages do (the NCCL parent has to post each
+  result receive after the next dispatch).
 * FFN, per stage: ``prefetch_attn_output`` only posts the count exchange and
   returns; ``recv_attn_output`` reads the counts, polls for the rows and
-  gathers them on the stage's stream; ``send_ffn_output`` stages the partial
-  sums and returns at once. The WRITE is posted from the polling loops as
-  soon as the experts kernel has finished, so the FFN GPU goes straight from
-  one stage's experts to the next while the previous partial sums are on the
+  gathers them onto the GPU on the stage's stream; ``send_ffn_output``
+  copies the partial sums into the pinned send buffer and returns at once.
+  The WRITE is posted from the polling loops as soon as that copy (so the
+  experts kernel) has finished, so the FFN GPU goes straight from one
+  stage's experts to the next while the previous partial sums are on the
   wire. ``flush_ffn_output`` (after the last MoE layer) posts what is left.
 
 Every host wait is a polling loop that also drives the posted WRITEs to
 completion, because NIXL sends the notification of a WRITE only when its
 state is checked after it finished.
+
+Host staging: the connector itself moves the rows between the GPU and the
+pinned NIXL buffers, with asynchronous copies on its streams that CUDA events
+order like the kernels around them, so UCX only sends host memory over TCP
+and makes no CUDA calls. With the buffers in GPU memory
+(``AFD_NIXL_HOST_STAGING=0``) UCX copies between the GPU and its TCP buffers
+itself, with a synchronous CUDA copy inside ``transfer()``; one of those
+copies was seen never to return, leaving the FFN stuck in ``transfer()``.
 
 With the parent's fixed-size experts launch (unquantized Triton experts), the
 FFN gathers the received rows into per-stage buffers of the regions' size
@@ -124,6 +136,9 @@ _DEBUG_WAIT_S = 5.0
 # it the worker is single-threaded and progresses in this connector's host
 # waits, which poll NIXL the whole time.
 _PROGRESS_THREAD = os.environ.get("AFD_NIXL_PROGRESS_THREAD", "1") != "0"
+# AFD_NIXL_HOST_STAGING=0: register the GPU buffers with NIXL instead of
+# pinned host buffers (see "Host staging" in the module docstring).
+_HOST_STAGING = os.environ.get("AFD_NIXL_HOST_STAGING", "1") != "0"
 
 
 def _agent_name(world_rank: int) -> str:
@@ -191,9 +206,13 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         self._peer_devices: dict[int, int] = {}
         # Attention: send rows (hidden, ids, weights) and the result regions;
         # FFN: receive regions (hidden, ids, weights) and the partial sums.
-        # All of them hold num_slots blocks, one per stage.
+        # All of them hold num_slots blocks, one per stage, and are the
+        # buffers registered with NIXL.
         self._rows: list[torch.Tensor] = []
         self._results: torch.Tensor | None = None
+        # Attention under host staging: the GPU buffers a stage's rows are
+        # packed into before they are copied into the pinned send buffers.
+        self._pack: list[torch.Tensor] = []
         # slot -> WRITE handles posted and not yet seen complete.
         self._writes: dict[int, list[Any]] = {}
         self._notifs: dict[str, list[bytes]] = {}
@@ -247,16 +266,31 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # Attention ranks per stage.
         peers = self.attn_size if self.is_ffn else self.ffn_size
         rows = self.num_slots * peers * self.max_tokens
+        # Host staging: pinned host memory (plain host memory when the
+        # connector runs on CPU tensors in tests).
+        self._host_staging = _HOST_STAGING
+        where = torch.device("cpu") if self._host_staging else self.device
+        pin = self._host_staging and self.device.type == "cuda"
+
+        def buffer(width: int, dtype: torch.dtype) -> torch.Tensor:
+            return torch.empty((rows, width), dtype=dtype, device=where, pin_memory=pin)
+
         self._rows = [
-            torch.empty(
-                (rows, spec.hidden_size), dtype=spec.act_dtype, device=self.device
-            ),
-            torch.empty((rows, spec.top_k), dtype=_IDS_DTYPE, device=self.device),
-            torch.empty((rows, spec.top_k), dtype=_WEIGHTS_DTYPE, device=self.device),
+            buffer(spec.hidden_size, spec.act_dtype),
+            buffer(spec.top_k, _IDS_DTYPE),
+            buffer(spec.top_k, _WEIGHTS_DTYPE),
         ]
-        self._results = torch.empty(
-            (rows, spec.hidden_size), dtype=spec.model_dtype, device=self.device
+        self._results = buffer(spec.hidden_size, spec.model_dtype)
+        self._pack = (
+            [
+                torch.empty(t.shape, dtype=t.dtype, device=self.device)
+                for t in self._rows
+            ]
+            if self._host_staging and not self.is_ffn
+            else []
         )
+        # Where every rank's NIXL buffers are (checked to be the same below).
+        self._nixl_mem_type = "VRAM" if self._results.is_cuda else "DRAM"
         if self.is_ffn and self._fixed_ok:
             # One set per stage: recv_attn_output masks the rows past the
             # received ones, and mask_rows_past tracks which rows still need
@@ -283,18 +317,19 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # Exchange agent metadata and region addresses over the dispatch
         # group. Peers write into FFN's receive rows and Attention's results.
         writable = self._rows if self.is_ffn else [self._results]
+        layout = (self.max_tokens, self.num_slots, self._nixl_mem_type)
         mine = (
             self.agent.get_agent_metadata(),
             [(t.data_ptr(), t[0].numel() * t.element_size()) for t in writable],
-            self.device.index or 0,
-            (self.max_tokens, self.num_slots),
+            (self.device.index or 0) if self._nixl_mem_type == "VRAM" else 0,
+            layout,
         )
         everyone: list[Any] = [None] * self.world_size
         dist.all_gather_object(everyone, mine, group=self.dispatch_pg)
-        if {info[3] for info in everyone} != {(self.max_tokens, self.num_slots)}:
+        if {info[3] for info in everyone} != {layout}:
             raise RuntimeError(
-                "NixlRoutedAFDConnector needs the same max_num_batched_tokens and "
-                "micro-batch count on every rank, got "
+                "NixlRoutedAFDConnector needs the same max_num_batched_tokens, "
+                "micro-batch count and AFD_NIXL_HOST_STAGING on every rank, got "
                 f"{[info[3] for info in everyone]}",
             )
         peer_ranks = (
@@ -312,7 +347,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             self._peer_devices[peer] = device
         logger.info(
             "NIXL routed AFD connector ready: role=%s world_rank=%d peers=%s "
-            "region_rows=%d slots=%d backend=%s progress_thread=%s",
+            "region_rows=%d slots=%d backend=%s progress_thread=%s "
+            "host_staging=%s",
             self.afd_config.role,
             self.world_rank,
             list(self._peer_agents),
@@ -320,6 +356,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             self.num_slots,
             NIXL_BACKEND,
             _PROGRESS_THREAD,
+            self._host_staging,
         )
         if _DEBUG:
             # kill -USR1 <pid>: every thread's stack, the process keeps running.
@@ -376,13 +413,10 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             )
             for addr, row_bytes in self._peer_regions[peer]
         ]
-        # GPU memory in serving, host memory when the connector runs on CPU
-        # tensors (tests).
-        mem_type = "VRAM" if self.device.type == "cuda" else "DRAM"
         handle = self.agent.initialize_xfer(
             "WRITE",
             self.agent.get_xfer_descs(local),
-            self.agent.get_xfer_descs(remote, mem_type),
+            self.agent.get_xfer_descs(remote, self._nixl_mem_type),
             self._peer_agents[peer],
             notif,
         )
@@ -494,6 +528,18 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
 
         self._wait_until(done, f"notification from {sorted(missing)}")
 
+    def _gather_rows(self, parts: list[torch.Tensor], out: torch.Tensor) -> None:
+        """Copy ``parts`` (regions of the NIXL buffers) one after another into
+        ``out`` on the current stream. Under host staging they are pinned host
+        memory, so the copies are asynchronous like a kernel."""
+        if not self._host_staging:
+            torch.cat(parts, out=out)
+            return
+        offset = 0
+        for part in parts:
+            out[offset : offset + part.shape[0]].copy_(part, non_blocking=True)
+            offset += part.shape[0]
+
     # ------------------------------------------------- attention data path
     def send_attn_output(
         self,
@@ -557,14 +603,21 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # This stage's block of the send buffers: a token is packed once per
         # FFN rank it visits, so a stage packs up to ffn_size * max_tokens
         # rows. Its previous WRITEs were completed in recv_ffn_output before
-        # the stage came round again.
+        # the stage came round again (and the copy out of its pack buffers
+        # before those WRITEs were posted).
         block_rows = self.ffn_size * self.max_tokens
         block = slice(stage * block_rows, (stage + 1) * block_rows)
         send_rows = [t[block] for t in self._rows]
+        pack_rows = [t[block] for t in self._pack] or send_rows
         with torch.profiler.record_function(f"afd_nixl.dispatch_write[{stage}]"):
-            # Destination-major packing, as the NCCL engine's dispatch does.
-            for src, packed in zip(tensors, send_rows, strict=True):
-                torch.index_select(src, 0, plan.perm, out=packed[: plan.num_send])
+            # Destination-major packing, as the NCCL engine's dispatch does;
+            # under host staging into the GPU pack buffers, then copied into
+            # the pinned send buffers on the same stream.
+            n = plan.num_send
+            for src, packed, sent in zip(tensors, pack_rows, send_rows, strict=True):
+                torch.index_select(src, 0, plan.perm, out=packed[:n])
+                if packed is not sent:
+                    sent[:n].copy_(packed[:n], non_blocking=True)
             packed_done = torch.cuda.Event()
             packed_done.record(stream)
             self._wait_event(packed_done, "packing")
@@ -617,13 +670,20 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 {ffn: notif for ffn in range(self.ffn_size) if plan.send_counts[ffn]}
             )
         # Gather the result regions of the stage back into the packed
-        # (``plan.perm``) order.
+        # (``plan.perm``) order, on the GPU.
         rows_per_region = self.max_tokens
-        back = torch.cat(
+        counts = plan.send_counts[: self.ffn_size]
+        back = torch.empty(
+            (sum(counts), self._results.shape[1]),
+            dtype=self._results.dtype,
+            device=self.device,
+        )
+        self._gather_rows(
             [
                 self._results[(stage * self.ffn_size + ffn) * rows_per_region :][:count]
-                for ffn, count in enumerate(plan.send_counts[: self.ffn_size])
-            ]
+                for ffn, count in enumerate(counts)
+            ],
+            back,
         )
         output = torch.empty_like(ref_tensor)
         if plan.perm.is_cuda:
@@ -688,8 +748,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                     if count
                 }
             )
-        # Gather the stage's receive regions into one block grouped by source
-        # rank, the order the NCCL engine's dispatch returns. With the
+        # Gather the stage's receive regions into one block on the GPU grouped
+        # by source rank, the order the NCCL engine's dispatch returns. With the
         # fixed-size launch the block is the head of the stage's fixed-size
         # buffer and the whole buffer goes on (recv_attn_output masks the
         # rest); the regions together are that size, so the block always
@@ -709,10 +769,14 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 ]
                 if fixed:
                     gather = self._fixed_received[stage][i]
-                    torch.cat(parts, out=gather[: plan.num_recv])
-                    received.append(gather)
                 else:
-                    received.append(torch.cat(parts))
+                    gather = torch.empty(
+                        (plan.num_recv, *region.shape[1:]),
+                        dtype=region.dtype,
+                        device=self.device,
+                    )
+                self._gather_rows(parts, gather[: plan.num_recv])
+                received.append(gather)
             ready = torch.cuda.Event()
             ready.record(stream)
         return RoutedPrefetch(
@@ -798,7 +862,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         base = slot * self.attn_size * self.max_tokens
         staged = self._results[base : base + plan.num_recv]
         with torch.profiler.record_function(f"afd_nixl.combine_stage[{slot}]"):
-            staged.copy_(ffn_output)
+            # Under host staging into pinned host memory: asynchronous,
+            # ``ready`` fires once it has landed.
+            staged.copy_(ffn_output, non_blocking=True)
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream(self.device))
         # The experts kernel that read the slot's gather buffers precedes
