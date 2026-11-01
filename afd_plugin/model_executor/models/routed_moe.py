@@ -25,6 +25,9 @@ import torch
 import torch.nn as nn
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+    MoEPrepareAndFinalizeNoDPEPModular,
+)
 from vllm.model_executor.layers.fused_moe.prepare_finalize.prerouted import (
     PreroutedPrepareAndFinalize,
 )
@@ -171,7 +174,16 @@ def run_prerouted_experts(
             device=hidden_states.device,
         )
     prepare_finalize = routed_experts.quant_method.moe_kernel.prepare_finalize
-    if not isinstance(prepare_finalize, PreroutedPrepareAndFinalize):
+    # A single FFN rank (EP size 1) owns every expert, and vLLM builds its
+    # MoE with the no-DP/EP prepare/finalize: the received global ids are
+    # its local ids, and the fixed-size launch's -1 rows are skipped by the
+    # align and sum kernels as with the prerouted one.
+    single_ffn_rank = isinstance(
+        prepare_finalize, MoEPrepareAndFinalizeNoDPEPModular
+    ) and (moe_config.moe_parallel_config.ep_size == 1)
+    if not (
+        isinstance(prepare_finalize, PreroutedPrepareAndFinalize) or single_ffn_rank
+    ):
         raise RuntimeError(
             "routed AFD FFN role must run with --enable-expert-parallel "
             "--all2all-backend prerouted (got "
@@ -179,6 +191,11 @@ def run_prerouted_experts(
         )
     if hidden_states.dtype == moe_config.in_dtype:
         kernel_input = hidden_states
+    elif single_ffn_rank:
+        raise RuntimeError(
+            "a single routed AFD FFN rank takes unquantized rows only "
+            f"(got {hidden_states.dtype})",
+        )
     else:
         # Pre-quantized rows: the kernel input only fixes the output dtype and
         # the row count; the quantized data and scales go through the
