@@ -145,6 +145,13 @@ def _agent_name(world_rank: int) -> str:
     return f"afd-routed-{world_rank}"
 
 
+def _mark(name: str) -> None:
+    """A point in time in profiler traces: a range of zero length (only the
+    range bookkeeping when the profiler is off)."""
+    with torch.profiler.record_function(name):
+        pass
+
+
 @dataclass(frozen=True)
 class NixlPrefetch:
     """FFN-side count exchange of one stage, posted but not yet read.
@@ -421,6 +428,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             notif,
         )
         state = self.agent.transfer(handle)
+        _mark(f"afd_nixl.write_post[{slot}:{notif.decode()}:{peer}]")
         if state == "ERR":
             raise RuntimeError(f"NIXL WRITE to world rank {peer} failed to post")
         self._writes.setdefault(slot, []).append(handle)
@@ -455,6 +463,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                     remaining.append(handle)
                 elif state == "DONE":
                     self.agent.release_xfer_handle(handle)
+                    _mark(f"afd_nixl.write_done[{slot}]")
                 else:
                     raise RuntimeError(f"NIXL WRITE ended in state {state}")
             if remaining:
@@ -521,6 +530,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         def done() -> bool:
             for name, notifs in agent.get_new_notifs().items():
                 self._dbg("notifs from %s: %s", name, notifs)
+                for notif in notifs:
+                    _mark(f"afd_nixl.notif_in[{notif.decode()}:{name}]")
                 self._notifs.setdefault(name, []).extend(notifs)
             for name in [n for n in missing if missing[n] in self._notifs.get(n, [])]:
                 self._notifs[name].remove(missing.pop(name))
@@ -809,10 +820,11 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
 
     def _post_combine(self, pending: PendingCombineWrite) -> None:
         self._dbg("F post combine slot=%d notif=%s", pending.slot, pending.notif)
-        for peer, rows, region_row in pending.shares:
-            self._write(
-                pending.slot, peer, [rows], region_row, rows.shape[0], pending.notif
-            )
+        with torch.profiler.record_function(f"afd_nixl.combine_post[{pending.slot}]"):
+            for peer, rows, region_row in pending.shares:
+                self._write(
+                    pending.slot, peer, [rows], region_row, rows.shape[0], pending.notif
+                )
 
     def _flush_combines(self, slot: int | None = None) -> None:
         """Post the staged partial sums of ``slot`` (of every slot when None)
