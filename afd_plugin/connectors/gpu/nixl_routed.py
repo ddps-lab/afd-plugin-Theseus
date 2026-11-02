@@ -679,6 +679,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                         notif,
                     )
                 else:
+                    assert self.agent is not None
                     self.agent.send_notif(self._peer_agents[ffn], notif)
                     _mark(f"afd_nixl.write_post[{stage}:{notif.decode()}:{ffn}]")
                 offset += count
