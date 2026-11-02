@@ -100,6 +100,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.distributed as dist
 from nixl import nixl_agent, nixl_agent_config
+
+# Not ``nixl.nixl_thread_sync_t``: that name is the raw binding, and the
+# config only takes this enum.
+from nixl._api import nixl_thread_sync_t
 from vllm.distributed.device_communicators.p2p_nccl_all2all import (
     P2pAll2AllPlan,
 )
@@ -138,12 +142,13 @@ _DEBUG_LEVEL = int(os.environ.get("AFD_NIXL_DEBUG", "0") or 0)
 _DEBUG = _DEBUG_LEVEL >= 1
 _DEBUG_PLANS = 400
 _DEBUG_WAIT_S = 5.0
-# AFD_NIXL_PROGRESS_THREAD=0: create the NIXL agent without its progress
-# thread. NIXL 1.3.x polls the UCX worker from that thread with no wait and
-# shares the worker (UCX multi-thread mode) with the calling thread; without
-# it the worker is single-threaded and progresses in this connector's host
-# waits, which poll NIXL the whole time.
-_PROGRESS_THREAD = os.environ.get("AFD_NIXL_PROGRESS_THREAD", "1") != "0"
+# AFD_NIXL_PROGRESS_THREAD=1: create the NIXL agent with its progress thread.
+# NIXL's Python agent polls the UCX worker from that thread with no pause, so
+# it keeps a CPU core busy even when idle, and every host wait of this
+# connector polls NIXL itself; so it is off by default. Without it the agent
+# uses NIXL_THREAD_SYNC_RW, which keeps the UCX worker thread-safe for the
+# micro-batch threads that call it in turn.
+_PROGRESS_THREAD = os.environ.get("AFD_NIXL_PROGRESS_THREAD", "0") != "0"
 # AFD_NIXL_HOST_STAGING=0: register the GPU buffers with NIXL instead of
 # pinned host buffers (see "Host staging" in the module docstring).
 _HOST_STAGING = os.environ.get("AFD_NIXL_HOST_STAGING", "1") != "0"
@@ -322,7 +327,11 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         self.agent = nixl_agent(
             _agent_name(self.world_rank),
             nixl_agent_config(
-                backends=[NIXL_BACKEND], enable_prog_thread=_PROGRESS_THREAD
+                backends=[NIXL_BACKEND],
+                enable_prog_thread=_PROGRESS_THREAD,
+                sync_mode=None
+                if _PROGRESS_THREAD
+                else nixl_thread_sync_t.NIXL_THREAD_SYNC_RW,
             ),
         )
         self.agent.register_memory([*self._rows, self._results])
