@@ -5,9 +5,9 @@
 ``NixlRoutedAFDConnector`` keeps the routing of ``P2pNcclRoutedAFDConnector``
 (Attention computes the gate and sends each token once to every FFN rank that
 owns one of its experts, FFN runs its experts through the ``prerouted``
-backend and returns the weighted partial sums) together with its NCCL groups
-for the per-layer count exchange and the control plane. Only the rows travel
-differently, as NIXL WRITEs followed by a notification:
+backend and returns the weighted partial sums) together with its control
+plane. The rows travel as NIXL WRITEs followed by a notification, and the
+row counts travel in those notifications (no count exchange):
 
     Attention a -> FFN f: rows into f's receive region of (stage, a).
     FFN f -> Attention a: partial sums into a's result region of (stage, f).
@@ -29,29 +29,38 @@ Attention 1 sending 300 rows of stage 0 to FFN 0 writes rows R..R+299 of FFN
 region holds the share of any stage because a token goes to an FFN rank at
 most once and a stage never has more than R tokens.
 
-Both ends of a pair know its row count from the count exchange: a pair without
-rows sends no WRITE and waits for no notification. A notification carries the
-plan sequence number, which advances identically on every rank because every
-rank takes part in every count exchange, in stage order. That exchange is also
-what makes a region safe to rewrite: a rank only reaches the next layer's
-exchange of a stage after it has consumed that stage's rows (enqueued their
-copy to the GPU on a stream the exchange is ordered after).
+Row counts: every dispatch notification is ``d<seq>:<rows>``, and every
+Attention rank sends one to every FFN rank for every stage (a bare
+notification, without a WRITE, when it has no rows for that FFN), so an FFN
+rank learns what each Attention rank sent when the rows arrive and no rank
+waits for the others before sending. ``<seq>`` is the plan sequence number,
+which advances identically on every rank (one plan per layer and stage). The
+partial sums come back with ``c<seq>`` from the FFN ranks the rows went to;
+Attention knows how many (the rows it sent).
+
+A region is safe to rewrite without a barrier: an Attention rank sends a
+stage's next rows to an FFN rank only after the partial sums of the rows it
+sent that FFN before have come back, which the FFN posts after its experts
+read the gathered rows; where it sent no rows, the FFN had nothing to read.
+The result regions follow the same order the other way round.
 
 Pipeline (the micro-batch stages of a layer overlap as four independent
 resources: Attention GPU, Attention->FFN link, FFN GPU, FFN->Attention link,
 and every step starts as soon as its input has arrived):
 
-* Attention, per stage: count exchange, pack (and copy into the pinned send
-  buffers), WRITE, then the shared experts; ``recv_ffn_output`` hands the
-  CPU to the other micro-batches once (``dbo_yield``) and polls for the
+* Attention, per stage: plan (copy its own per-FFN counts to the host), pack
+  (and copy into the pinned send buffers), WRITE, then the shared experts;
+  ``recv_ffn_output`` hands the CPU to the other micro-batches once
+  (``dbo_yield``) and polls for the
   partial sums when it gets it back. No receive has to be posted for a
   WRITE, so a stage's partial sums leave the FFN the moment its experts are
   done, whatever the other stages do (the NCCL parent has to post each
   result receive after the next dispatch).
-* FFN, per stage: ``prefetch_attn_output`` only posts the count exchange and
-  returns; ``recv_attn_output`` reads the counts, polls for the rows and
-  gathers them onto the GPU on the stage's stream; ``send_ffn_output``
-  copies the partial sums into the pinned send buffer and returns at once.
+* FFN, per stage: ``prefetch_attn_output`` only picks the stage's stream;
+  ``recv_attn_output`` polls for every Attention rank's notification (it
+  carries the row count) and gathers the rows onto the GPU on that stream;
+  ``send_ffn_output`` copies the partial sums into the pinned send buffer and
+  returns at once.
   The WRITE is posted from the polling loops as soon as that copy (so the
   experts kernel) has finished, so the FFN GPU goes straight from one
   stage's experts to the next while the previous partial sums are on the
@@ -92,7 +101,6 @@ import torch
 import torch.distributed as dist
 from nixl import nixl_agent, nixl_agent_config
 from vllm.distributed.device_communicators.p2p_nccl_all2all import (
-    P2pAll2AllPendingPlan,
     P2pAll2AllPlan,
 )
 from vllm.logger import init_logger
@@ -154,17 +162,15 @@ def _mark(name: str) -> None:
 
 @dataclass(frozen=True)
 class NixlPrefetch:
-    """FFN-side count exchange of one stage, posted but not yet read.
+    """FFN-side stage whose rows are not yet received.
 
-    Returned by ``prefetch_attn_output``; ``recv_attn_output`` reads the
-    counts, waits for the rows and turns it into a ``RoutedPrefetch``.
-    ``exchanged`` is recorded on ``stream`` right after the exchange.
+    Returned by ``prefetch_attn_output``; ``recv_attn_output`` waits for the
+    rows (and their counts) and turns it into a ``RoutedPrefetch``, gathering
+    on ``stream``.
     """
 
     stage: int
-    pending: P2pAll2AllPendingPlan
     stream: torch.cuda.Stream
-    exchanged: torch.cuda.Event
 
 
 @dataclass(frozen=True)
@@ -539,6 +545,32 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
 
         self._wait_until(done, f"notification from {sorted(missing)}")
 
+    def _wait_counts(self, prefix: bytes, peers: list[int]) -> dict[int, int]:
+        """Wait for the notification ``<prefix><rows>`` from every world rank
+        of ``peers`` and return the row count each one announced."""
+        assert self.agent is not None
+        agent = self.agent
+        missing = {self._peer_agents[peer]: peer for peer in peers}
+        counts: dict[int, int] = {}
+
+        def done() -> bool:
+            for name, notifs in agent.get_new_notifs().items():
+                self._dbg("notifs from %s: %s", name, notifs)
+                for notif in notifs:
+                    _mark(f"afd_nixl.notif_in[{notif.decode()}:{name}]")
+                self._notifs.setdefault(name, []).extend(notifs)
+            for name in list(missing):
+                notifs = self._notifs.get(name, [])
+                for notif in notifs:
+                    if notif.startswith(prefix):
+                        notifs.remove(notif)
+                        counts[missing.pop(name)] = int(notif[len(prefix) :])
+                        break
+            return not missing
+
+        self._wait_until(done, f"notification {prefix!r} from {sorted(missing)}")
+        return counts
+
     def _gather_rows(self, parts: list[torch.Tensor], out: torch.Tensor) -> None:
         """Copy ``parts`` (regions of the NIXL buffers) one after another into
         ``out`` on the current stream. Under host staging they are pinned host
@@ -586,23 +618,23 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             topk_weights.to(_WEIGHTS_DTYPE),
         ]
         engine = self.engine
-        # Under micro-batching the count exchange and the packing go on the
+        # Under micro-batching the plan and the packing go on the
         # communication stream (after this stage's attention), so the other
         # stages' attention kernels on the compute stream are not queued
-        # behind the exchange's wait for the peers. Without it: no-ops.
+        # behind them. Without it: no-ops.
         dbo_switch_to_comm_sync()
         stream = torch.cuda.current_stream(self.device)
-        # The count exchange is the only dependency of the dispatch on this
-        # stage's attention; the host waits for it here (polling, so the
-        # WRITEs of the other stages keep completing) and never hands the
-        # CPU away before the rows are on the wire.
+        # The plan is the only dependency of the dispatch on this stage's
+        # attention; the host waits for its kernels here (polling, so the
+        # WRITEs of the other stages keep completing), copies its own per-FFN
+        # counts and never hands the CPU away before the rows are on the
+        # wire. The FFN ranks learn the counts from the notifications.
         pending = engine.begin_plan(tensors[1], slot=stage)
-        engine.exchange_counts(pending)
-        exchanged = torch.cuda.Event()
-        exchanged.record(stream)
-        with torch.profiler.record_function(f"afd_nixl.count_wait[{stage}]"):
-            self._wait_event(exchanged, "count exchange")
-        plan = engine.finish_plan(pending)
+        planned = torch.cuda.Event()
+        planned.record(stream)
+        with torch.profiler.record_function(f"afd_nixl.plan_wait[{stage}]"):
+            self._wait_event(planned, "plan")
+        plan = engine.finish_plan_local(pending)
         self._dbg_plan = plan.seq
         self._dbg(
             "A send stage=%d seq=%d tokens=%d send=%s",
@@ -635,6 +667,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             offset = 0
             for ffn in range(self.ffn_size):
                 count = plan.send_counts[ffn]
+                # Every FFN rank hears from every Attention rank for every
+                # stage; the notification carries the row count.
+                notif = f"d{plan.seq}:{count}".encode()
                 if count:
                     self._write(
                         stage,
@@ -642,8 +677,11 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                         [t[offset : offset + count] for t in send_rows],
                         self._region_row(stage, self.attn_size),
                         count,
-                        f"d{plan.seq}".encode(),
+                        notif,
                     )
+                else:
+                    self.agent.send_notif(self._peer_agents[ffn], notif)
+                    _mark(f"afd_nixl.write_post[{stage}:{notif.decode()}:{ffn}]")
                 offset += count
         # Back to the compute stream: the shared experts run while the rows
         # are on the wire.
@@ -708,13 +746,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
     def prefetch_attn_output(  # type: ignore[override]
         self, ubatch_idx: int = 0
     ) -> NixlPrefetch:
-        """Post the count exchange of this stage and return without waiting.
-
-        On the stage's own stream, chained after the previous exchange so
-        every rank issues them in the same order; ``recv_attn_output`` reads
-        the counts and waits for the rows.
-        """
-        if self.engine is None or self._empty_send is None:
+        """Pick the stage's stream and return without waiting; the counts
+        come with the rows, which ``recv_attn_output`` waits for."""
+        if self.engine is None:
             raise RuntimeError("routed connector is not initialized")
         stage = int(ubatch_idx)
         if stage >= self.num_slots:
@@ -722,43 +756,28 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 f"stage {stage} but the connector has {self.num_slots} micro-batch "
                 "slots (--enable-dbo / --ubatch-size)",
             )
-        stream = self._stage_stream(stage)
-        engine = self.engine
-        with torch.cuda.stream(stream):
-            if self._dispatch_chain is not None:
-                stream.wait_event(self._dispatch_chain)
-            pending = engine.begin_plan(self._empty_send[1], slot=stage)
-            engine.exchange_counts(pending)
-            exchanged = torch.cuda.Event()
-            exchanged.record(stream)
-        self._dispatch_chain = exchanged
         self._dbg_exchanges += 1
-        self._dbg("F prefetch stage=%d exchange#%d", stage, self._dbg_exchanges)
+        self._dbg("F prefetch stage=%d #%d", stage, self._dbg_exchanges)
         self._service_writes()
-        return NixlPrefetch(
-            stage=stage, pending=pending, stream=stream, exchanged=exchanged
-        )
+        return NixlPrefetch(stage=stage, stream=self._stage_stream(stage))
 
     def _complete_prefetch(self, prefetched: NixlPrefetch) -> RoutedPrefetch:
-        """Read the counts, wait for the rows and gather them on the stage stream."""
+        """Wait for every Attention rank's rows of the stage (their counts come
+        with the notifications) and gather them on the stage stream."""
         assert self.engine is not None
         stage, stream = prefetched.stage, prefetched.stream
-        with torch.profiler.record_function(f"afd_nixl.count_wait[{stage}]"):
-            self._wait_event(prefetched.exchanged, "count exchange")
-        with torch.cuda.stream(stream):
-            plan = self.engine.finish_plan(prefetched.pending)
-        attn_counts = plan.recv_counts[self.ffn_size :]
-        self._dbg_plan = plan.seq
-        self._dbg("F recv stage=%d seq=%d counts=%s", stage, plan.seq, attn_counts)
+        # Plans are numbered identically on every rank (one per layer and
+        # stage), so this stage's notifications carry this number.
+        seq = self.engine.next_plan_seq()
+        self._dbg_plan = seq
         with torch.profiler.record_function(f"afd_nixl.dispatch_wait[{stage}]"):
-            notif = f"d{plan.seq}".encode()
-            self._wait_notifs(
-                {
-                    self.ffn_size + attn: notif
-                    for attn, count in enumerate(attn_counts)
-                    if count
-                }
+            counts = self._wait_counts(
+                f"d{seq}:".encode(),
+                [self.ffn_size + attn for attn in range(self.attn_size)],
             )
+        attn_counts = [counts[self.ffn_size + attn] for attn in range(self.attn_size)]
+        plan = self.engine.recv_plan(stage, seq, [0] * self.ffn_size + attn_counts)
+        self._dbg("F recv stage=%d seq=%d counts=%s", stage, plan.seq, attn_counts)
         # Gather the stage's receive regions into one block on the GPU grouped
         # by source rank, the order the NCCL engine's dispatch returns. With the
         # fixed-size launch the block is the head of the stage's fixed-size
