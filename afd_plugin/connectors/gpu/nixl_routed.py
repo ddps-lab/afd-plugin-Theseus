@@ -89,6 +89,7 @@ Limitations: unquantized rows, Attention TP=1.
 
 from __future__ import annotations
 
+import contextlib
 import faulthandler
 import os
 import signal
@@ -158,11 +159,25 @@ def _agent_name(world_rank: int) -> str:
     return f"afd-routed-{world_rank}"
 
 
+def _profiling() -> bool:
+    """Whether a profiler is recording. A ``record_function`` range costs
+    several microseconds of host time even when none is, so the ranges of
+    this module are opened only while one records."""
+    return torch.autograd.profiler._is_profiler_enabled
+
+
+def _profile_range(name: str) -> contextlib.AbstractContextManager:
+    """``record_function(name)`` while a profiler records, else nothing."""
+    if _profiling():
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
+
+
 def _mark(name: str) -> None:
-    """A point in time in profiler traces: a range of zero length (only the
-    range bookkeeping when the profiler is off)."""
-    with torch.profiler.record_function(name):
-        pass
+    """A point in time in profiler traces: a range of zero length."""
+    if _profiling():
+        with torch.profiler.record_function(name):
+            pass
 
 
 @dataclass(frozen=True)
@@ -641,7 +656,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         pending = engine.begin_plan(tensors[1], slot=stage)
         planned = torch.cuda.Event()
         planned.record(stream)
-        with torch.profiler.record_function(f"afd_nixl.plan_wait[{stage}]"):
+        with _profile_range(f"afd_nixl.plan_wait[{stage}]"):
             self._wait_event(planned, "plan")
         plan = engine.finish_plan_local(pending)
         self._dbg_plan = plan.seq
@@ -661,7 +676,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         block = slice(stage * block_rows, (stage + 1) * block_rows)
         send_rows = [t[block] for t in self._rows]
         pack_rows = [t[block] for t in self._pack] or send_rows
-        with torch.profiler.record_function(f"afd_nixl.dispatch_write[{stage}]"):
+        with _profile_range(f"afd_nixl.dispatch_write[{stage}]"):
             # Destination-major packing, as the NCCL engine's dispatch does;
             # under host staging into the GPU pack buffers, then copied into
             # the pinned send buffers on the same stream.
@@ -719,10 +734,10 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 f"ref_tensor has {ref_tensor.shape[0]} rows, stage {stage} "
                 f"dispatched {plan.num_tokens}",
             )
-        with torch.profiler.record_function(f"afd_nixl.dispatch_finish[{stage}]"):
+        with _profile_range(f"afd_nixl.dispatch_finish[{stage}]"):
             self._finish_writes(stage)
         self._dbg("A wait combine stage=%d seq=%d", stage, plan.seq)
-        with torch.profiler.record_function(f"afd_nixl.combine_wait[{stage}]"):
+        with _profile_range(f"afd_nixl.combine_wait[{stage}]"):
             notif = f"c{plan.seq}".encode()
             self._wait_notifs(
                 {ffn: notif for ffn in range(self.ffn_size) if plan.send_counts[ffn]}
@@ -779,7 +794,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # stage), so this stage's notifications carry this number.
         seq = self.engine.next_plan_seq()
         self._dbg_plan = seq
-        with torch.profiler.record_function(f"afd_nixl.dispatch_wait[{stage}]"):
+        with _profile_range(f"afd_nixl.dispatch_wait[{stage}]"):
             counts = self._wait_counts(
                 f"d{seq}:".encode(),
                 [self.ffn_size + attn for attn in range(self.attn_size)],
@@ -848,7 +863,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
 
     def _post_combine(self, pending: PendingCombineWrite) -> None:
         self._dbg("F post combine slot=%d notif=%s", pending.slot, pending.notif)
-        with torch.profiler.record_function(f"afd_nixl.combine_post[{pending.slot}]"):
+        with _profile_range(f"afd_nixl.combine_post[{pending.slot}]"):
             for peer, rows, region_row in pending.shares:
                 self._write(
                     pending.slot, peer, [rows], region_row, rows.shape[0], pending.notif
@@ -901,7 +916,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         self._flush_combines(slot)
         base = slot * self.attn_size * self.max_tokens
         staged = self._results[base : base + plan.num_recv]
-        with torch.profiler.record_function(f"afd_nixl.combine_stage[{slot}]"):
+        with _profile_range(f"afd_nixl.combine_stage[{slot}]"):
             # Under host staging into pinned host memory: asynchronous,
             # ``ready`` fires once it has landed.
             staged.copy_(ffn_output, non_blocking=True)
@@ -940,7 +955,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         """
         if self.agent is None:
             return
-        with torch.profiler.record_function("afd_nixl.combine_flush"):
+        with _profile_range("afd_nixl.combine_flush"):
             self._flush_combines()
 
 
