@@ -68,15 +68,16 @@ and every step starts as soon as its input has arrived):
 
 Every host wait is a polling loop that also drives the posted WRITEs to
 completion, because NIXL sends the notification of a WRITE only when its
-state is checked after it finished.
+state is checked after it finished. The NIXL agent runs NIXL's progress
+thread as well (NIXL's default).
 
-Host staging: the connector itself moves the rows between the GPU and the
-pinned NIXL buffers, with asynchronous copies on its streams that CUDA events
-order like the kernels around them, so UCX only sends host memory over TCP
-and makes no CUDA calls. With the buffers in GPU memory
-(``AFD_NIXL_HOST_STAGING=0``) UCX copies between the GPU and its TCP buffers
-itself, with a synchronous CUDA copy inside ``transfer()``; one of those
-copies was seen never to return, leaving the FFN stuck in ``transfer()``.
+Host staging: the NIXL buffers are pinned host memory, and the connector
+itself moves the rows between them and the GPU, with asynchronous copies on
+its streams that CUDA events order like the kernels around them, so UCX only
+sends host memory over TCP and makes no CUDA calls. With the buffers in GPU
+memory UCX copies between the GPU and its TCP buffers itself, with a
+synchronous CUDA copy inside ``transfer()``; one of those copies was seen
+never to return, leaving the FFN stuck in ``transfer()``.
 
 With the parent's fixed-size experts launch (unquantized Triton experts), the
 FFN gathers the received rows into per-stage buffers of the regions' size
@@ -101,10 +102,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.distributed as dist
 from nixl import nixl_agent, nixl_agent_config
-
-# Not ``nixl.nixl_thread_sync_t``: that name is the raw binding, and the
-# config only takes this enum.
-from nixl._api import nixl_thread_sync_t
 from vllm.distributed.device_communicators.p2p_nccl_all2all import (
     P2pAll2AllPlan,
 )
@@ -134,6 +131,9 @@ logger = init_logger(f"vllm.{__name__}")
 # as an error instead of a hang.
 TRANSFER_TIMEOUT_S = 120.0
 NIXL_BACKEND = "UCX"
+# NIXL memory type of the buffers: pinned host memory, device id 0 (see "Host
+# staging" in the module docstring).
+NIXL_MEM_TYPE = "DRAM"
 # AFD_NIXL_DEBUG=1: a host wait longer than _DEBUG_WAIT_S logs what it is
 # still waiting for every _DEBUG_WAIT_S seconds, and SIGUSR1 dumps every
 # thread's stack (no cost while nothing waits that long). =2 also logs every
@@ -143,16 +143,6 @@ _DEBUG_LEVEL = int(os.environ.get("AFD_NIXL_DEBUG", "0") or 0)
 _DEBUG = _DEBUG_LEVEL >= 1
 _DEBUG_PLANS = 400
 _DEBUG_WAIT_S = 5.0
-# AFD_NIXL_PROGRESS_THREAD=1: create the NIXL agent with its progress thread.
-# NIXL's Python agent polls the UCX worker from that thread with no pause, so
-# it keeps a CPU core busy even when idle, and every host wait of this
-# connector polls NIXL itself; so it is off by default. Without it the agent
-# uses NIXL_THREAD_SYNC_RW, which keeps the UCX worker thread-safe for the
-# micro-batch threads that call it in turn.
-_PROGRESS_THREAD = os.environ.get("AFD_NIXL_PROGRESS_THREAD", "0") != "0"
-# AFD_NIXL_HOST_STAGING=0: register the GPU buffers with NIXL instead of
-# pinned host buffers (see "Host staging" in the module docstring).
-_HOST_STAGING = os.environ.get("AFD_NIXL_HOST_STAGING", "1") != "0"
 
 
 def _agent_name(world_rank: int) -> str:
@@ -235,17 +225,16 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # world rank -> NIXL agent name of the peers this rank writes to.
         self._peer_agents: dict[int, str] = {}
         # world rank -> (base address, row bytes) of every receive buffer of
-        # the peer, and the peer's device id.
+        # the peer.
         self._peer_regions: dict[int, list[tuple[int, int]]] = {}
-        self._peer_devices: dict[int, int] = {}
         # Attention: send rows (hidden, ids, weights) and the result regions;
         # FFN: receive regions (hidden, ids, weights) and the partial sums.
         # All of them hold num_slots blocks, one per stage, and are the
         # buffers registered with NIXL.
         self._rows: list[torch.Tensor] = []
         self._results: torch.Tensor | None = None
-        # Attention under host staging: the GPU buffers a stage's rows are
-        # packed into before they are copied into the pinned send buffers.
+        # Attention: the GPU buffers a stage's rows are packed into before
+        # they are copied into the pinned send buffers.
         self._pack: list[torch.Tensor] = []
         # slot -> WRITE handles posted and not yet seen complete.
         self._writes: dict[int, list[Any]] = {}
@@ -300,14 +289,12 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # Attention ranks per stage.
         peers = self.attn_size if self.is_ffn else self.ffn_size
         rows = self.num_slots * peers * self.max_tokens
-        # Host staging: pinned host memory (plain host memory when the
-        # connector runs on CPU tensors in tests).
-        self._host_staging = _HOST_STAGING
-        where = torch.device("cpu") if self._host_staging else self.device
-        pin = self._host_staging and self.device.type == "cuda"
+        # Pinned host memory (plain host memory when the connector runs on
+        # CPU tensors in tests); see "Host staging" in the module docstring.
+        pin = self.device.type == "cuda"
 
         def buffer(width: int, dtype: torch.dtype) -> torch.Tensor:
-            return torch.empty((rows, width), dtype=dtype, device=where, pin_memory=pin)
+            return torch.empty((rows, width), dtype=dtype, device="cpu", pin_memory=pin)
 
         self._rows = [
             buffer(spec.hidden_size, spec.act_dtype),
@@ -320,13 +307,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 torch.empty(t.shape, dtype=t.dtype, device=self.device)
                 for t in self._rows
             ]
-            if self._host_staging and not self.is_ffn
+            if not self.is_ffn
             else []
-        )
-        # Where every rank's NIXL buffers are (checked to be the same below).
-        self._nixl_mem_type = "VRAM" if self._results.is_cuda else "DRAM"
-        self._nixl_device = (
-            (self.device.index or 0) if self._nixl_mem_type == "VRAM" else 0
         )
         if self.is_ffn and self._fixed_ok:
             # One set per stage: recv_attn_output masks the rows past the
@@ -345,33 +327,26 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             ]
         self.agent = nixl_agent(
             _agent_name(self.world_rank),
-            nixl_agent_config(
-                backends=[NIXL_BACKEND],
-                enable_prog_thread=_PROGRESS_THREAD,
-                sync_mode=None
-                if _PROGRESS_THREAD
-                else nixl_thread_sync_t.NIXL_THREAD_SYNC_RW,
-            ),
+            nixl_agent_config(backends=[NIXL_BACKEND], enable_prog_thread=True),
         )
         self.agent.register_memory([*self._rows, self._results])
 
         # Exchange agent metadata and region addresses over the dispatch
         # group. Peers write into FFN's receive rows and Attention's results.
         writable = self._rows if self.is_ffn else [self._results]
-        layout = (self.max_tokens, self.num_slots, self._nixl_mem_type)
+        layout = (self.max_tokens, self.num_slots)
         mine = (
             self.agent.get_agent_metadata(),
             [(t.data_ptr(), t[0].numel() * t.element_size()) for t in writable],
-            self._nixl_device,
             layout,
         )
         everyone: list[Any] = [None] * self.world_size
         dist.all_gather_object(everyone, mine, group=self.dispatch_pg)
-        if {info[3] for info in everyone} != {layout}:
+        if {info[2] for info in everyone} != {layout}:
             raise RuntimeError(
-                "NixlRoutedAFDConnector needs the same max_num_batched_tokens, "
-                "micro-batch count and AFD_NIXL_HOST_STAGING on every rank, got "
-                f"{[info[3] for info in everyone]}",
+                "NixlRoutedAFDConnector needs the same max_num_batched_tokens "
+                "and micro-batch count on every rank, got "
+                f"{[info[2] for info in everyone]}",
             )
         peer_ranks = (
             range(self.ffn_size, self.world_size)
@@ -379,25 +354,21 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             else range(self.ffn_size)
         )
         for peer in peer_ranks:
-            metadata, regions, device, _ = everyone[peer]
+            metadata, regions, _ = everyone[peer]
             # add_remote_agent returns the name as bytes while notifications
             # are keyed by str, so peers are addressed by the known name.
             self.agent.add_remote_agent(metadata)
             self._peer_agents[peer] = _agent_name(peer)
             self._peer_regions[peer] = regions
-            self._peer_devices[peer] = device
         logger.info(
             "NIXL routed AFD connector ready: role=%s world_rank=%d peers=%s "
-            "region_rows=%d slots=%d backend=%s progress_thread=%s "
-            "host_staging=%s",
+            "region_rows=%d slots=%d backend=%s",
             self.afd_config.role,
             self.world_rank,
             list(self._peer_agents),
             self.max_tokens,
             self.num_slots,
             NIXL_BACKEND,
-            _PROGRESS_THREAD,
-            self._host_staging,
         )
         if _DEBUG:
             # kill -USR1 <pid>: every thread's stack, the process keeps running.
@@ -449,21 +420,15 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         costs less host time than slicing the tensors for NIXL to read back.
         """
         assert self.agent is not None
-        src = [
-            (addr, num_rows * row_bytes, self._nixl_device) for addr, row_bytes in local
-        ]
+        src = [(addr, num_rows * row_bytes, 0) for addr, row_bytes in local]
         dst = [
-            (
-                addr + region_row * row_bytes,
-                num_rows * row_bytes,
-                self._peer_devices[peer],
-            )
+            (addr + region_row * row_bytes, num_rows * row_bytes, 0)
             for addr, row_bytes in self._peer_regions[peer]
         ]
         handle = self.agent.initialize_xfer(
             "WRITE",
-            self.agent.get_xfer_descs(src, self._nixl_mem_type),
-            self.agent.get_xfer_descs(dst, self._nixl_mem_type),
+            self.agent.get_xfer_descs(src, NIXL_MEM_TYPE),
+            self.agent.get_xfer_descs(dst, NIXL_MEM_TYPE),
             self._peer_agents[peer],
             notif,
         )
@@ -606,12 +571,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         return counts
 
     def _gather_rows(self, parts: list[torch.Tensor], out: torch.Tensor) -> None:
-        """Copy ``parts`` (regions of the NIXL buffers) one after another into
-        ``out`` on the current stream. Under host staging they are pinned host
-        memory, so the copies are asynchronous like a kernel."""
-        if not self._host_staging:
-            torch.cat(parts, out=out)
-            return
+        """Copy ``parts`` (regions of the pinned NIXL buffers) one after
+        another into ``out`` on the current stream, asynchronously like a
+        kernel."""
         offset = 0
         for part in parts:
             out[offset : offset + part.shape[0]].copy_(part, non_blocking=True)
@@ -685,16 +647,15 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         block_rows = self.ffn_size * self.max_tokens
         block = slice(stage * block_rows, (stage + 1) * block_rows)
         send_rows = [t[block] for t in self._rows]
-        pack_rows = [t[block] for t in self._pack] or send_rows
+        pack_rows = [t[block] for t in self._pack]
         with _profile_range(f"afd_nixl.dispatch_write[{stage}]"):
-            # Destination-major packing, as the NCCL engine's dispatch does;
-            # under host staging into the GPU pack buffers, then copied into
-            # the pinned send buffers on the same stream.
+            # Destination-major packing, as the NCCL engine's dispatch does,
+            # into the GPU pack buffers, then copied into the pinned send
+            # buffers on the same stream.
             n = plan.num_send
             for src, packed, sent in zip(tensors, pack_rows, send_rows, strict=True):
                 torch.index_select(src, 0, plan.perm, out=packed[:n])
-                if packed is not sent:
-                    sent[:n].copy_(packed[:n], non_blocking=True)
+                sent[:n].copy_(packed[:n], non_blocking=True)
             packed_done = torch.cuda.Event()
             packed_done.record(stream)
             self._wait_event(packed_done, "packing")
