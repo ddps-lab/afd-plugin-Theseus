@@ -199,12 +199,13 @@ class PendingCombineWrite:
 
     ``ready`` is recorded on the compute stream after the staging copy (so
     after the experts kernel); the WRITEs in ``shares`` (peer world rank,
-    rows, row of the peer's region) are posted once it has fired.
+    (address, row bytes) of the first staged row, row count, row of the
+    peer's region) are posted once it has fired.
     """
 
     slot: int
     ready: torch.cuda.Event
-    shares: list[tuple[int, torch.Tensor, int]]
+    shares: list[tuple[int, tuple[int, int], int, int]]
     notif: bytes
 
 
@@ -324,6 +325,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         )
         # Where every rank's NIXL buffers are (checked to be the same below).
         self._nixl_mem_type = "VRAM" if self._results.is_cuda else "DRAM"
+        self._nixl_device = (
+            (self.device.index or 0) if self._nixl_mem_type == "VRAM" else 0
+        )
         if self.is_ffn and self._fixed_ok:
             # One set per stage: recv_attn_output masks the rows past the
             # received ones, and mask_rows_past tracks which rows still need
@@ -358,7 +362,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         mine = (
             self.agent.get_agent_metadata(),
             [(t.data_ptr(), t[0].numel() * t.element_size()) for t in writable],
-            (self.device.index or 0) if self._nixl_mem_type == "VRAM" else 0,
+            self._nixl_device,
             layout,
         )
         everyone: list[Any] = [None] * self.world_size
@@ -429,20 +433,26 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         self,
         slot: int,
         peer: int,
-        local: list[torch.Tensor],
+        local: list[tuple[int, int]],
         region_row: int,
         num_rows: int,
         notif: bytes,
     ) -> None:
-        """WRITE ``local`` into ``peer``'s receive buffers from ``region_row`` on.
+        """WRITE ``num_rows`` rows from every ``(address, row bytes)`` of
+        ``local`` into ``peer``'s receive buffers from ``region_row`` on.
 
-        ``local`` holds one ``[num_rows, ...]`` tensor per receive buffer of the
-        peer (see the module docstring); ``region_row`` is where this rank's
-        region of the stage starts in them. The peer receives ``notif`` once
-        all of it has landed and this side has seen the WRITE complete.
+        ``local`` holds the first row to send of one registered buffer per
+        receive buffer of the peer (see the module docstring); ``region_row``
+        is where this rank's region of the stage starts in them. The peer
+        receives ``notif`` once all of it has landed and this side has seen
+        the WRITE complete. The descriptors are built from addresses, which
+        costs less host time than slicing the tensors for NIXL to read back.
         """
         assert self.agent is not None
-        remote = [
+        src = [
+            (addr, num_rows * row_bytes, self._nixl_device) for addr, row_bytes in local
+        ]
+        dst = [
             (
                 addr + region_row * row_bytes,
                 num_rows * row_bytes,
@@ -452,8 +462,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         ]
         handle = self.agent.initialize_xfer(
             "WRITE",
-            self.agent.get_xfer_descs(local),
-            self.agent.get_xfer_descs(remote, self._nixl_mem_type),
+            self.agent.get_xfer_descs(src, self._nixl_mem_type),
+            self.agent.get_xfer_descs(dst, self._nixl_mem_type),
             self._peer_agents[peer],
             notif,
         )
@@ -688,6 +698,10 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             packed_done = torch.cuda.Event()
             packed_done.record(stream)
             self._wait_event(packed_done, "packing")
+            # (address, row bytes) of the first row of the stage's block.
+            sources = [
+                (t.data_ptr(), t.stride(0) * t.element_size()) for t in send_rows
+            ]
             offset = 0
             for ffn in range(self.ffn_size):
                 count = plan.send_counts[ffn]
@@ -698,7 +712,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                     self._write(
                         stage,
                         ffn,
-                        [t[offset : offset + count] for t in send_rows],
+                        [(addr + offset * rb, rb) for addr, rb in sources],
                         self._region_row(stage, self.attn_size),
                         count,
                         notif,
@@ -864,9 +878,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
     def _post_combine(self, pending: PendingCombineWrite) -> None:
         self._dbg("F post combine slot=%d notif=%s", pending.slot, pending.notif)
         with _profile_range(f"afd_nixl.combine_post[{pending.slot}]"):
-            for peer, rows, region_row in pending.shares:
+            for peer, rows, num_rows, region_row in pending.shares:
                 self._write(
-                    pending.slot, peer, [rows], region_row, rows.shape[0], pending.notif
+                    pending.slot, peer, [rows], region_row, num_rows, pending.notif
                 )
 
     def _flush_combines(self, slot: int | None = None) -> None:
@@ -925,14 +939,16 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # The experts kernel that read the slot's gather buffers precedes
         # this copy on the compute stream.
         self._slot_consumed[slot] = ready
-        shares: list[tuple[int, torch.Tensor, int]] = []
+        shares: list[tuple[int, tuple[int, int], int, int]] = []
+        addr, row_bytes = staged.data_ptr(), staged.stride(0) * staged.element_size()
         offset = 0
         for attn, count in enumerate(plan.recv_counts[self.ffn_size :]):
             if count:
                 shares.append(
                     (
                         self.ffn_size + attn,
-                        staged[offset : offset + count],
+                        (addr + offset * row_bytes, row_bytes),
+                        count,
                         self._region_row(slot, self.ffn_size),
                     )
                 )
