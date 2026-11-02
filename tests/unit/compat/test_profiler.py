@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import sys
@@ -92,11 +95,13 @@ def test_create_gpu_profiler_uses_configured_schedule(monkeypatch):
         "repeat": 6,
         "skip_first": 7,
     }
-    assert profiler_module.profile_kwargs["record_shapes"] is True
-    assert profiler_module.profile_kwargs["profile_memory"] is False
-    assert profiler_module.profile_kwargs["with_stack"] is False
+    profile_kwargs = profiler_module.profile_kwargs
+    assert profile_kwargs is not None
+    assert profile_kwargs["record_shapes"] is True
+    assert profile_kwargs["profile_memory"] is False
+    assert profile_kwargs["with_stack"] is False
     # DBO micro-batches run on threads other than the one starting the profiler.
-    assert profiler_module.profile_kwargs["experimental_config"] == {
+    assert profile_kwargs["experimental_config"] == {
         "profile_all_threads": True,
     }
     assert profiler_module.trace_dir == "/tmp/afd-ffn"
