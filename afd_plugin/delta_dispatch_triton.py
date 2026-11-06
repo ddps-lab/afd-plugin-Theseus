@@ -9,13 +9,15 @@ and at its own byte offset, so one launch per side and MoE layer covers rows
 of every format.
 
 * ``encode_rows`` (Attention): per row, ``h'`` in bf16 (first visit, the state
-  becomes ``h'``) or ``d = h' - S`` in fp32 / int8 / int4 (the group's ``lo`` /
-  ``step`` rounded to fp16, IEEE divisions, ``q = round_half_even((d - lo) /
-  step)`` clamped) with ``S += deq`` in place; also the row's word and the
-  MoE layer of the visit. Without states (``x_int4``) ``S`` is zero.
+  becomes ``h'``) or ``d = h' - S`` in fp32 / int8 / int4 / int3 (the group's
+  ``lo`` / ``step`` rounded to fp16, IEEE divisions, ``q = round_half_even((d -
+  lo) / step)`` clamped) with ``S += deq`` in place; ``h_int4`` (first visit)
+  quantizes ``h'`` with ``S`` taken as zero, so ``S = deq``. Also the row's
+  word and the MoE layer of the visit. Without states (``x_int4``) ``S`` is
+  zero.
 * ``decode_rows`` (FFN): per row, the value rebuilt from the bytes: ``S = h'``
-  or ``S += deq`` and ``h_out = S`` in the model dtype (``h_out = deq`` without
-  states).
+  (``h_int4``: ``S = 0 + deq``) or ``S += deq`` and ``h_out = S`` in the model
+  dtype (``h_out = deq`` without states).
 * ``encode_combine`` (FFN) / ``decode_combine`` (Attention): the compressed
   partial sums of combine compression, every row in one int format: ``v =
   partial (+ e)``, the bytes, ``deq`` and the new residual ``e = v - deq``; and
@@ -38,12 +40,17 @@ from afd_plugin.delta_dispatch import (
     CODE_BITS,
     CODE_MASK,
     CODE_SHIFT,
+    D_INT4,
+    D_INT8,
     MIN_GROUP_RANGE,
     QUANT_GROUP_SIZE,
     RANK_SHIFT,
     DeltaDispatchConfig,
     row_bytes,
 )
+
+# The formats the combine kernels handle (their int4 branch is the else).
+COMBINE_CODES = (D_INT8, D_INT4)
 
 
 @triton.jit
@@ -140,13 +147,21 @@ def _encode_rows_kernel(
         scales = row.to(tl.pointer_type(tl.float16)) + hidden // 2 + 2 * g
         tl.store(scales, lo.to(tl.float16))
         tl.store(scales + 1, step.to(tl.float16))
-    else:  # d_int4
+    elif (code == 3) | (code == 4):  # d_int4, h_int4
         k = tl.arange(0, half)
         h_e = tl.load(src_ptr + t * src_stride + base + 2 * k).to(tl.float32)
         h_o = tl.load(src_ptr + t * src_stride + base + 2 * k + 1).to(tl.float32)
         if stateful:
-            s_e = tl.load(state_ptr + flat * state_stride + base + 2 * k)
-            s_o = tl.load(state_ptr + flat * state_stride + base + 2 * k + 1)
+            # h_int4 quantizes h' itself and replaces the state (counts as 0).
+            diff = code == 3
+            s_e = tl.load(
+                state_ptr + flat * state_stride + base + 2 * k, mask=diff, other=0.0
+            )
+            s_o = tl.load(
+                state_ptr + flat * state_stride + base + 2 * k + 1,
+                mask=diff,
+                other=0.0,
+            )
         else:
             s_e = tl.zeros([half], dtype=tl.float32)
             s_o = tl.zeros([half], dtype=tl.float32)
@@ -169,6 +184,34 @@ def _encode_rows_kernel(
             )
         tl.store(row + g * half + k, q_e.to(tl.uint8) | (q_o.to(tl.uint8) << 4))
         scales = row.to(tl.pointer_type(tl.float16)) + hidden // 4 + 2 * g
+        tl.store(scales, lo.to(tl.float16))
+        tl.store(scales + 1, step.to(tl.float16))
+    elif code == 5:  # d_int3
+        # The group as lanes x 8 values; a lane's 8 3-bit values are one
+        # little-endian 24-bit word, stored as 3 bytes (of a 4-wide tile).
+        lanes: tl.constexpr = group // 8
+        r = tl.arange(0, lanes)[:, None]
+        c = tl.arange(0, 8)[None, :]
+        b = tl.arange(0, 4)[None, :]
+        idx = base + 8 * r + c
+        h = tl.load(src_ptr + t * src_stride + idx).to(tl.float32)
+        if stateful:
+            s = tl.load(state_ptr + flat * state_stride + idx)
+        else:
+            s = tl.zeros([lanes, 8], dtype=tl.float32)
+        d = h - s
+        lo = tl.min(tl.min(d, 1), 0)
+        step = _step(lo, tl.max(tl.max(d, 1), 0), min_range, 7)
+        lo = lo.to(tl.float16).to(tl.float32)
+        q = _quantize(d, lo, step, 7)
+        if stateful:
+            tl.store(
+                state_ptr + flat * state_stride + idx, s + _dequantize(q, lo, step)
+            )
+        word = tl.sum(q.to(tl.int32) << (3 * c), 1)
+        packed = (word[:, None] >> (8 * b)) & 0xFF
+        tl.store(row + g * (3 * lanes) + 3 * r + b, packed.to(tl.uint8), mask=b < 3)
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden * 3 // 16 + 2 * g
         tl.store(scales, lo.to(tl.float16))
         tl.store(scales + 1, step.to(tl.float16))
     if g == 0:
@@ -224,7 +267,7 @@ def _decode_rows_kernel(
             v = tl.load(state_ptr + srow * state_stride + base + k) + v
             tl.store(state_ptr + srow * state_stride + base + k, v)
         tl.store(out_ptr + i * out_stride + base + k, v.to(out_ty))
-    else:  # d_int4
+    elif (code == 3) | (code == 4):  # d_int4, h_int4
         k = tl.arange(0, half)
         scales = row.to(tl.pointer_type(tl.float16)) + hidden // 4 + 2 * g
         lo = tl.load(scales).to(tl.float32)
@@ -233,12 +276,31 @@ def _decode_rows_kernel(
         v_e = _dequantize((packed & 0xF).to(tl.float32), lo, step)
         v_o = _dequantize((packed >> 4).to(tl.float32), lo, step)
         if stateful:
-            v_e = tl.load(state_ptr + srow * state_stride + base + 2 * k) + v_e
-            v_o = tl.load(state_ptr + srow * state_stride + base + 2 * k + 1) + v_o
-            tl.store(state_ptr + srow * state_stride + base + 2 * k, v_e)
-            tl.store(state_ptr + srow * state_stride + base + 2 * k + 1, v_o)
+            # h_int4 replaces the state (counts as 0, as on the Attention side).
+            diff = code == 3
+            s_row = state_ptr + srow * state_stride + base
+            v_e = tl.load(s_row + 2 * k, mask=diff, other=0.0) + v_e
+            v_o = tl.load(s_row + 2 * k + 1, mask=diff, other=0.0) + v_o
+            tl.store(s_row + 2 * k, v_e)
+            tl.store(s_row + 2 * k + 1, v_o)
         tl.store(out_ptr + i * out_stride + base + 2 * k, v_e.to(out_ty))
         tl.store(out_ptr + i * out_stride + base + 2 * k + 1, v_o.to(out_ty))
+    elif code == 5:  # d_int3
+        lanes: tl.constexpr = group // 8
+        r = tl.arange(0, lanes)[:, None]
+        c = tl.arange(0, 8)[None, :]
+        b = tl.arange(0, 4)[None, :]
+        idx = base + 8 * r + c
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden * 3 // 16 + 2 * g
+        lo = tl.load(scales).to(tl.float32)
+        step = tl.load(scales + 1).to(tl.float32)
+        packed = tl.load(row + g * (3 * lanes) + 3 * r + b, mask=b < 3, other=0)
+        word = tl.sum(packed.to(tl.int32) << (8 * b), 1)
+        v = _dequantize(((word[:, None] >> (3 * c)) & 7).to(tl.float32), lo, step)
+        if stateful:
+            v = tl.load(state_ptr + srow * state_stride + idx) + v
+            tl.store(state_ptr + srow * state_stride + idx, v)
+        tl.store(out_ptr + i * out_stride + idx, v.to(out_ty))
 
 
 @triton.jit
@@ -443,6 +505,7 @@ def encode_combine(
     deq: torch.Tensor,
 ) -> None:
     """Fused FFN kernel (see ``encode_combine_reference``)."""
+    assert code in COMBINE_CODES, f"combine rows are d_int8 / d_int4, not {code}"
     n, hidden = partial.shape
     if not n:
         return
@@ -478,6 +541,7 @@ def encode_combine(
 
 def decode_combine(code: int, data: torch.Tensor, out: torch.Tensor) -> None:
     """Fused Attention kernel (see ``decode_combine_reference``)."""
+    assert code in COMBINE_CODES, f"combine rows are d_int8 / d_int4, not {code}"
     n, hidden = out.shape
     if not n:
         return
