@@ -16,6 +16,10 @@ of every format.
 * ``decode_rows`` (FFN): per row, the value rebuilt from the bytes: ``S = h'``
   or ``S += deq`` and ``h_out = S`` in the model dtype (``h_out = deq`` without
   states).
+* ``encode_combine`` (FFN) / ``decode_combine`` (Attention): the compressed
+  partial sums of combine compression, every row in one int format: ``v =
+  partial (+ e)``, the bytes, ``deq`` and the new residual ``e = v - deq``; and
+  ``deq`` back from the bytes.
 
 Both sides dequantize with the same ``_dequantize`` (an explicit fused
 multiply-add), so the states the FFN rank rebuilds are bit-identical to the
@@ -31,10 +35,12 @@ import triton
 import triton.language as tl
 
 from afd_plugin.delta_dispatch import (
+    CODE_BITS,
     MIN_GROUP_RANGE,
     QUANT_GROUP_SIZE,
     RANK_SHIFT,
     DeltaDispatchConfig,
+    row_bytes,
 )
 
 
@@ -230,6 +236,111 @@ def _decode_rows_kernel(
         tl.store(out_ptr + i * out_stride + base + 2 * k + 1, v_o.to(out_ty))
 
 
+@triton.jit
+def _encode_combine_kernel(
+    part_ptr,
+    part_stride,
+    rows_ptr,
+    err_ptr,
+    err_stride,
+    out_ptr,
+    deq_ptr,
+    deq_stride,
+    row_bytes,
+    min_range,
+    hidden: tl.constexpr,
+    group: tl.constexpr,
+    bits: tl.constexpr,
+    ef: tl.constexpr,
+):
+    half: tl.constexpr = group // 2
+    i = tl.program_id(0)
+    g = tl.program_id(1)
+    row = out_ptr + i * row_bytes
+    base = g * group
+    if ef:
+        erow = err_ptr + tl.load(rows_ptr + i) * err_stride
+    if bits == 8:
+        k = tl.arange(0, group)
+        v = tl.load(part_ptr + i * part_stride + base + k).to(tl.float32)
+        if ef:
+            v = v + tl.load(erow + base + k)
+        lo = tl.min(v, 0)
+        step = _step(lo, tl.max(v, 0), min_range, 255)
+        lo = lo.to(tl.float16).to(tl.float32)
+        q = _quantize(v, lo, step, 255)
+        d = _dequantize(q, lo, step)
+        tl.store(row + base + k, q.to(tl.uint8))
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden // 2 + 2 * g
+        tl.store(scales, lo.to(tl.float16))
+        tl.store(scales + 1, step.to(tl.float16))
+        tl.store(deq_ptr + i * deq_stride + base + k, d)
+        if ef:
+            tl.store(erow + base + k, v - d)
+    else:
+        k = tl.arange(0, half)
+        v_e = tl.load(part_ptr + i * part_stride + base + 2 * k).to(tl.float32)
+        v_o = tl.load(part_ptr + i * part_stride + base + 2 * k + 1).to(tl.float32)
+        if ef:
+            v_e = v_e + tl.load(erow + base + 2 * k)
+            v_o = v_o + tl.load(erow + base + 2 * k + 1)
+        lo = tl.minimum(tl.min(v_e, 0), tl.min(v_o, 0))
+        hi = tl.maximum(tl.max(v_e, 0), tl.max(v_o, 0))
+        step = _step(lo, hi, min_range, 15)
+        lo = lo.to(tl.float16).to(tl.float32)
+        q_e = _quantize(v_e, lo, step, 15)
+        q_o = _quantize(v_o, lo, step, 15)
+        d_e = _dequantize(q_e, lo, step)
+        d_o = _dequantize(q_o, lo, step)
+        tl.store(row + g * half + k, q_e.to(tl.uint8) | (q_o.to(tl.uint8) << 4))
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden // 4 + 2 * g
+        tl.store(scales, lo.to(tl.float16))
+        tl.store(scales + 1, step.to(tl.float16))
+        tl.store(deq_ptr + i * deq_stride + base + 2 * k, d_e)
+        tl.store(deq_ptr + i * deq_stride + base + 2 * k + 1, d_o)
+        if ef:
+            tl.store(erow + base + 2 * k, v_e - d_e)
+            tl.store(erow + base + 2 * k + 1, v_o - d_o)
+
+
+@triton.jit
+def _decode_combine_kernel(
+    data_ptr,
+    row_bytes,
+    out_ptr,
+    out_stride,
+    hidden: tl.constexpr,
+    group: tl.constexpr,
+    bits: tl.constexpr,
+):
+    half: tl.constexpr = group // 2
+    i = tl.program_id(0)
+    g = tl.program_id(1)
+    row = data_ptr + i * row_bytes
+    base = g * group
+    if bits == 8:
+        k = tl.arange(0, group)
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden // 2 + 2 * g
+        lo = tl.load(scales).to(tl.float32)
+        step = tl.load(scales + 1).to(tl.float32)
+        v = _dequantize(tl.load(row + base + k).to(tl.float32), lo, step)
+        tl.store(out_ptr + i * out_stride + base + k, v)
+    else:
+        k = tl.arange(0, half)
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden // 4 + 2 * g
+        lo = tl.load(scales).to(tl.float32)
+        step = tl.load(scales + 1).to(tl.float32)
+        packed = tl.load(row + g * half + k)
+        tl.store(
+            out_ptr + i * out_stride + base + 2 * k,
+            _dequantize((packed & 0xF).to(tl.float32), lo, step),
+        )
+        tl.store(
+            out_ptr + i * out_stride + base + 2 * k + 1,
+            _dequantize((packed >> 4).to(tl.float32), lo, step),
+        )
+
+
 def _state_args(state: torch.Tensor | None, like: torch.Tensor) -> tuple[Any, int]:
     if state is None:
         return like, 0
@@ -315,4 +426,64 @@ def decode_rows(
     )
 
 
-__all__ = ["decode_rows", "encode_rows"]
+def encode_combine(
+    code: int,
+    partial: torch.Tensor,
+    rows: torch.Tensor,
+    err: torch.Tensor | None,
+    out: torch.Tensor,
+    deq: torch.Tensor,
+) -> None:
+    """Fused FFN kernel (see ``encode_combine_reference``)."""
+    n, hidden = partial.shape
+    if not n:
+        return
+    if (
+        partial.stride(-1) != 1
+        or deq.stride(-1) != 1
+        or deq.dtype != torch.float32
+        or out.dim() != 1
+        or out.dtype != torch.uint8
+    ):
+        raise ValueError(
+            "combine compression needs row-contiguous partial and fp32 deq, "
+            "flat uint8 out"
+        )
+    err_arg, err_stride = _state_args(err, deq)
+    _encode_combine_kernel[(n, hidden // QUANT_GROUP_SIZE)](
+        partial,
+        partial.stride(0),
+        rows,
+        err_arg,
+        err_stride,
+        out,
+        deq,
+        deq.stride(0),
+        row_bytes(code, hidden),
+        MIN_GROUP_RANGE,
+        hidden=hidden,
+        group=QUANT_GROUP_SIZE,
+        bits=CODE_BITS[code],
+        ef=err is not None,
+    )
+
+
+def decode_combine(code: int, data: torch.Tensor, out: torch.Tensor) -> None:
+    """Fused Attention kernel (see ``decode_combine_reference``)."""
+    n, hidden = out.shape
+    if not n:
+        return
+    if out.stride(-1) != 1 or out.dtype != torch.float32 or data.dim() != 1:
+        raise ValueError("combine compression needs a row-contiguous fp32 out")
+    _decode_combine_kernel[(n, hidden // QUANT_GROUP_SIZE)](
+        data,
+        row_bytes(code, hidden),
+        out,
+        out.stride(0),
+        hidden=hidden,
+        group=QUANT_GROUP_SIZE,
+        bits=CODE_BITS[code],
+    )
+
+
+__all__ = ["decode_combine", "decode_rows", "encode_combine", "encode_rows"]

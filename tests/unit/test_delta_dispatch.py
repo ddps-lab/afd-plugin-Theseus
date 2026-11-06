@@ -19,9 +19,12 @@ from afd_plugin.delta_dispatch import (
     QUANT_GROUP_SIZE,
     RANK_SHIFT,
     AttentionDeltaState,
+    CombineConfig,
     DeltaDispatchConfig,
     FFNDeltaState,
+    decode_combine_reference,
     decode_rows_reference,
+    encode_combine_reference,
     encode_rows_reference,
     row_bytes,
 )
@@ -74,20 +77,32 @@ def _order(owner: torch.Tensor, ids: torch.Tensor, num_ffn: int) -> torch.Tensor
     return torch.cat([flat, pad])
 
 
-def _drive(cfg: DeltaDispatchConfig, num_ffn: int, num_attn: int, stages: int):
+def _drive(
+    cfg: DeltaDispatchConfig,
+    num_ffn: int,
+    num_attn: int,
+    stages: int,
+    combine: CombineConfig | None = None,
+    forwards: int = 1,
+):
     """Run Attention ranks and FFN ranks through the MoE layers the way the
     connector and the model do, with a loopback wire. Per (layer, stage,
     Attention rank) return the experts' input of every (FFN rank, token) row,
     Norm(h'), the rows' state indices, codes and words, the bytes per FFN
-    rank and, after each (layer, stage), the states of both sides."""
+    rank, the returned partial sums (exact and as received) and, after each
+    (layer, stage), the states of both sides."""
     gen = torch.Generator().manual_seed(0)
     owner = torch.arange(NUM_EXPERTS) % num_ffn
+    combine = combine or CombineConfig()
+    rb = combine.row_bytes(HIDDEN) if combine.enabled else 0
     attn = [
-        AttentionDeltaState(cfg, MOE_LAYERS, ROUTED_SCALE, num_ffn, TOKENS, HIDDEN)
+        AttentionDeltaState(
+            cfg, MOE_LAYERS, ROUTED_SCALE, num_ffn, TOKENS, HIDDEN, combine
+        )
         for _ in range(num_attn)
     ]
     ffn = [
-        FFNDeltaState(cfg, MOE_LAYERS, ROUTED_SCALE, HIDDEN, num_attn, TOKENS)
+        FFNDeltaState(cfg, MOE_LAYERS, ROUTED_SCALE, HIDDEN, num_attn, TOKENS, combine)
         for _ in range(num_ffn)
     ]
     h = {
@@ -96,7 +111,7 @@ def _drive(cfg: DeltaDispatchConfig, num_ffn: int, num_attn: int, stages: int):
         for s in range(stages)
     }
     steps = []
-    for layer in MOE_LAYERS:
+    for layer in [layer for _ in range(forwards) for layer in MOE_LAYERS]:
         for s in range(stages):
             sent = {}
             for a in range(num_attn):
@@ -142,16 +157,32 @@ def _drive(cfg: DeltaDispatchConfig, num_ffn: int, num_attn: int, stages: int):
                             partial[r] += weights[t, k] * _expert(x[r], int(ids[t, k]))
                 partial = partial.to(torch.bfloat16)
                 ffn[f].after_experts(s, partial)
+                if combine.enabled:
+                    # The compressed rows, Attention rank major like the
+                    # received ones: each Attention rank's share is a span.
+                    cbytes = ffn[f].combine_bytes(s, len(origin)).clone()
+                    assert cbytes.numel() == len(origin) * rb
                 for r, (a, i) in enumerate(origin):
-                    results[a].append((i, partial[r], x[r].clone(), f))
+                    wire = cbytes[r * rb : (r + 1) * rb] if combine.enabled else None
+                    results[a].append((i, partial[r], x[r].clone(), f, wire))
             for a in range(num_attn):
                 h_prime, ids, weights, packed, n, _, meta = sent[a]
-                back = torch.zeros(n, HIDDEN, dtype=torch.bfloat16)
+                exact = torch.zeros(n, HIDDEN, dtype=torch.bfloat16)
                 inputs = {}
-                for i, part, x_row, f in results[a]:
-                    back[i] = part
+                for i, part, x_row, f, _ in results[a]:
+                    exact[i] = part
                     inputs[(f, int(packed.flat[i]) % TOKENS)] = x_row
-                attn[a].after_combine(packed, n, back)
+                if combine.enabled:
+                    # Gathered in the dispatch order (FFN rank major, as the
+                    # connector reads the regions), rebuilt, into the states.
+                    by_row = sorted(results[a], key=lambda item: item[0])
+                    data = torch.cat([item[4] for item in by_row])
+                    received = attn[a].decode_combine(s, data, n).clone()
+                    attn[a].after_combine(packed, n, received)
+                    back = received.to(torch.bfloat16)
+                else:
+                    back = exact
+                    attn[a].after_combine(packed, n, back)
                 summed = torch.zeros(TOKENS, HIDDEN)
                 summed.index_add_(0, packed.flat[:n] % TOKENS, back.float())
                 shared = torch.randn(TOKENS, HIDDEN, generator=gen) * 0.2
@@ -169,6 +200,8 @@ def _drive(cfg: DeltaDispatchConfig, num_ffn: int, num_attn: int, stages: int):
                         "codes": packed.codes[:n].clone(),
                         "meta": meta.clone(),
                         "bytes": packed.totals.clone(),
+                        "exact": exact.float(),
+                        "received": back.float(),
                     }
                 )
             steps[-1]["ffn_states"] = [f_state._state.get(s) for f_state in ffn]
@@ -464,3 +497,176 @@ def test_each_forward_starts_with_first_visits() -> None:
             out = torch.zeros(int(packed.totals.sum()), dtype=torch.uint8)
             meta = torch.zeros(2 * TOKENS, dtype=torch.int32)
             attn.encode(packed, h, 2 * TOKENS, out, meta, 0)
+
+
+def test_combine_config_parsing() -> None:
+    assert not CombineConfig.from_extra_config(None).enabled
+    cfg = CombineConfig.from_extra_config({"combine": {"mode": "int4"}})
+    assert cfg.enabled and cfg.ef and cfg.code == D_INT4
+    assert cfg.row_bytes(MODEL_HIDDEN) == 1088
+    cfg = CombineConfig.from_mapping({"mode": "int8", "ef": False})
+    assert cfg.code == D_INT8 and not cfg.ef
+    assert cfg.row_bytes(MODEL_HIDDEN) == 2112
+    for bad in ({"mode": "fp8"}, {"mode": "int4", "ef": 1}, {"bits": 4}):
+        with pytest.raises(ValueError):
+            CombineConfig.from_mapping(bad)
+
+
+@pytest.mark.parametrize("code,bits", [(D_INT8, 8), (D_INT4, 4)])
+def test_combine_rows_match_offline_quantizer(code: int, bits: int) -> None:
+    # Without error feedback the received value is the offline quantizer's
+    # (compress.py) of the partial; with it, of partial + residual, and the
+    # new residual is what was cut.
+    gen = torch.Generator().manual_seed(4)
+    n = 9
+    partial = (torch.randn(n, HIDDEN, generator=gen) * 2).to(torch.bfloat16)
+    rows = torch.randperm(2 * TOKENS, generator=gen)[:n]
+    size = row_bytes(code, HIDDEN)
+    data = torch.zeros(n * size + 5, dtype=torch.uint8)
+    deq = torch.empty(n, HIDDEN)
+    encode_combine_reference(code, partial, rows, None, data, deq)
+    assert torch.equal(deq, _offline_quantize(partial.float(), bits))
+    back = torch.empty(n, HIDDEN)
+    decode_combine_reference(code, data, back)
+    assert torch.equal(back, deq)
+    err = torch.randn(2 * TOKENS, HIDDEN, generator=gen) * 0.1
+    before = err.clone()
+    encode_combine_reference(code, partial, rows, err, data, deq)
+    v = partial.float() + before[rows]
+    assert torch.equal(deq, _offline_quantize(v, bits))
+    assert torch.equal(err[rows], v - deq)
+    untouched = torch.ones(2 * TOKENS, dtype=torch.bool)
+    untouched[rows] = False
+    assert torch.equal(err[untouched], before[untouched])
+
+
+@pytest.mark.parametrize("mode", ["int8", "int4"])
+def test_combine_error_feedback_keeps_the_sum(mode: str) -> None:
+    # Over the visits of a forward the received partials add up to the exact
+    # ones minus the last residual (sigma-delta): the cut parts are not lost.
+    combine = CombineConfig(mode=mode)
+    ffn = FFNDeltaState(
+        DeltaDispatchConfig(mode="delta_fp32"),
+        MOE_LAYERS,
+        1.0,
+        HIDDEN,
+        1,
+        TOKENS,
+        combine,
+    )
+    gen = torch.Generator().manual_seed(6)
+    exact = torch.zeros(TOKENS, HIDDEN)
+    received = torch.zeros(TOKENS, HIDDEN)
+    rows = torch.arange(TOKENS)
+    for _ in MOE_LAYERS:
+        ffn._rows[0] = rows
+        partial = (torch.randn(TOKENS, HIDDEN, generator=gen)).to(torch.bfloat16)
+        ffn._state[0] = torch.zeros(TOKENS, HIDDEN)
+        ffn.after_experts(0, partial)
+        back = torch.empty(TOKENS, HIDDEN)
+        decode_combine_reference(combine.code, ffn.combine_bytes(0, TOKENS), back)
+        exact += partial.float()
+        received += back
+    torch.testing.assert_close(received, exact - ffn._err[0], rtol=0, atol=1e-5)
+    # The residual stays at one quantization step, not the accumulated error.
+    assert float(ffn._err[0].abs().max()) < 0.2
+
+
+@pytest.mark.parametrize("delta_mode", ["delta_int4", "delta_fp32", "x_int4"])
+@pytest.mark.parametrize("mode,ef", [("int4", True), ("int8", True), ("int4", False)])
+def test_combine_keeps_both_states_identical(
+    delta_mode: str, mode: str, ef: bool
+) -> None:
+    # Four FFN ranks, two Attention ranks, two stages, two forwards: both sides
+    # add what the Attention side received, so the states stay identical; the
+    # received partial sums are the offline quantizer's of partial (+ residual).
+    revisit = "int8" if delta_mode == "delta_int4" else "int4"
+    cfg = DeltaDispatchConfig(mode=delta_mode, revisit=revisit)
+    steps = _drive(cfg, 4, 2, 2, CombineConfig(mode=mode, ef=ef), forwards=2)
+    for step in steps:
+        if "ffn_states" in step and cfg.stateful:
+            for f, f_state in enumerate(step["ffn_states"]):
+                for a, a_state in enumerate(step["attn_states"]):
+                    if f_state is None or a_state is None:
+                        continue
+                    assert torch.equal(
+                        f_state[a * TOKENS : (a + 1) * TOKENS],
+                        a_state[f * TOKENS : (f + 1) * TOKENS],
+                    )
+        err = (step["received"] - step["exact"]).abs().max()
+        assert 0 < float(err) < 0.5
+    if not ef:
+        bits = 8 if mode == "int8" else 4
+        for step in steps:
+            assert torch.equal(
+                step["received"],
+                _offline_quantize(step["exact"], bits).to(torch.bfloat16).float(),
+            )
+
+
+def test_combine_residual_starts_at_zero_every_forward() -> None:
+    combine = CombineConfig(mode="int4")
+    ffn = FFNDeltaState(
+        DeltaDispatchConfig(mode="delta_int4"),
+        MOE_LAYERS,
+        1.0,
+        HIDDEN,
+        1,
+        TOKENS,
+        combine,
+    )
+    ffn._err[0] = torch.ones(TOKENS, HIDDEN)
+    ffn.receive(0, torch.zeros(0, dtype=torch.int32))
+    ffn.decode(
+        MOE_LAYERS[1],
+        0,
+        torch.zeros(0, dtype=torch.uint8),
+        _norm_into,
+        2,
+        torch.bfloat16,
+    )
+    assert float(ffn._err[0].sum()) == TOKENS * HIDDEN
+    ffn.receive(0, torch.zeros(0, dtype=torch.int32))
+    ffn.decode(
+        MOE_LAYERS[0],
+        0,
+        torch.zeros(0, dtype=torch.uint8),
+        _norm_into,
+        2,
+        torch.bfloat16,
+    )
+    assert float(ffn._err[0].abs().sum()) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton)")
+@pytest.mark.parametrize("code", [D_INT8, D_INT4])
+@pytest.mark.parametrize("ef", [False, True])
+def test_triton_combine_kernels_match_reference(code: int, ef: bool) -> None:
+    from afd_plugin import delta_dispatch_triton
+
+    gen = torch.Generator().manual_seed(8)
+    n, slots = 40, 64
+    partial = (torch.randn(n, MODEL_HIDDEN, generator=gen) * 3).to(torch.bfloat16)
+    rows = torch.randperm(slots, generator=gen)[:n]
+    err = torch.randn(slots, MODEL_HIDDEN, generator=gen) * 0.1 if ef else None
+    size = row_bytes(code, MODEL_HIDDEN)
+    ref_data = torch.zeros(n * size, dtype=torch.uint8)
+    ref_deq = torch.empty(n, MODEL_HIDDEN)
+    ref_err = err.clone() if ef else None
+    encode_combine_reference(code, partial, rows, ref_err, ref_data, ref_deq)
+    data = torch.zeros(n * size, dtype=torch.uint8, device="cuda")
+    deq = torch.empty(n, MODEL_HIDDEN, device="cuda")
+    gpu_err = err.cuda() if ef else None
+    delta_dispatch_triton.encode_combine(
+        code, partial.cuda(), rows.cuda(), gpu_err, data, deq
+    )
+    # Same bytes; deq and the residual differ from the reference only by the
+    # fused multiply-add of the dequantization.
+    assert torch.equal(data.cpu(), ref_data)
+    torch.testing.assert_close(deq.cpu(), ref_deq, rtol=1e-6, atol=1e-6)
+    if ef:
+        torch.testing.assert_close(gpu_err.cpu(), ref_err, rtol=1e-6, atol=1e-6)
+    # The Attention kernel rebuilds exactly what the FFN kernel added.
+    back = torch.empty(n, MODEL_HIDDEN, device="cuda")
+    delta_dispatch_triton.decode_combine(code, data, back)
+    assert torch.equal(back, deq)

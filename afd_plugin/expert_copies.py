@@ -15,9 +15,9 @@ for every selected expert, which rank's copy computes it:
 2. Copy: an expert held by one rank of that set goes there; one held by
    several goes to the rank with the fewest single-choice (token, expert)
    pairs of this stage, then to its home rank, then to the lower rank. All
-   pairs choose at once (a few tensor operations); the per-pair sequential
-   choice it approximates balances the stage's experts within 0.03 of it on
-   recorded routings (Plan 16 experiment 6, step 4-3).
+   pairs choose at once (a few tensor operations). On recorded routings its
+   max/mean expert load is 0.01-0.04 above that of the per-pair sequential
+   choice it approximates (Plan 16 experiment 6, step 4-3).
 
 The dispatch plan takes these (token, expert) destinations, and every FFN rank
 receives the token's row with the other ranks' experts set to -1 (ignored by

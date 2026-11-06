@@ -95,8 +95,10 @@ def context(monkeypatch):
     return ctx
 
 
-def _vllm_config(delta: dict | None) -> SimpleNamespace:
+def _vllm_config(delta: dict | None, combine: dict | None = None) -> SimpleNamespace:
     extra = {} if delta is None else {"delta_dispatch": delta}
+    if combine is not None:
+        extra["combine"] = combine
     return SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.bfloat16, enforce_eager=True),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=TOKENS),
@@ -184,9 +186,10 @@ def _model(
     ffn: int = 0,
     connector: str = "NixlRoutedAFDConnector",
     held: dict[int, torch.Tensor] | None = None,
+    combine: dict | None = None,
 ):
     """The parts of AFDDeepseekV2Model the delta wiring and the FFN compute use."""
-    vllm_config = _vllm_config(delta)
+    vllm_config = _vllm_config(delta, combine)
     layers = [
         _AttnLayer(idx)
         if role == "attention"
@@ -207,7 +210,11 @@ def _model(
     cfg = adapter.DeltaDispatchConfig.from_vllm_config(vllm_config)
     if cfg.enabled:
         adapter.AFDDeepseekV2Model._init_delta_dispatch(
-            model, cfg, vllm_config, _afd_config(role, num_ffn, connector)
+            model,
+            cfg,
+            vllm_config,
+            _afd_config(role, num_ffn, connector),
+            adapter.CombineConfig.from_vllm_config(vllm_config),
         )
     return model, cfg
 
@@ -219,8 +226,11 @@ class _Loopback:
     the connector's own ``_begin_plan`` (per-layer expert placement, copies)
     and each FFN rank gets the rows' ids its ``_mask_copied_ids`` leaves."""
 
-    def __init__(self, cfg, ffns, ctx, owners=None, router=None) -> None:
+    def __init__(self, cfg, ffns, ctx, owners=None, router=None, combine=None) -> None:
         self.delta_dispatch, self.ffns, self.ctx = cfg, ffns, ctx
+        self.combine = combine or adapter.CombineConfig()
+        # Per dispatch: the FFN ranks' exact partial sums and the received ones.
+        self.returned: list[tuple[torch.Tensor, torch.Tensor]] = []
         num_ffn = len(ffns)
         self.engine = P2pAll2AllEngine(
             None, num_ffn, num_ffn + 1, NUM_EXPERTS // num_ffn, TOKENS, "cpu"
@@ -277,7 +287,7 @@ class _Loopback:
             self, ids, stage, plan, pending
         )
         rows = hidden_states[plan.perm]
-        partials, row, byte = [], 0, 0
+        partials, compressed, row, byte = [], [], 0, 0
         for f, model in enumerate(self.ffns):
             count = plan.send_counts[f]
             launch_ids = torch.cat(
@@ -298,13 +308,25 @@ class _Loopback:
                 model, received, context.metadata.layer_idx, launch_weights, launch_ids
             )
             partials.append(out[:count])
+            if self.combine.enabled:
+                # The FFN model compressed its rows after the experts.
+                compressed.append(model.ffn_delta.combine_bytes(stage, count).clone())
             row += count
-        self._pending = (plan, torch.cat(partials), packed, delta)
+        self._pending = (plan, torch.cat(partials), packed, delta, compressed)
 
     def recv_ffn_output(self, ref_tensor, ubatch_idx):
-        plan, back, packed, delta = self._pending
-        if self.delta_dispatch.enabled:
+        plan, back, packed, delta, compressed = self._pending
+        exact = back
+        if self.combine.enabled:
+            # The connector's steps: bytes gathered in FFN rank order,
+            # rebuilt in fp32, into the states, summed in the model dtype.
+            data = torch.cat(compressed)
+            received = delta.decode_combine(ubatch_idx, data, plan.num_send)
+            delta.after_combine(packed, plan.num_send, received)
+            back = received.to(back.dtype)
+        elif self.delta_dispatch.enabled:
             delta.after_combine(packed, plan.num_send, back)
+        self.returned.append((exact.float(), back.float()))
         out = torch.empty_like(ref_tensor)
         self.engine.combine_accumulate(plan, back, out)
         return out
@@ -329,6 +351,7 @@ def _run(
     num_ffn: int,
     placement: dict[int, list[list[int]]] | None = None,
     home: dict[int, list[int]] | None = None,
+    combine: dict | None = None,
 ) -> dict:
     """One forward over the MoE layers, ``stages`` micro-batches interleaved
     per layer like the pipeline; returns what every FFN rank's experts saw,
@@ -350,9 +373,16 @@ def _run(
             )
         else:
             owners = routed_connector.expert_owner_tables(placement, NUM_EXPERTS, "cpu")
-    attn, cfg = _model("attention", delta, num_ffn)
+    attn, cfg = _model("attention", delta, num_ffn, combine=combine)
     ffns = [
-        _model("ffn", delta, num_ffn, f, held=None if held is None else held[f])[0]
+        _model(
+            "ffn",
+            delta,
+            num_ffn,
+            f,
+            held=None if held is None else held[f],
+            combine=combine,
+        )[0]
         for f in range(num_ffn)
     ]
     gen = torch.Generator().manual_seed(0)
@@ -362,7 +392,14 @@ def _run(
         with torch.no_grad():
             for model in (attn, *ffns):
                 model.layers[idx].post_attention_layernorm.weight.copy_(weight)
-    wire = _Loopback(cfg, ffns, ctx, owners, router)
+    wire = _Loopback(
+        cfg,
+        ffns,
+        ctx,
+        owners,
+        router,
+        adapter.CombineConfig.from_mapping(combine),
+    )
     ctx.afd.connector = wire
     router = _Router(gen)
     residual = [
@@ -395,6 +432,7 @@ def _run(
         ],
         "hidden": hidden,
         "sent": wire.sent,
+        "returned": wire.returned,
         "attn": attn,
         "ffns": ffns,
     }
@@ -633,6 +671,48 @@ def test_copies_keep_both_int4_states_identical(cpu_config, context):
                 model.ffn_delta._state[stage][:TOKENS],
                 attn_state[stage][f * TOKENS : (f + 1) * TOKENS],
             )
+
+
+@pytest.mark.parametrize("ef", [True, False])
+def test_combine_keeps_both_states_identical_with_copies(cpu_config, context, ef):
+    # Combine compression on top of int4 deltas and a placement with copies:
+    # every FFN rank adds what the Attention side received to its states.
+    placement, home = _copies_placement()
+    delta = {"mode": "delta_int4", "revisit": "int8"}
+    on = _run(delta, context, 2, 4, placement, home, {"mode": "int4", "ef": ef})
+    attn_state = on["attn"].layers[MOE_LAYERS[0]].mlp.experts.delta._state
+    for f, model in enumerate(on["ffns"]):
+        for stage in range(2):
+            assert torch.equal(
+                model.ffn_delta._state[stage][:TOKENS],
+                attn_state[stage][f * TOKENS : (f + 1) * TOKENS],
+            )
+    assert len(on["returned"]) == len(MOE_LAYERS) * 2
+    for exact, received in on["returned"]:
+        err = (received - exact).abs().max()
+        assert 0 < float(err) < 0.2
+
+
+def test_combine_int8_stays_close_to_off(cpu_config, context):
+    off = _run(None, context, 2, 4)
+    on = _run({"mode": "delta_fp32"}, context, 2, 4, combine={"mode": "int8"})
+    for h_on, h_off in zip(on["hidden"], off["hidden"], strict=True):
+        torch.testing.assert_close(h_on.float(), h_off.float(), rtol=0.03, atol=0.03)
+
+
+def test_nixl_connector_combine_needs_delta_dispatch():
+    pytest.importorskip("nixl")
+    from afd_plugin.connectors.gpu.nixl_routed import NixlRoutedAFDConnector
+
+    NixlRoutedAFDConnector.parse_extra_config(
+        {"delta_dispatch": {"mode": "full_bf16"}, "combine": {"mode": "int4"}}
+    )
+    with pytest.raises(ValueError, match="needs delta dispatch"):
+        NixlRoutedAFDConnector.parse_extra_config({"combine": {"mode": "int8"}})
+    with pytest.raises(ValueError):
+        NixlRoutedAFDConnector.parse_extra_config(
+            {"delta_dispatch": {"mode": "delta_int4"}, "combine": {"mode": "fp8"}}
+        )
 
 
 def test_delta_dispatch_needs_the_routed_connector(cpu_config, context):

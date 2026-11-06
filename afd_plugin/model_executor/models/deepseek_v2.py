@@ -35,6 +35,7 @@ from afd_plugin.connectors import (
 )
 from afd_plugin.delta_dispatch import (
     AttentionDeltaState,
+    CombineConfig,
     DeltaDispatchConfig,
     FFNDeltaState,
 )
@@ -946,11 +947,18 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             ),
             prefix=f"{prefix}.layers",
         )
-        # Delta dispatch (afd_plugin/delta_dispatch.py; off by default).
+        # Delta dispatch and combine compression (afd_plugin/delta_dispatch.py;
+        # off by default).
         self.ffn_delta: FFNDeltaState | None = None
         delta = DeltaDispatchConfig.from_vllm_config(vllm_config)
+        combine = CombineConfig.from_vllm_config(vllm_config)
+        if combine.enabled and not delta.enabled:
+            raise ValueError(
+                "combine compression needs delta dispatch (mode full_bf16 sends "
+                "the same bf16 x as off)"
+            )
         if delta.enabled:
-            self._init_delta_dispatch(delta, vllm_config, afd_config)
+            self._init_delta_dispatch(delta, vllm_config, afd_config, combine)
         # ### PATCH END
 
         if native.get_pp_group().is_last_rank:
@@ -980,6 +988,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         delta: DeltaDispatchConfig,
         vllm_config: VllmConfig,
         afd_config: AFDConfig,
+        combine: CombineConfig | None = None,
     ) -> None:
         """Wire the delta dispatch states into the routed MoE layers.
 
@@ -1017,6 +1026,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
                 num_ffn=int(afd_config.num_ffn_ranks),
                 max_tokens=max_tokens,
                 hidden=self.config.hidden_size,
+                combine=combine,
             )
             for idx in layers:
                 layer = self.layers[idx]
@@ -1036,6 +1046,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
                 hidden=self.hidden_size,
                 num_attn=int(afd_config.num_attention_ranks),
                 max_tokens=max_tokens,
+                combine=combine,
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
