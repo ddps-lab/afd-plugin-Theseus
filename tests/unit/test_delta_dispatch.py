@@ -241,13 +241,16 @@ def test_config_parsing() -> None:
         "int8",
         2,
     )
-    assert DeltaDispatchConfig(mode="x_int4").sends_x
-    assert not DeltaDispatchConfig(mode="x_int4").stateful
+    for mode in ("x_int4", "x_int8"):
+        assert DeltaDispatchConfig(mode=mode).sends_x
+        assert not DeltaDispatchConfig(mode=mode).stateful
     for bad in (
         {"mode": "int3"},
         {"mode": "off", "extra": 1},
         {"mode": "delta_fp32", "early": 2},
         {"mode": "x_int4", "revisit": "int8"},
+        {"mode": "x_int8", "revisit": "int8"},
+        {"mode": "x_int8", "first": "int4"},
         {"mode": "delta_int4", "revisit": "fp8"},
         {"mode": "delta_int4", "rgap": 1},
     ):
@@ -282,6 +285,7 @@ def test_first_and_revisit_config() -> None:
         ("delta_int4", "int4"),
         ("delta_int3", "int3"),
         ("x_int4", "int4"),
+        ("x_int8", "int4"),
         ("delta_fp32", "int4"),
     ):
         named = DeltaDispatchConfig.from_mapping({"mode": mode, "revisit": own})
@@ -330,6 +334,7 @@ def test_row_formats_and_codes() -> None:
         "delta_fp32": (DeltaDispatchConfig(mode="delta_fp32"), (4096, 8192)),
         "full_bf16": (DeltaDispatchConfig(mode="full_bf16"), (4096, 4096)),
         "x_int4": (DeltaDispatchConfig(mode="x_int4"), (1088, 1088)),
+        "x_int8": (DeltaDispatchConfig(mode="x_int8"), (2112, 2112)),
         "delta_int3": (DeltaDispatchConfig(mode="delta_int3"), (832, 4096)),
         "delta_int3 first": (
             DeltaDispatchConfig(mode="delta_int3", first="int4"),
@@ -356,6 +361,7 @@ def test_row_formats_and_codes() -> None:
     cases = {
         "full_bf16": (DeltaDispatchConfig(mode="full_bf16"), [0, 0, 0, 0, 0]),
         "x_int4": (DeltaDispatchConfig(mode="x_int4"), [3, 3, 3, 3, 3]),
+        "x_int8": (DeltaDispatchConfig(mode="x_int8"), [2, 2, 2, 2, 2]),
         "delta_fp32": (DeltaDispatchConfig(mode="delta_fp32"), [0, 1, 1, 1, 1]),
         "int4": (DeltaDispatchConfig(mode="delta_int4"), [0, 3, 3, 3, 3]),
         # gaps 1, 2, 3, 5
@@ -621,12 +627,15 @@ def test_first_visit_and_revisit_follow_the_offline_rules() -> None:
     assert any(len(set(s["codes"].tolist())) > 1 for s in steps)
 
 
-def test_x_int4_is_the_plain_quantizer() -> None:
-    # No state: every FFN rank gets x = Norm(h') quantized to int4 per row.
-    for step in _drive(DeltaDispatchConfig(mode="x_int4"), 4, 2, 1):
-        assert set(step["codes"].tolist()) == {D_INT4}
+@pytest.mark.parametrize(
+    "mode,code,bits", [("x_int4", D_INT4, 4), ("x_int8", D_INT8, 8)]
+)
+def test_x_modes_are_the_plain_quantizer(mode: str, code: int, bits: int) -> None:
+    # No state: every FFN rank gets x = Norm(h') quantized per row.
+    for step in _drive(DeltaDispatchConfig(mode=mode), 4, 2, 1):
+        assert set(step["codes"].tolist()) == {code}
         for (_, t), x in step["inputs"].items():
-            want = _offline_quantize(step["norm_h"][t].float().view(1, -1), 4)
+            want = _offline_quantize(step["norm_h"][t].float().view(1, -1), bits)
             assert torch.equal(x, want.view(-1).to(torch.bfloat16))
 
 
@@ -650,6 +659,7 @@ def test_missing_rows_are_an_error() -> None:
         ("delta_fp32", "bf16"),
         ("full_bf16", "bf16"),
         ("x_int4", "bf16"),
+        ("x_int8", "bf16"),
         ("delta_int3", "int4"),
         ("delta_int4", "int4"),
         ("delta_int3", "bf16"),
@@ -816,7 +826,7 @@ def test_combine_error_feedback_keeps_the_sum(mode: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "delta_mode", ["delta_int4", "delta_int3", "delta_fp32", "x_int4"]
+    "delta_mode", ["delta_int4", "delta_int3", "delta_fp32", "x_int4", "x_int8"]
 )
 @pytest.mark.parametrize("mode,ef", [("int4", True), ("int8", True), ("int4", False)])
 def test_combine_keeps_both_states_identical(

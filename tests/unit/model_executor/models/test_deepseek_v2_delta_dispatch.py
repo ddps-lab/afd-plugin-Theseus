@@ -540,19 +540,22 @@ def test_quantized_rows_keep_both_states_identical(
         assert {first_code, own, D_INT8} <= all_codes
 
 
-def test_x_int4_sends_the_plainly_quantized_x(cpu_config, context):
-    on = _run({"mode": "x_int4"}, context, 1, 4)
+@pytest.mark.parametrize(
+    "mode,code,bits", [("x_int4", D_INT4, 4), ("x_int8", D_INT8, 8)]
+)
+def test_x_modes_send_the_plainly_quantized_x(cpu_config, context, mode, code, bits):
+    on = _run({"mode": mode}, context, 1, 4)
     sent = iter(on["sent"])
     inputs = iter(on["inputs"])
     # The FFN models' inputs, per layer FFN rank by FFN rank, are the plan's x
-    # rows quantized to int4 (no state, no FFN-side norm).
+    # rows quantized to int4 / int8 (no state, no FFN-side norm).
     by_layer: dict[int, list[torch.Tensor]] = {}
     for model in on["ffns"]:
         for idx in MOE_LAYERS:
             by_layer.setdefault(idx, []).extend(model.layers[idx].inputs)
     for item in sent:
-        assert set(item["codes"]) == {D_INT4}
-        want = _offline_quantize(item["x"].float(), 4).to(torch.bfloat16)
+        assert set(item["codes"]) == {code}
+        want = _offline_quantize(item["x"].float(), bits).to(torch.bfloat16)
         got = torch.cat(by_layer[item["layer"]])
         assert torch.equal(got, want)
     assert next(inputs, None) is not None
