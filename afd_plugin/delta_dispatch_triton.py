@@ -13,7 +13,7 @@ of every format.
   ``lo`` / ``step`` rounded to fp16, IEEE divisions, ``q = round_half_even((d -
   lo) / step)`` clamped) with ``S += deq`` in place; ``h_int4`` (first visit)
   quantizes ``h'`` with ``S`` taken as zero, so ``S = deq``. Also the row's
-  word and the MoE layer of the visit. Without states (``x_int4``) ``S`` is
+  word and the MoE layer of the visit. Without states (``x_int4``, ``x_int8``) ``S`` is
   zero.
 * ``decode_rows`` (FFN): per row, the value rebuilt from the bytes: ``S = h'``
   (``h_int4``: ``S = 0 + deq``) or ``S += deq`` and ``h_out = S`` in the model

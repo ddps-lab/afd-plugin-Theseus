@@ -1125,7 +1125,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
                 topk_ids,
                 a1q_scale=a1q_scale,
             )
-        # Delta dispatch: rebuild every received row (h', or x for x_int4)
+        # Delta dispatch: rebuild every received row (h', or x for x_int4 / x_int8)
         # from the bytes and the words the connector handed over, normalize
         # h' here, then run the experts as for x rows; keep the partial sums.
         afd_metadata = get_afd_metadata_from_forward_context()

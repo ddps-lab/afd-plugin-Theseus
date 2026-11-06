@@ -60,8 +60,10 @@ Codes by mode (``connector_extra_config = {"delta_dispatch": {...}}``):
   format on rows whose last visit to the FFN rank was ``rgap`` or more MoE
   layers before; else ``d_int4`` / ``d_int3`` (the rules of the offline
   experiment's ``sim.FFNSim``).
-* ``x_int4``: no state: every row is ``x = Norm(h')`` in int4 and the FFN rank
-  uses the dequantized ``x`` as is (plain quantization, the baseline).
+* ``x_int4`` / ``x_int8``: no state: every row is ``x = Norm(h')`` in int4 /
+  int8 (``d_int4`` / ``d_int8`` of ``x - 0``) and the FFN rank uses the
+  dequantized ``x`` as is (plain quantization, the baselines; int8 stands in
+  for the 8-bit dispatch of other systems).
 
 Combine compression (``connector_extra_config = {"combine": {"mode": ...,
 "ef": ...}}``, needs delta dispatch for the rows' tokens): each FFN rank
@@ -91,7 +93,15 @@ import torch
 
 from afd_plugin.config import connector_extra_config_from_source
 
-MODES = ("off", "full_bf16", "delta_fp32", "delta_int4", "delta_int3", "x_int4")
+MODES = (
+    "off",
+    "full_bf16",
+    "delta_fp32",
+    "delta_int4",
+    "delta_int3",
+    "x_int4",
+    "x_int8",
+)
 EXTRA_CONFIG_KEY = "delta_dispatch"
 COMBINE_KEY = "combine"
 COMBINE_MODES = ("off", "int8", "int4")
@@ -101,6 +111,8 @@ CODE_BITS = {D_INT8: 8, D_INT4: 4, H_INT4: 4, D_INT3: 3}
 # The format of a quantized delta mode's later visits, and the formats
 # ``first`` and ``revisit`` name.
 DELTA_CODES = {"delta_int4": D_INT4, "delta_int3": D_INT3}
+# The format of every row of a plain-quantization (stateless) mode.
+X_CODES = {"x_int4": D_INT4, "x_int8": D_INT8}
 FIRST_FORMATS = {"bf16": H_BF16, "int4": H_INT4}
 REVISIT_FORMATS = {"int3": D_INT3, "int4": D_INT4, "int8": D_INT8}
 CODE_SHIFT = 23
@@ -220,7 +232,7 @@ class DeltaDispatchConfig:
     @property
     def sends_x(self) -> bool:
         """Rows are the MoE input x itself (no state, no FFN-side norm)."""
-        return self.mode == "x_int4"
+        return self.mode in X_CODES
 
     def row_codes(
         self, layer_pos: int, num_layers: int, last: torch.Tensor
@@ -230,8 +242,8 @@ class DeltaDispatchConfig:
         visit to its FFN rank in this forward (``< 0``: first visit)."""
         if self.mode == "full_bf16":
             return torch.full_like(last, H_BF16)
-        if self.mode == "x_int4":
-            return torch.full_like(last, D_INT4)
+        if self.mode in X_CODES:
+            return torch.full_like(last, X_CODES[self.mode])
         if self.mode == "delta_fp32":
             rest = torch.full_like(last, D_FP32)
         elif layer_pos < self.early or layer_pos >= num_layers - self.late:
@@ -252,7 +264,7 @@ class DeltaDispatchConfig:
         fixed = {
             "full_bf16": (H_BF16,),
             "delta_fp32": (H_BF16, D_FP32),
-            "x_int4": (D_INT4,),
+            **{mode: (code,) for mode, code in X_CODES.items()},
         }
         if self.mode in fixed:
             return fixed[self.mode]
