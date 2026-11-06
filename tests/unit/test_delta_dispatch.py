@@ -10,14 +10,19 @@ import pytest
 import torch
 
 from afd_plugin.delta_dispatch import (
+    CODE_FORMATS,
     CODE_MASK,
     CODE_SHIFT,
     D_FP32,
+    D_INT3,
     D_INT4,
     D_INT8,
     H_BF16,
+    H_INT4,
+    MAX_ATTENTION_RANKS,
     QUANT_GROUP_SIZE,
     RANK_SHIFT,
+    TOKEN_MASK,
     AttentionDeltaState,
     CombineConfig,
     DeltaDispatchConfig,
@@ -264,13 +269,88 @@ def test_config_parsing() -> None:
     ).enabled
 
 
+def test_first_and_revisit_config() -> None:
+    cfg = DeltaDispatchConfig.from_extra_config(
+        {"delta_dispatch": {"mode": "delta_int3", "first": "int4"}}
+    )
+    assert (cfg.mode, cfg.first, cfg.revisit) == ("delta_int3", "int4", "")
+    assert cfg.stateful and not cfg.sends_x
+    assert DeltaDispatchConfig.from_mapping({"mode": "delta_int4"}).first == "bf16"
+    # Naming the mode's own format is no revisit rule: equal configs, equal
+    # repr (the settings digest); int4 stays no rule in the other modes.
+    for mode, own in (
+        ("delta_int4", "int4"),
+        ("delta_int3", "int3"),
+        ("x_int4", "int4"),
+        ("delta_fp32", "int4"),
+    ):
+        named = DeltaDispatchConfig.from_mapping({"mode": mode, "revisit": own})
+        plain = DeltaDispatchConfig.from_mapping({"mode": mode})
+        assert named == plain and repr(named) == repr(plain) and not named.revisit
+    # Only formats wider than the mode's own are revisit rules.
+    for mode, revisit in (
+        ("delta_int4", "int8"),
+        ("delta_int3", "int4"),
+        ("delta_int3", "int8"),
+    ):
+        cfg = DeltaDispatchConfig.from_mapping(
+            {"mode": mode, "revisit": revisit, "first": "int4"}
+        )
+        assert (cfg.revisit, cfg.first) == (revisit, "int4")
+    for bad in (
+        {"mode": "delta_int4", "revisit": "int3"},
+        {"mode": "x_int4", "revisit": "int3"},
+        {"mode": "delta_int3", "revisit": "fp8"},
+        {"mode": "delta_int3", "first": "fp8"},
+        {"mode": "delta_int3", "first": "bf16", "extra": 1},
+        {"mode": "delta_fp32", "first": "int4"},
+        {"mode": "full_bf16", "first": "int4"},
+        {"mode": "x_int4", "first": "int4"},
+        {"mode": "off", "first": "int4"},
+    ):
+        with pytest.raises(ValueError):
+            DeltaDispatchConfig.from_mapping(bad)
+
+
 def test_row_formats_and_codes() -> None:
     assert row_bytes(H_BF16, MODEL_HIDDEN) == 4096
     assert row_bytes(D_FP32, MODEL_HIDDEN) == 8192
     assert row_bytes(D_INT8, MODEL_HIDDEN) == 2112
     assert row_bytes(D_INT4, MODEL_HIDDEN) == 1088
-    assert DeltaDispatchConfig(mode="delta_int4").max_row_bytes(MODEL_HIDDEN) == 4096
-    assert DeltaDispatchConfig(mode="x_int4").max_row_bytes(MODEL_HIDDEN) == 1088
+    assert row_bytes(H_INT4, MODEL_HIDDEN) == 1088
+    assert row_bytes(D_INT3, MODEL_HIDDEN) == 832
+    assert row_bytes(D_INT3, QUANT_GROUP_SIZE) == 52
+    # (min, max) row bytes per config; the existing ones as before.
+    bounds = {
+        "delta_int4": (DeltaDispatchConfig(mode="delta_int4"), (1088, 4096)),
+        "delta_int4 rules": (
+            DeltaDispatchConfig(mode="delta_int4", early=2, late=1, revisit="int8"),
+            (1088, 4096),
+        ),
+        "delta_fp32": (DeltaDispatchConfig(mode="delta_fp32"), (4096, 8192)),
+        "full_bf16": (DeltaDispatchConfig(mode="full_bf16"), (4096, 4096)),
+        "x_int4": (DeltaDispatchConfig(mode="x_int4"), (1088, 1088)),
+        "delta_int3": (DeltaDispatchConfig(mode="delta_int3"), (832, 4096)),
+        "delta_int3 first": (
+            DeltaDispatchConfig(mode="delta_int3", first="int4"),
+            (832, 1088),
+        ),
+        "delta_int3 first revisit": (
+            DeltaDispatchConfig(mode="delta_int3", first="int4", revisit="int4"),
+            (832, 1088),
+        ),
+        "delta_int3 first late": (
+            DeltaDispatchConfig(mode="delta_int3", first="int4", late=1),
+            (832, 2112),
+        ),
+        "delta_int4 first": (
+            DeltaDispatchConfig(mode="delta_int4", first="int4"),
+            (1088, 1088),
+        ),
+    }
+    for name, (cfg, limits) in bounds.items():
+        got = (cfg.min_row_bytes(MODEL_HIDDEN), cfg.max_row_bytes(MODEL_HIDDEN))
+        assert got == limits, name
     # Previous visits of five rows before MoE layer position 5 of 9 (-1: none).
     last = torch.tensor([-1, 4, 3, 2, 0], dtype=torch.int32)
     cases = {
@@ -289,14 +369,39 @@ def test_row_formats_and_codes() -> None:
         ),
         "early": (DeltaDispatchConfig(mode="delta_int4", early=6), [0, 2, 2, 2, 2]),
         "late": (DeltaDispatchConfig(mode="delta_int4", late=4), [0, 2, 2, 2, 2]),
+        "int4 first": (
+            DeltaDispatchConfig(mode="delta_int4", first="int4"),
+            [4, 3, 3, 3, 3],
+        ),
+        "int3": (DeltaDispatchConfig(mode="delta_int3"), [0, 5, 5, 5, 5]),
+        "int3 first": (
+            DeltaDispatchConfig(mode="delta_int3", first="int4"),
+            [4, 5, 5, 5, 5],
+        ),
+        "int3 revisit int4": (
+            DeltaDispatchConfig(mode="delta_int3", revisit="int4"),
+            [0, 5, 3, 3, 3],
+        ),
+        "int3 first revisit int8 rgap3": (
+            DeltaDispatchConfig(
+                mode="delta_int3", first="int4", revisit="int8", rgap=3
+            ),
+            [4, 5, 5, 2, 2],
+        ),
+        # First visits keep their format on the early / late layers.
+        "int3 first early": (
+            DeltaDispatchConfig(mode="delta_int3", first="int4", early=6),
+            [4, 2, 2, 2, 2],
+        ),
+        "int3 late": (DeltaDispatchConfig(mode="delta_int3", late=4), [0, 2, 2, 2, 2]),
     }
     for name, (cfg, want) in cases.items():
         assert cfg.row_codes(5, 9, last).tolist() == want, name
 
 
-@pytest.mark.parametrize("code,bits", [(D_INT4, 4), (D_INT8, 8)])
+@pytest.mark.parametrize("code,bits", [(D_INT4, 4), (D_INT8, 8), (D_INT3, 3)])
 def test_quantization_matches_offline_experiment(code: int, bits: int) -> None:
-    cfg = DeltaDispatchConfig(mode="delta_int4")
+    cfg = DeltaDispatchConfig(mode="delta_int3" if code == D_INT3 else "delta_int4")
     gen = torch.Generator().manual_seed(1)
     h = (torch.randn(TOKENS, HIDDEN, generator=gen) * 3).to(torch.bfloat16)
     state = torch.randn(TOKENS, HIDDEN, generator=gen) * 3
@@ -321,6 +426,108 @@ def test_quantization_matches_offline_experiment(code: int, bits: int) -> None:
     decode_rows_reference(cfg, out, meta, offsets, flat, ffn_state, h_out)
     assert torch.equal(ffn_state, state)
     assert torch.equal(h_out, state)
+
+
+def test_first_visit_in_int4_replaces_the_state() -> None:
+    # h_int4: h' itself in the offline int4 quantizer; both sides overwrite
+    # the (stale, nonzero) state with it instead of adding.
+    cfg = DeltaDispatchConfig(mode="delta_int3", first="int4")
+    gen = torch.Generator().manual_seed(3)
+    h = (torch.randn(TOKENS, HIDDEN, generator=gen) * 3).to(torch.bfloat16)
+    state = torch.randn(TOKENS, HIDDEN, generator=gen) * 3
+    size = row_bytes(H_INT4, HIDDEN)
+    flat, offsets = torch.arange(TOKENS), torch.arange(TOKENS) * size
+    out = torch.zeros(TOKENS * size, dtype=torch.uint8)
+    meta = torch.zeros(TOKENS, dtype=torch.int32)
+    last = torch.full((TOKENS,), -1, dtype=torch.int32)
+    codes = torch.full((TOKENS,), H_INT4, dtype=torch.int32)
+    encode_rows_reference(
+        cfg, h, state, last, 0, flat, codes, offsets, TOKENS, 1, out, meta
+    )
+    want = _offline_quantize(h.float(), 4)
+    assert torch.equal(state, want)
+    assert torch.equal((meta >> CODE_SHIFT) & CODE_MASK, codes)
+    ffn_state = torch.full((TOKENS, HIDDEN), 7.0)
+    h_out = torch.zeros(TOKENS, HIDDEN)
+    decode_rows_reference(cfg, out, meta, offsets, flat, ffn_state, h_out)
+    assert torch.equal(ffn_state, want) and torch.equal(h_out, want)
+
+
+def test_int3_bytes_are_a_little_endian_3_bit_stream() -> None:
+    # Values that quantize to themselves (each group holds 0 and 7: lo 0,
+    # step 1): the data bytes are the little-endian bytes of sum(q_i << 3 i),
+    # followed by each group's fp16 (lo, step).
+    cfg = DeltaDispatchConfig(mode="delta_int3")
+    gen = torch.Generator().manual_seed(5)
+    bits = 3
+    levels = (1 << bits) - 1
+    q = torch.randint(0, levels + 1, (HIDDEN,), generator=gen)
+    q[::QUANT_GROUP_SIZE], q[1::QUANT_GROUP_SIZE] = 0, levels
+    data_bytes = HIDDEN * bits // 8
+    stream = sum(int(v) << (bits * i) for i, v in enumerate(q.tolist()))
+    groups = HIDDEN // QUANT_GROUP_SIZE
+    scales = torch.tensor([0.0, 1.0] * groups, dtype=torch.float16)
+    want = list(stream.to_bytes(data_bytes, "little"))
+    want += scales.view(torch.uint8).tolist()
+    out = torch.zeros(row_bytes(D_INT3, HIDDEN), dtype=torch.uint8)
+    state = torch.zeros(1, HIDDEN)
+    encode_rows_reference(
+        cfg,
+        q.view(1, -1).to(torch.bfloat16),
+        state,
+        torch.full((1,), -1, dtype=torch.int32),
+        1,
+        torch.zeros(1, dtype=torch.int64),
+        torch.full((1,), D_INT3, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int64),
+        1,
+        0,
+        out,
+        torch.zeros(1, dtype=torch.int32),
+    )
+    assert out.tolist() == want
+    assert torch.equal(state.view(-1), q.float())
+
+
+def test_row_words_hold_every_code_token_and_rank() -> None:
+    # One row per format for the largest token and Attention rank: the word
+    # stays a non-negative int32 and gives back token, code and rank, and the
+    # bytes decode (no states: src is a broadcast view, no big buffers).
+    cfg = DeltaDispatchConfig(mode="full_bf16")
+    gen = torch.Generator().manual_seed(6)
+    h = (torch.randn(1, HIDDEN, generator=gen) * 3).to(torch.bfloat16)
+    tokens = TOKEN_MASK + 1
+    rank = MAX_ATTENTION_RANKS - 1
+    codes = torch.arange(len(CODE_FORMATS), dtype=torch.int32)
+    sizes = torch.tensor([row_bytes(int(c), HIDDEN) for c in codes])
+    offsets = torch.cumsum(sizes, 0) - sizes
+    flat = torch.full((len(codes),), TOKEN_MASK, dtype=torch.int64)
+    out = torch.zeros(int(sizes.sum()), dtype=torch.uint8)
+    meta = torch.zeros(len(codes), dtype=torch.int32)
+    src = h.expand(tokens, HIDDEN)
+    encode_rows_reference(
+        cfg, src, None, None, 0, flat, codes, offsets, tokens, rank, out, meta
+    )
+    assert (meta >= 0).all()
+    assert torch.equal(meta & TOKEN_MASK, flat.int())
+    assert torch.equal((meta >> CODE_SHIFT) & CODE_MASK, codes)
+    assert torch.equal(meta >> RANK_SHIFT, torch.full_like(meta, rank))
+    h_out = torch.zeros(len(codes), HIDDEN)
+    decode_rows_reference(cfg, out, meta, offsets, flat, None, h_out)
+    want = {
+        H_BF16: h.float(),
+        D_FP32: h.float(),
+        D_INT8: _offline_quantize(h.float(), 8),
+        D_INT4: _offline_quantize(h.float(), 4),
+        H_INT4: _offline_quantize(h.float(), 4),
+        D_INT3: _offline_quantize(h.float(), 3),
+    }
+    for code in codes.tolist():
+        assert torch.equal(h_out[code], want[code].view(-1)), CODE_FORMATS[code]
+    # The Attention side's states only take tokens the word can hold.
+    AttentionDeltaState(cfg, MOE_LAYERS, ROUTED_SCALE, 1, tokens, HIDDEN)
+    with pytest.raises(ValueError):
+        AttentionDeltaState(cfg, MOE_LAYERS, ROUTED_SCALE, 1, tokens + 1, HIDDEN)
 
 
 def test_constant_group_has_no_nan() -> None:
@@ -354,10 +561,22 @@ def test_uncompressed_modes_give_norm_of_h_prime(
             assert torch.equal(x, step["norm_h"][t])
 
 
-@pytest.mark.parametrize("revisit", ["int4", "int8"])
-def test_int4_states_stay_identical_across_ffn_ranks(revisit: str) -> None:
+@pytest.mark.parametrize(
+    "mode,first,revisit,want_codes",
+    [
+        ("delta_int4", "bf16", "int4", {H_BF16, D_INT4, D_INT8}),
+        ("delta_int4", "bf16", "int8", {H_BF16, D_INT4, D_INT8}),
+        ("delta_int4", "int4", "int8", {H_INT4, D_INT4, D_INT8}),
+        ("delta_int3", "bf16", "", {H_BF16, D_INT3, D_INT8}),
+        ("delta_int3", "int4", "", {H_INT4, D_INT3, D_INT8}),
+        ("delta_int3", "int4", "int4", {H_INT4, D_INT3, D_INT4, D_INT8}),
+    ],
+)
+def test_quantized_states_stay_identical_across_ffn_ranks(
+    mode: str, first: str, revisit: str, want_codes: set[int]
+) -> None:
     num_ffn, num_attn, stages = 4, 2, 2
-    cfg = DeltaDispatchConfig(mode="delta_int4", late=1, revisit=revisit)
+    cfg = DeltaDispatchConfig(mode=mode, late=1, revisit=revisit, first=first)
     steps = _drive(cfg, num_ffn, num_attn, stages)
     codes = set()
     for step in steps:
@@ -382,7 +601,7 @@ def test_int4_states_stay_identical_across_ffn_ranks(revisit: str) -> None:
                     ffn_state[a * TOKENS : (a + 1) * TOKENS],
                     attn_state[f * TOKENS : (f + 1) * TOKENS],
                 )
-    assert codes == ({H_BF16, D_INT4, D_INT8})
+    assert codes == want_codes
 
 
 def test_first_visit_and_revisit_follow_the_offline_rules() -> None:
@@ -423,53 +642,68 @@ def test_missing_rows_are_an_error() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton)")
-@pytest.mark.parametrize("mode", ["delta_int4", "delta_fp32", "full_bf16", "x_int4"])
-def test_triton_kernels_match_reference(mode: str) -> None:
+@pytest.mark.parametrize("hidden", [MODEL_HIDDEN, QUANT_GROUP_SIZE])
+@pytest.mark.parametrize(
+    "mode,first",
+    [
+        ("delta_int4", "bf16"),
+        ("delta_fp32", "bf16"),
+        ("full_bf16", "bf16"),
+        ("x_int4", "bf16"),
+        ("delta_int3", "int4"),
+        ("delta_int4", "int4"),
+        ("delta_int3", "bf16"),
+    ],
+)
+def test_triton_kernels_match_reference(mode: str, first: str, hidden: int) -> None:
     from afd_plugin import delta_dispatch_triton
 
-    revisit = "int8" if mode == "delta_int4" else "int4"
-    cfg = DeltaDispatchConfig(mode=mode, revisit=revisit)
+    revisit = {"delta_int4": "int8", "delta_int3": "int4"}.get(mode, "")
+    cfg = DeltaDispatchConfig(mode=mode, revisit=revisit, first=first)
     gen = torch.Generator().manual_seed(2)
-    tokens, rows = 64, 40
+    tokens, rows, rank = 64, 40, MAX_ATTENTION_RANKS - 1
     flat = torch.randperm(3 * tokens, generator=gen)[:rows].sort().values
-    last = torch.randint(-1, 3, (rows,), generator=gen, dtype=torch.int32)
-    codes = cfg.row_codes(3, 8, last)
-    sizes = torch.tensor([row_bytes(int(c), MODEL_HIDDEN) for c in codes])
+    # Per state row, the MoE layer of its last visit (-1: none).
+    last = torch.randint(-1, 3, (3 * tokens,), generator=gen, dtype=torch.int32)
+    codes = cfg.row_codes(3, 8, last[flat])
+    sizes = torch.tensor([row_bytes(int(c), hidden) for c in codes])
     offsets = torch.cumsum(sizes, 0) - sizes
-    h = (torch.randn(tokens, MODEL_HIDDEN, generator=gen) * 3).to(torch.bfloat16)
-    state = torch.randn(3 * tokens, MODEL_HIDDEN, generator=gen) * 3
+    h = (torch.randn(tokens, hidden, generator=gen) * 3).to(torch.bfloat16)
+    state = torch.randn(3 * tokens, hidden, generator=gen) * 3
     total = int(sizes.sum())
     ref_state = state.clone()
+    ref_last = last.clone()
     ref_out = torch.zeros(total, dtype=torch.uint8)
     ref_meta = torch.zeros(rows, dtype=torch.int32)
     encode_rows_reference(
         cfg,
         h,
         ref_state,
-        last.clone(),
+        ref_last,
         3,
         flat,
         codes,
         offsets,
         tokens,
-        1,
+        rank,
         ref_out,
         ref_meta,
     )
     gpu_state = state.cuda()
+    gpu_last = last.cuda()
     out = torch.zeros(total, dtype=torch.uint8, device="cuda")
     meta = torch.zeros(rows, dtype=torch.int32, device="cuda")
     delta_dispatch_triton.encode_rows(
         cfg,
         h.cuda(),
         gpu_state,
-        last.cuda(),
+        gpu_last,
         3,
         flat.cuda(),
         codes.cuda(),
         offsets.cuda(),
         tokens,
-        1,
+        rank,
         out,
         meta,
     )
@@ -477,9 +711,11 @@ def test_triton_kernels_match_reference(mode: str) -> None:
     # by the fused multiply-add of the dequantization.
     assert torch.equal(out.cpu(), ref_out) and torch.equal(meta.cpu(), ref_meta)
     torch.testing.assert_close(gpu_state.cpu(), ref_state, rtol=1e-6, atol=1e-6)
+    if cfg.stateful:
+        assert torch.equal(gpu_last.cpu(), ref_last)
     # The FFN kernel rebuilds the Attention kernel's states bit for bit.
     ffn_state = state.cuda()
-    h_out = torch.empty(rows, MODEL_HIDDEN, dtype=torch.bfloat16, device="cuda")
+    h_out = torch.empty(rows, hidden, dtype=torch.bfloat16, device="cuda")
     delta_dispatch_triton.decode_rows(
         cfg, out, meta, offsets.cuda(), flat.cuda(), ffn_state, h_out
     )
@@ -579,7 +815,9 @@ def test_combine_error_feedback_keeps_the_sum(mode: str) -> None:
     assert float(ffn._err[0].abs().max()) < 0.2
 
 
-@pytest.mark.parametrize("delta_mode", ["delta_int4", "delta_fp32", "x_int4"])
+@pytest.mark.parametrize(
+    "delta_mode", ["delta_int4", "delta_int3", "delta_fp32", "x_int4"]
+)
 @pytest.mark.parametrize("mode,ef", [("int4", True), ("int8", True), ("int4", False)])
 def test_combine_keeps_both_states_identical(
     delta_mode: str, mode: str, ef: bool
@@ -587,8 +825,9 @@ def test_combine_keeps_both_states_identical(
     # Four FFN ranks, two Attention ranks, two stages, two forwards: both sides
     # add what the Attention side received, so the states stay identical; the
     # received partial sums are the offline quantizer's of partial (+ residual).
-    revisit = "int8" if delta_mode == "delta_int4" else "int4"
-    cfg = DeltaDispatchConfig(mode=delta_mode, revisit=revisit)
+    revisit = {"delta_int4": "int8", "delta_int3": "int4"}.get(delta_mode, "")
+    first = "int4" if delta_mode == "delta_int3" else "bf16"
+    cfg = DeltaDispatchConfig(mode=delta_mode, revisit=revisit, first=first)
     steps = _drive(cfg, 4, 2, 2, CombineConfig(mode=mode, ef=ef), forwards=2)
     for step in steps:
         if "ffn_states" in step and cfg.stateful:

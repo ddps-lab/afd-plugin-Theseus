@@ -72,8 +72,29 @@ def test_settings_digest_tells_configs_apart():
         routed.wire_settings_digest(
             DeltaDispatchConfig(mode="delta_int4", late=1), CombineConfig()
         ),
+        routed.wire_settings_digest(
+            DeltaDispatchConfig(mode="delta_int4", first="int4"), CombineConfig()
+        ),
+        routed.wire_settings_digest(
+            DeltaDispatchConfig(mode="delta_int3"), CombineConfig()
+        ),
+        routed.wire_settings_digest(
+            DeltaDispatchConfig(mode="delta_int3", first="int4"), CombineConfig()
+        ),
+        routed.wire_settings_digest(
+            DeltaDispatchConfig(mode="delta_int3", first="int4", revisit="int4"),
+            CombineConfig(),
+        ),
     }
-    assert base not in others and len(others) == 4
+    assert base not in others and len(others) == 8
+    # Naming the mode's own format is the same setting.
+    for mode, own in (("delta_int4", "int4"), ("delta_int3", "int3")):
+        named = DeltaDispatchConfig.from_mapping({"mode": mode, "revisit": own})
+        plain = DeltaDispatchConfig.from_mapping({"mode": mode})
+        digests = {
+            routed.wire_settings_digest(c, CombineConfig()) for c in (named, plain)
+        }
+        assert len(digests) == 1
 
 
 def _plan_owner(owners, router=None):
