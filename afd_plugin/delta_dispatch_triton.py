@@ -1,40 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Fused CUDA kernels of the quantized delta dispatch formats (Triton).
+"""Fused CUDA kernels of delta dispatch (Triton).
 
-Same arithmetic and row layout as the torch reference in ``delta_dispatch.py``
-(``encode_delta_reference`` / ``decode_delta_reference``); one program per
-(token, group of ``QUANT_GROUP_SIZE`` values).
+Same arithmetic and byte layout as the torch reference in ``delta_dispatch.py``
+(``encode_rows_reference`` / ``decode_rows_reference``); one program per
+(row, group of ``QUANT_GROUP_SIZE`` values), each row in the format of its code
+and at its own byte offset, so one launch per side and MoE layer covers rows
+of every format.
 
-* ``encode_delta`` (Attention): ``d = h' - S``, the group's ``lo`` / ``step``
-  rounded to fp16 (IEEE divisions, like torch), ``q = round_half_even((d -
-  lo) / step)`` clamped, the
-  packed values and the scales written into the row, and ``S += q * step +
-  lo`` in place: one launch per MoE layer.
-* ``decode_delta`` (FFN): ``S += q * step + lo`` and ``h_out = S`` in the
-  model dtype: one launch per MoE layer.
+* ``encode_rows`` (Attention): per row, ``h'`` in bf16 (first visit, the state
+  becomes ``h'``) or ``d = h' - S`` in fp32 / int8 / int4 (the group's ``lo`` /
+  ``step`` rounded to fp16, IEEE divisions, ``q = round_half_even((d - lo) /
+  step)`` clamped) with ``S += deq`` in place; also the row's word and the
+  MoE layer of the visit. Without states (``x_int4``) ``S`` is zero.
+* ``decode_rows`` (FFN): per row, the value rebuilt from the bytes: ``S = h'``
+  or ``S += deq`` and ``h_out = S`` in the model dtype (``h_out = deq`` without
+  states).
 
 Both sides dequantize with the same ``_dequantize`` (an explicit fused
-multiply-add), so the state the FFN rank rebuilds is bit-identical to the one
-the Attention side keeps.
+multiply-add), so the states the FFN rank rebuilds are bit-identical to the
+ones the Attention side keeps.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import torch
 import triton
 import triton.language as tl
 
 from afd_plugin.delta_dispatch import (
-    BITS_PER_BYTE,
-    FORMAT_BITS,
     MIN_GROUP_RANGE,
     QUANT_GROUP_SIZE,
-    row_bytes,
+    RANK_SHIFT,
+    DeltaDispatchConfig,
 )
-
-HALF_GROUP = QUANT_GROUP_SIZE // 2
-NIBBLE_MASK = 0xF
 
 
 @triton.jit
@@ -67,161 +68,251 @@ def _quantize(d, lo, step, levels: tl.constexpr):
     return tl.where(step > 0, q, 0.0)
 
 
-@triton.jit
-def _encode_kernel(
-    h_ptr,
-    h_stride,
-    s_ptr,
-    s_stride,
-    row_ptr,
-    row_stride,
-    scale_ptr,
-    scale_stride,
+# Runtime integers are not specialized (a value of 1 would become a constant and
+# the batch size would select kernel variants).
+@triton.jit(do_not_specialize=["num_tokens", "rank_word", "layer_pos"])
+def _encode_rows_kernel(
+    src_ptr,
+    src_stride,
+    state_ptr,
+    state_stride,
+    last_ptr,
+    flat_ptr,
+    code_ptr,
+    off_ptr,
+    out_ptr,
+    meta_ptr,
+    num_tokens,
+    rank_word,
+    layer_pos,
     min_range,
-    bits: tl.constexpr,
+    hidden: tl.constexpr,
     group: tl.constexpr,
+    stateful: tl.constexpr,
 ):
-    t = tl.program_id(0)
+    half: tl.constexpr = group // 2
+    i = tl.program_id(0)
     g = tl.program_id(1)
-    levels: tl.constexpr = (1 << bits) - 1
-    if bits == 4:
-        half: tl.constexpr = group // 2
+    flat = tl.load(flat_ptr + i)
+    t = flat % num_tokens
+    code = tl.load(code_ptr + i)
+    row = out_ptr + tl.load(off_ptr + i)
+    base = g * group
+    if code == 0:  # h_bf16
+        k = tl.arange(0, group)
+        h = tl.load(src_ptr + t * src_stride + base + k)
+        tl.store(row.to(tl.pointer_type(tl.bfloat16)) + base + k, h)
+        if stateful:
+            tl.store(state_ptr + flat * state_stride + base + k, h.to(tl.float32))
+    elif code == 1:  # d_fp32
+        k = tl.arange(0, group)
+        h = tl.load(src_ptr + t * src_stride + base + k).to(tl.float32)
+        s = tl.load(state_ptr + flat * state_stride + base + k)
+        d = h - s
+        tl.store(row.to(tl.pointer_type(tl.float32)) + base + k, d)
+        tl.store(state_ptr + flat * state_stride + base + k, s + d)
+    elif code == 2:  # d_int8
+        k = tl.arange(0, group)
+        h = tl.load(src_ptr + t * src_stride + base + k).to(tl.float32)
+        if stateful:
+            s = tl.load(state_ptr + flat * state_stride + base + k)
+        else:
+            s = tl.zeros([group], dtype=tl.float32)
+        d = h - s
+        lo = tl.min(d, 0)
+        step = _step(lo, tl.max(d, 0), min_range, 255)
+        lo = lo.to(tl.float16).to(tl.float32)
+        q = _quantize(d, lo, step, 255)
+        if stateful:
+            tl.store(
+                state_ptr + flat * state_stride + base + k, s + _dequantize(q, lo, step)
+            )
+        tl.store(row + base + k, q.to(tl.uint8))
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden // 2 + 2 * g
+        tl.store(scales, lo.to(tl.float16))
+        tl.store(scales + 1, step.to(tl.float16))
+    else:  # d_int4
         k = tl.arange(0, half)
-        base = g * group
-        h_e = tl.load(h_ptr + t * h_stride + base + 2 * k).to(tl.float32)
-        h_o = tl.load(h_ptr + t * h_stride + base + 2 * k + 1).to(tl.float32)
-        s_e = tl.load(s_ptr + t * s_stride + base + 2 * k)
-        s_o = tl.load(s_ptr + t * s_stride + base + 2 * k + 1)
+        h_e = tl.load(src_ptr + t * src_stride + base + 2 * k).to(tl.float32)
+        h_o = tl.load(src_ptr + t * src_stride + base + 2 * k + 1).to(tl.float32)
+        if stateful:
+            s_e = tl.load(state_ptr + flat * state_stride + base + 2 * k)
+            s_o = tl.load(state_ptr + flat * state_stride + base + 2 * k + 1)
+        else:
+            s_e = tl.zeros([half], dtype=tl.float32)
+            s_o = tl.zeros([half], dtype=tl.float32)
         d_e = h_e - s_e
         d_o = h_o - s_o
         lo = tl.minimum(tl.min(d_e, 0), tl.min(d_o, 0))
         hi = tl.maximum(tl.max(d_e, 0), tl.max(d_o, 0))
-        step = _step(lo, hi, min_range, levels)
+        step = _step(lo, hi, min_range, 15)
         lo = lo.to(tl.float16).to(tl.float32)
-        q_e = _quantize(d_e, lo, step, levels)
-        q_o = _quantize(d_o, lo, step, levels)
-        tl.store(s_ptr + t * s_stride + base + 2 * k, s_e + _dequantize(q_e, lo, step))
-        tl.store(
-            s_ptr + t * s_stride + base + 2 * k + 1, s_o + _dequantize(q_o, lo, step)
-        )
-        packed = q_e.to(tl.uint8) | (q_o.to(tl.uint8) << 4)
-        tl.store(row_ptr + t * row_stride + g * half + k, packed)
-    else:
-        k = tl.arange(0, group)
-        offs = g * group + k
-        h = tl.load(h_ptr + t * h_stride + offs).to(tl.float32)
-        s = tl.load(s_ptr + t * s_stride + offs)
-        d = h - s
-        lo = tl.min(d, 0)
-        hi = tl.max(d, 0)
-        step = _step(lo, hi, min_range, levels)
-        lo = lo.to(tl.float16).to(tl.float32)
-        q = _quantize(d, lo, step, levels)
-        tl.store(s_ptr + t * s_stride + offs, s + _dequantize(q, lo, step))
-        tl.store(row_ptr + t * row_stride + offs, q.to(tl.uint8))
-    tl.store(scale_ptr + t * scale_stride + 2 * g, lo.to(tl.float16))
-    tl.store(scale_ptr + t * scale_stride + 2 * g + 1, step.to(tl.float16))
+        q_e = _quantize(d_e, lo, step, 15)
+        q_o = _quantize(d_o, lo, step, 15)
+        if stateful:
+            tl.store(
+                state_ptr + flat * state_stride + base + 2 * k,
+                s_e + _dequantize(q_e, lo, step),
+            )
+            tl.store(
+                state_ptr + flat * state_stride + base + 2 * k + 1,
+                s_o + _dequantize(q_o, lo, step),
+            )
+        tl.store(row + g * half + k, q_e.to(tl.uint8) | (q_o.to(tl.uint8) << 4))
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden // 4 + 2 * g
+        tl.store(scales, lo.to(tl.float16))
+        tl.store(scales + 1, step.to(tl.float16))
+    if g == 0:
+        word = t + (code.to(tl.int64) << 24) + rank_word
+        tl.store(meta_ptr + i, word.to(tl.int32))
+        if stateful:
+            tl.store(last_ptr + flat, layer_pos)
 
 
 @triton.jit
-def _decode_kernel(
-    row_ptr,
-    row_stride,
-    scale_ptr,
-    scale_stride,
-    s_ptr,
-    s_stride,
+def _decode_rows_kernel(
+    data_ptr,
+    meta_ptr,
+    off_ptr,
+    rows_ptr,
+    state_ptr,
+    state_stride,
     out_ptr,
     out_stride,
-    bits: tl.constexpr,
+    hidden: tl.constexpr,
     group: tl.constexpr,
+    stateful: tl.constexpr,
 ):
-    t = tl.program_id(0)
+    half: tl.constexpr = group // 2
+    i = tl.program_id(0)
     g = tl.program_id(1)
-    lo = tl.load(scale_ptr + t * scale_stride + 2 * g).to(tl.float32)
-    step = tl.load(scale_ptr + t * scale_stride + 2 * g + 1).to(tl.float32)
-    if bits == 4:
-        half: tl.constexpr = group // 2
-        k = tl.arange(0, half)
-        base = g * group
-        packed = tl.load(row_ptr + t * row_stride + g * half + k)
-        q_e = (packed & 0xF).to(tl.float32)
-        q_o = (packed >> 4).to(tl.float32)
-        s_e = tl.load(s_ptr + t * s_stride + base + 2 * k) + _dequantize(q_e, lo, step)
-        s_o = tl.load(s_ptr + t * s_stride + base + 2 * k + 1) + _dequantize(
-            q_o, lo, step
-        )
-        tl.store(s_ptr + t * s_stride + base + 2 * k, s_e)
-        tl.store(s_ptr + t * s_stride + base + 2 * k + 1, s_o)
-        out_ty = out_ptr.dtype.element_ty
-        tl.store(out_ptr + t * out_stride + base + 2 * k, s_e.to(out_ty))
-        tl.store(out_ptr + t * out_stride + base + 2 * k + 1, s_o.to(out_ty))
-    else:
+    code = (tl.load(meta_ptr + i) >> 24) & 0x3
+    row = data_ptr + tl.load(off_ptr + i)
+    srow = tl.load(rows_ptr + i)
+    base = g * group
+    out_ty = out_ptr.dtype.element_ty
+    if code == 0:  # h_bf16
         k = tl.arange(0, group)
-        offs = g * group + k
-        q = tl.load(row_ptr + t * row_stride + offs).to(tl.float32)
-        s = tl.load(s_ptr + t * s_stride + offs) + _dequantize(q, lo, step)
-        tl.store(s_ptr + t * s_stride + offs, s)
-        tl.store(out_ptr + t * out_stride + offs, s.to(out_ptr.dtype.element_ty))
+        h = tl.load(row.to(tl.pointer_type(tl.bfloat16)) + base + k).to(tl.float32)
+        if stateful:
+            tl.store(state_ptr + srow * state_stride + base + k, h)
+        tl.store(out_ptr + i * out_stride + base + k, h.to(out_ty))
+    elif code == 1:  # d_fp32
+        k = tl.arange(0, group)
+        d = tl.load(row.to(tl.pointer_type(tl.float32)) + base + k)
+        s = tl.load(state_ptr + srow * state_stride + base + k) + d
+        tl.store(state_ptr + srow * state_stride + base + k, s)
+        tl.store(out_ptr + i * out_stride + base + k, s.to(out_ty))
+    elif code == 2:  # d_int8
+        k = tl.arange(0, group)
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden // 2 + 2 * g
+        lo = tl.load(scales).to(tl.float32)
+        step = tl.load(scales + 1).to(tl.float32)
+        v = _dequantize(tl.load(row + base + k).to(tl.float32), lo, step)
+        if stateful:
+            v = tl.load(state_ptr + srow * state_stride + base + k) + v
+            tl.store(state_ptr + srow * state_stride + base + k, v)
+        tl.store(out_ptr + i * out_stride + base + k, v.to(out_ty))
+    else:  # d_int4
+        k = tl.arange(0, half)
+        scales = row.to(tl.pointer_type(tl.float16)) + hidden // 4 + 2 * g
+        lo = tl.load(scales).to(tl.float32)
+        step = tl.load(scales + 1).to(tl.float32)
+        packed = tl.load(row + g * half + k)
+        v_e = _dequantize((packed & 0xF).to(tl.float32), lo, step)
+        v_o = _dequantize((packed >> 4).to(tl.float32), lo, step)
+        if stateful:
+            v_e = tl.load(state_ptr + srow * state_stride + base + 2 * k) + v_e
+            v_o = tl.load(state_ptr + srow * state_stride + base + 2 * k + 1) + v_o
+            tl.store(state_ptr + srow * state_stride + base + 2 * k, v_e)
+            tl.store(state_ptr + srow * state_stride + base + 2 * k + 1, v_o)
+        tl.store(out_ptr + i * out_stride + base + 2 * k, v_e.to(out_ty))
+        tl.store(out_ptr + i * out_stride + base + 2 * k + 1, v_o.to(out_ty))
 
 
-def _scales(rows: torch.Tensor, hidden: int, bits: int) -> torch.Tensor:
-    """fp16 view [T, 2 * groups] of the scales at the end of each row."""
-    data = hidden * bits // BITS_PER_BYTE
-    return rows[:, data:].view(torch.float16)
+def _state_args(state: torch.Tensor | None, like: torch.Tensor) -> tuple[Any, int]:
+    if state is None:
+        return like, 0
+    if state.stride(-1) != 1:
+        raise ValueError("delta dispatch states must be row-contiguous")
+    return state, state.stride(0)
 
 
-def encode_delta(fmt: str, h_prime: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-    """Fused Attention kernel: rows of Q(h' - S); ``S += deq`` in place."""
-    bits = FORMAT_BITS[fmt]
-    tokens, hidden = state.shape
-    if h_prime.stride(-1) != 1 or state.stride(-1) != 1:
-        raise ValueError("delta dispatch needs row-contiguous h' and state")
-    rows = torch.empty(
-        (tokens, row_bytes(fmt, hidden)), dtype=torch.uint8, device=state.device
-    )
-    if tokens:
-        scales = _scales(rows, hidden, bits)
-        _encode_kernel[(tokens, hidden // QUANT_GROUP_SIZE)](
-            h_prime,
-            h_prime.stride(0),
-            state,
-            state.stride(0),
-            rows,
-            rows.stride(0),
-            scales,
-            scales.stride(0),
-            MIN_GROUP_RANGE,
-            bits=bits,
-            group=QUANT_GROUP_SIZE,
-        )
-    return rows
-
-
-def decode_delta(
-    fmt: str, rows: torch.Tensor, state: torch.Tensor, h_out: torch.Tensor
+def encode_rows(
+    cfg: DeltaDispatchConfig,
+    src: torch.Tensor,
+    state: torch.Tensor | None,
+    last: torch.Tensor | None,
+    layer_pos: int,
+    flat: torch.Tensor,
+    codes: torch.Tensor,
+    offsets: torch.Tensor,
+    num_tokens: int,
+    rank: int,
+    out: torch.Tensor,
+    meta: torch.Tensor,
 ) -> None:
-    """Fused FFN kernel: ``S += deq(rows)`` and ``h_out = S`` (h_out's dtype)."""
-    bits = FORMAT_BITS[fmt]
-    tokens, hidden = state.shape
-    if rows.shape != (tokens, row_bytes(fmt, hidden)) or rows.stride(-1) != 1:
+    """Fused Attention kernel (see ``encode_rows_reference``)."""
+    rows, hidden = int(flat.shape[0]), src.shape[1]
+    if not rows:
+        return
+    if src.stride(-1) != 1 or out.dim() != 1 or out.dtype != torch.uint8:
+        raise ValueError("delta dispatch needs row-contiguous src and flat uint8 out")
+    stateful = cfg.stateful
+    state_arg, state_stride = _state_args(state if stateful else None, src)
+    _encode_rows_kernel[(rows, hidden // QUANT_GROUP_SIZE)](
+        src,
+        src.stride(0),
+        state_arg,
+        state_stride,
+        last if (stateful and last is not None) else flat,
+        flat,
+        codes,
+        offsets,
+        out,
+        meta,
+        num_tokens,
+        rank << RANK_SHIFT,
+        layer_pos,
+        MIN_GROUP_RANGE,
+        hidden=hidden,
+        group=QUANT_GROUP_SIZE,
+        stateful=stateful,
+    )
+
+
+def decode_rows(
+    cfg: DeltaDispatchConfig,
+    data: torch.Tensor,
+    meta: torch.Tensor,
+    offsets: torch.Tensor,
+    state_rows: torch.Tensor,
+    state: torch.Tensor | None,
+    h_out: torch.Tensor,
+) -> None:
+    """Fused FFN kernel (see ``decode_rows_reference``)."""
+    rows, hidden = int(meta.shape[0]), h_out.shape[1]
+    if not rows:
+        return
+    if h_out.stride(-1) != 1 or data.dim() != 1 or data.dtype != torch.uint8:
         raise ValueError(
-            f"{fmt} rows {tuple(rows.shape)} for state {tuple(state.shape)}"
+            "delta dispatch needs row-contiguous h_out and flat uint8 data"
         )
-    if tokens:
-        scales = _scales(rows, hidden, bits)
-        _decode_kernel[(tokens, hidden // QUANT_GROUP_SIZE)](
-            rows,
-            rows.stride(0),
-            scales,
-            scales.stride(0),
-            state,
-            state.stride(0),
-            h_out,
-            h_out.stride(0),
-            bits=bits,
-            group=QUANT_GROUP_SIZE,
-        )
+    stateful = cfg.stateful
+    state_arg, state_stride = _state_args(state if stateful else None, h_out)
+    _decode_rows_kernel[(rows, hidden // QUANT_GROUP_SIZE)](
+        data,
+        meta,
+        offsets,
+        state_rows,
+        state_arg,
+        state_stride,
+        h_out,
+        h_out.stride(0),
+        hidden=hidden,
+        group=QUANT_GROUP_SIZE,
+        stateful=stateful,
+    )
 
 
-__all__ = ["decode_delta", "encode_delta"]
+__all__ = ["decode_rows", "encode_rows"]

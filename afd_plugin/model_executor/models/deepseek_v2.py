@@ -989,10 +989,8 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         ``h'`` to the proxy). The FFN side keeps one ``FFNDeltaState`` used by
         ``compute_routed_experts_output``. Both list the same routed layers.
         """
-        if not is_routed_afd(afd_config) or int(afd_config.num_ffn_ranks) != 1:
-            raise ValueError(
-                "delta dispatch needs the routed connector and one FFN rank"
-            )
+        if not is_routed_afd(afd_config):
+            raise ValueError("delta dispatch needs the routed connector")
         if vllm_config.model_config.dtype != torch.bfloat16:
             raise ValueError("delta dispatch needs a bf16 model")
         if get_tensor_model_parallel_world_size() != 1:
@@ -1010,8 +1008,16 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             if isinstance(self.layers[idx].mlp, routed_cls)
         ]
         scale = getattr(self.config, "routed_scaling_factor", 1.0)
+        max_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
         if afd_config.role == "attention":
-            state = AttentionDeltaState(delta, layers, scale)
+            state = AttentionDeltaState(
+                delta,
+                layers,
+                scale,
+                num_ffn=int(afd_config.num_ffn_ranks),
+                max_tokens=max_tokens,
+                hidden=self.config.hidden_size,
+            )
             for idx in layers:
                 layer = self.layers[idx]
                 proxy = layer.mlp.experts
@@ -1023,7 +1029,14 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
                     record=proxy.record_h_prime,
                 )
         else:
-            self.ffn_delta = FFNDeltaState(delta, layers, scale, self.hidden_size)
+            self.ffn_delta = FFNDeltaState(
+                delta,
+                layers,
+                scale,
+                hidden=self.hidden_size,
+                num_attn=int(afd_config.num_attention_ranks),
+                max_tokens=max_tokens,
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1092,14 +1105,15 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
                 topk_ids,
                 a1q_scale=a1q_scale,
             )
-        # Delta dispatch: rebuild h' from the received rows and normalize it
-        # here, then run the experts as for x rows; keep the partial sum.
+        # Delta dispatch: rebuild every received row (h', or x for x_int4)
+        # from the bytes and the words the connector handed over, normalize
+        # h' here, then run the experts as for x rows; keep the partial sums.
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("delta dispatch needs the stage of the received rows")
         stage = int(afd_metadata.stage_idx)
         norm = layer.post_attention_layernorm
-        x = self.ffn_delta.decode_dispatch(
+        x = self.ffn_delta.decode(
             layer_idx,
             stage,
             hidden_states,
@@ -1113,7 +1127,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             topk_ids,
             a1q_scale=a1q_scale,
         )
-        self.ffn_delta.after_experts(layer_idx, stage, output)
+        self.ffn_delta.after_experts(stage, output)
         return output
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
