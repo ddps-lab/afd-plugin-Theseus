@@ -23,7 +23,13 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 nn = torch.nn
 
-from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config  # noqa: E402
+from vllm.config import (  # noqa: E402
+    CompilationConfig,
+    DeviceConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
+from vllm.config.compilation import CompilationMode  # noqa: E402
 from vllm.model_executor.layers.layernorm import RMSNorm  # noqa: E402
 
 from afd_plugin.config import AFDConfig  # noqa: E402
@@ -362,7 +368,12 @@ def test_norm_from_residual_writes_norm_and_keeps_h(cpu_config):
 def test_cuda_norm_from_residual_matches_attention_norm(tokens):
     # The Attention side's fused add + norm and the FFN side's call on the
     # rebuilt h' give the same bits (same kernel, launch and reduction).
-    with set_current_vllm_config(VllmConfig()):
+    # Eager like the server (--enforce-eager), with the IR op priority the
+    # worker applies at start: the CUDA kernels, not the torch reference.
+    config = VllmConfig(compilation_config=CompilationConfig(mode=CompilationMode.NONE))
+    priority = config.kernel_config.ir_op_priority
+    assert priority.fused_add_rms_norm[0] == "vllm_c"
+    with set_current_vllm_config(config), priority.set_priority():
         norm = RMSNorm(2048, eps=EPS).to(device="cuda", dtype=torch.bfloat16)
         gen = torch.Generator(device="cuda").manual_seed(4)
         with torch.no_grad():
