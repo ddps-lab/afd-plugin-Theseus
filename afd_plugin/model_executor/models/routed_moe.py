@@ -15,9 +15,11 @@ Model wrappers build their routed MoE modules from ``RoutedExpertsProxy``,
 ``routed_moe_forward`` and ``run_prerouted_experts`` so that DeepSeek and
 Qwen3 share one implementation of the exchange.
 
-Delta dispatch (``afd_plugin/delta_dispatch.py``, DeepSeek only): the proxy sends the
-rows ``AttentionDeltaState`` derives from the residual ``h'`` that the
-layer's ``ResidualRecordingRMSNorm`` recorded, instead of ``x = Norm(h')``.
+Delta dispatch (``afd_plugin/delta_dispatch.py``, DeepSeek only): the proxy hands
+the connector the residual ``h'`` that the layer's ``ResidualRecordingRMSNorm``
+recorded and the model's ``AttentionDeltaState``; the connector encodes the
+rows once its plan is known and updates the states with the returned partial
+sums.
 """
 
 from __future__ import annotations
@@ -99,6 +101,7 @@ class RoutedExpertsProxy(nn.Module):
                 "delta dispatch is configured on the connector but not wired into "
                 "this model (DeepSeek only), or the other way round",
             )
+        delta_kwargs = {}
         if self.delta is None:
             a1q, a1q_scale = connector.quantize_for_dispatch(hidden_states)
         else:
@@ -108,8 +111,12 @@ class RoutedExpertsProxy(nn.Module):
                     f"layer {self.layer_idx} stage {stage_idx}: no h' recorded by "
                     "post_attention_layernorm before the dispatch",
                 )
-            a1q = self.delta.encode_dispatch(self.layer_idx, stage_idx, h_prime)
-            a1q_scale = None
+            a1q, a1q_scale = hidden_states, None
+            delta_kwargs = {
+                "delta": self.delta,
+                "h_prime": h_prime,
+                "layer_idx": self.layer_idx,
+            }
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=self.layer_idx,
             stage_idx=stage_idx,
@@ -122,14 +129,13 @@ class RoutedExpertsProxy(nn.Module):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             a1q_scale=a1q_scale,
+            **delta_kwargs,
         )
         shared_output = shared_experts_fn() if shared_experts_fn is not None else None
         routed_output = connector.recv_ffn_output(
             ref_tensor=hidden_states,
             ubatch_idx=stage_idx,
         )
-        if self.delta is not None:
-            self.delta.after_combine(self.layer_idx, stage_idx, routed_output)
         return routed_output, shared_output
 
     def update_expert_map(self) -> None:
