@@ -34,8 +34,9 @@ packed back to back at the size of their format code:
   step ``(max - lo) / (2^bits - 1)``, both rounded to fp16, and
   ``q = round((d - lo) / step)`` clamped to ``[0, 2^bits - 1]`` (the offline
   experiment's ``compress.py`` arithmetic). A row is the packed values (int4:
-  two per byte, even index in the low nibble) followed by the ``(lo, step)``
-  fp16 pairs of its groups.
+  two per byte, even index in the low nibble; int3: value ``i`` at bit ``3 i``
+  of the row's bytes read little-endian, so every 8 values fill 3 bytes and a
+  group 48) followed by the ``(lo, step)`` fp16 pairs of its groups.
 * ``4`` ``h_int4``: ``h'`` itself quantized like ``d_int4`` (a first visit
   with ``first: "int4"``); the state becomes the dequantized value.
 * ``5`` ``d_int3``: ``d`` quantized like ``d_int4`` in 3 bits.
@@ -354,6 +355,12 @@ def _quantized_rows(code: int, d: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     q = q.view(rows, hidden)
     if bits == 4:
         q = q[:, 0::2] | (q[:, 1::2] << 4)
+    elif bits == 3:
+        # Every BITS_PER_BYTE values (value j at bit 3 j) fill 3 bytes, low first.
+        shifts = bits * torch.arange(BITS_PER_BYTE, device=d.device)
+        word = (q.view(rows, -1, BITS_PER_BYTE).long() << shifts).sum(-1, keepdim=True)
+        shifts = BITS_PER_BYTE * torch.arange(bits, device=d.device)
+        q = ((word >> shifts) & 0xFF).to(torch.uint8).view(rows, -1)
     scales = torch.cat([lo, step], dim=-1).view(rows, groups * 2)
     return torch.cat([q, scales.view(torch.uint8)], dim=1), deq
 
@@ -367,6 +374,11 @@ def _dequantized_rows(code: int, rows: torch.Tensor, hidden: int) -> torch.Tenso
     packed, scales = rows[:, :data], rows[:, data:].contiguous().view(torch.float16)
     if bits == 4:
         q = torch.stack([packed & 0xF, packed >> 4], dim=-1).view(n, hidden)
+    elif bits == 3:
+        shifts = BITS_PER_BYTE * torch.arange(bits, device=rows.device)
+        word = (packed.reshape(n, -1, bits).long() << shifts).sum(-1, keepdim=True)
+        shifts = bits * torch.arange(BITS_PER_BYTE, device=rows.device)
+        q = ((word >> shifts) & ((1 << bits) - 1)).view(n, hidden)
     else:
         q = packed
     scales = scales.view(n, groups, 2)
@@ -409,6 +421,12 @@ def encode_rows_reference(
             if cfg.stateful:
                 assert state is not None
                 state[rows_flat] = h.to(torch.bfloat16).float()
+        elif code == H_INT4:
+            # h' itself: the state becomes what was sent.
+            data, deq = _quantized_rows(code, h.float())
+            if cfg.stateful:
+                assert state is not None
+                state[rows_flat] = deq
         else:
             base = (
                 state[rows_flat]
@@ -452,8 +470,12 @@ def decode_rows_reference(
             continue
         size = row_bytes(code, hidden)
         rows = data[_byte_positions(offsets[sel], size)]
-        if code == H_BF16:
-            value = rows.contiguous().view(torch.bfloat16).float()
+        if code in (H_BF16, H_INT4):
+            # h' itself: the new state.
+            if code == H_BF16:
+                value = rows.contiguous().view(torch.bfloat16).float()
+            else:
+                value = _dequantized_rows(code, rows, hidden)
             if cfg.stateful:
                 assert state is not None
                 state[state_rows[sel]] = value
