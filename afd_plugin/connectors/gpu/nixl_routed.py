@@ -219,6 +219,8 @@ class PendingCombineWrite:
 
 
 class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
+    _carries_copies = True
+
     """``P2pNcclRoutedAFDConnector`` with the rows carried by NIXL WRITEs."""
 
     # AFD_NIXL_DEBUG: seq of the plan being handled, count exchanges posted
@@ -753,8 +755,12 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             # into the GPU pack buffers, then copied into the pinned send
             # buffers on the same stream.
             n = plan.num_send
-            for src, packed, sent in zip(tensors, pack_rows, send_rows, strict=True):
+            for i, (src, packed, sent) in enumerate(
+                zip(tensors, pack_rows, send_rows, strict=True)
+            ):
                 torch.index_select(src, 0, plan.perm, out=packed[:n])
+                if i == 1:
+                    self._mask_copied_ids(packed, stage, plan, pending)
                 sent[:n].copy_(packed[:n], non_blocking=True)
             packed_done = torch.cuda.Event()
             packed_done.record(stream)
@@ -849,6 +855,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             send_bytes[:total].copy_(pack_bytes[:total], non_blocking=True)
             for i, column in ((1, ids), (2, weights)):
                 torch.index_select(column, 0, plan.perm, out=pack_rows[i][:n])
+                if i == 1:
+                    self._mask_copied_ids(pack_rows[1], stage, plan, pending)
                 send_rows[i][:n].copy_(pack_rows[i][:n], non_blocking=True)
             send_rows[3][:n].copy_(pack_rows[3][:n], non_blocking=True)
             packed_done = torch.cuda.Event()

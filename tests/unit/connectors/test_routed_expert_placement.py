@@ -17,6 +17,7 @@ from vllm.distributed.device_communicators.p2p_nccl_all2all import (  # noqa: E4
 )
 
 from afd_plugin.connectors.gpu import routed  # noqa: E402
+from afd_plugin.expert_copies import CopyRouter  # noqa: E402
 
 PLACEMENT = {
     1: [[3, 0], [1, 2]],
@@ -52,12 +53,13 @@ def test_placement_digest_follows_the_content_only():
     assert routed.expert_placement_digest(other) != digest
 
 
-def _plan_owner(owners):
+def _plan_owner(owners, router=None):
     conn = routed.P2pNcclRoutedAFDConnector.__new__(routed.P2pNcclRoutedAFDConnector)
     # Two FFN ranks and one Attention rank (world rank 2), four experts.
     conn.engine = P2pAll2AllEngine(None, 2, 3, 2, 4, "cpu")
-    conn._layer_owner = owners
-    conn.expert_placement_file = None if owners is None else "placement.json"
+    conn._layer_owner, conn._copy_router, conn._copy_rank_of = owners, router, {}
+    placed = owners is not None or router is not None
+    conn.expert_placement_file = "placement.json" if placed else None
     return conn
 
 
@@ -126,3 +128,23 @@ def test_runtime_check_accepts_indivisible_experts_with_a_file(monkeypatch):
     routed._validate_routed_runtime(_runtime_config("p.json"), afd, spec)
     with pytest.raises(RuntimeError, match="divisible"):
         routed._validate_routed_runtime(_runtime_config(None), afd, spec)
+
+
+def test_plan_with_copies_sends_each_pair_to_its_copy():
+    # Layer 1: expert 1 on both ranks (home 1), the others on one rank.
+    layers = {1: [[0, 1, 3], [1, 2]]}
+    router = CopyRouter(layers, {1: [0, 1, 1, 0]}, 4, 2, 2, 4, 1, "cpu")
+    conn = _plan_owner(None, router)
+    topk_ids = torch.tensor([[0, 1], [1, 2], [3, -1]])
+    pending = conn._begin_plan(topk_ids, 0, 1)
+    # Token 0 visits rank 0 only (expert 1's copy there), token 1 rank 1 only.
+    assert conn.engine._count_buf(0)[0].tolist() == [2, 1, 0]
+    plan = conn.engine.finish_plan_local(pending)
+    rows = topk_ids[plan.perm]
+    conn._mask_copied_ids(rows, 0, plan, pending)
+    assert rows.tolist() == [[0, 1], [3, -1], [1, 2]]
+    assert conn._copy_rank_of == {}
+    # Without copies the rows keep all their ids.
+    rows2 = topk_ids[plan.perm]
+    conn._mask_copied_ids(rows2, 0, plan, pending)
+    assert torch.equal(rows2, topk_ids[plan.perm])
