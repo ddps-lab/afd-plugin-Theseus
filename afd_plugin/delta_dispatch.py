@@ -11,6 +11,7 @@ times the partial sum it returned then. The Attention side keeps a copy of
 every FFN rank's states. At a MoE layer, for a row of FFN rank ``f``:
 
     first visit of the forward:  send h' in bf16,              S_f = h'
+               (first "int4"):   send Q(h'),                   S_f = deq(Q(h'))
     later visit:                 d = h' - S_f, send Q(d),      S_f += deq(Q(d))
 
 the FFN rank normalizes ``S_f`` itself (``x = Norm(S_f in bf16)``), and after
@@ -35,6 +36,9 @@ packed back to back at the size of their format code:
   experiment's ``compress.py`` arithmetic). A row is the packed values (int4:
   two per byte, even index in the low nibble) followed by the ``(lo, step)``
   fp16 pairs of its groups.
+* ``4`` ``h_int4``: ``h'`` itself quantized like ``d_int4`` (a first visit
+  with ``first: "int4"``); the state becomes the dequantized value.
+* ``5`` ``d_int3``: ``d`` quantized like ``d_int4`` in 3 bits.
 
 Each row also carries a 4-byte word ``token | code << CODE_SHIFT | rank <<
 RANK_SHIFT``: the token's index in the Attention rank's batch, the row's format
@@ -48,10 +52,13 @@ Codes by mode (``connector_extra_config = {"delta_dispatch": {...}}``):
   the byte rows).
 * ``delta_fp32``: first visit ``h_bf16``, then ``d_fp32`` (checks the states
   and the closed loop; outputs must equal ``off``).
-* ``delta_int4``: first visit ``h_bf16``; then ``d_int8`` on the ``early``
-  first and ``late`` last MoE layers and, with ``revisit: "int8"``, on rows
-  whose last visit to the FFN rank was ``rgap`` or more MoE layers before;
-  else ``d_int4`` (the rules of the offline experiment's ``sim.FFNSim``).
+* ``delta_int4`` / ``delta_int3``: first visit ``h_bf16`` (``h_int4`` with
+  ``first: "int4"``, on every MoE layer); then ``d_int8`` on the ``early``
+  first and ``late`` last MoE layers and, with ``revisit`` naming a format
+  wider than the mode's own (``"int8"``; for delta_int3 also ``"int4"``), that
+  format on rows whose last visit to the FFN rank was ``rgap`` or more MoE
+  layers before; else ``d_int4`` / ``d_int3`` (the rules of the offline
+  experiment's ``sim.FFNSim``).
 * ``x_int4``: no state: every row is ``x = Norm(h')`` in int4 and the FFN rank
   uses the dequantized ``x`` as is (plain quantization, the baseline).
 
@@ -83,16 +90,20 @@ import torch
 
 from afd_plugin.config import connector_extra_config_from_source
 
-MODES = ("off", "full_bf16", "delta_fp32", "delta_int4", "x_int4")
-REVISIT_FORMATS = ("int4", "int8")
+MODES = ("off", "full_bf16", "delta_fp32", "delta_int4", "delta_int3", "x_int4")
 EXTRA_CONFIG_KEY = "delta_dispatch"
 COMBINE_KEY = "combine"
 COMBINE_MODES = ("off", "int8", "int4")
-H_BF16, D_FP32, D_INT8, D_INT4 = 0, 1, 2, 3
-CODE_FORMATS = ("h_bf16", "d_fp32", "d_int8", "d_int4")
-CODE_BITS = {D_INT8: 8, D_INT4: 4}
-CODE_SHIFT = 24
-CODE_MASK = 0x3
+H_BF16, D_FP32, D_INT8, D_INT4, H_INT4, D_INT3 = 0, 1, 2, 3, 4, 5
+CODE_FORMATS = ("h_bf16", "d_fp32", "d_int8", "d_int4", "h_int4", "d_int3")
+CODE_BITS = {D_INT8: 8, D_INT4: 4, H_INT4: 4, D_INT3: 3}
+# The format of a quantized delta mode's later visits, and the formats
+# ``first`` and ``revisit`` name.
+DELTA_CODES = {"delta_int4": D_INT4, "delta_int3": D_INT3}
+FIRST_FORMATS = {"bf16": H_BF16, "int4": H_INT4}
+REVISIT_FORMATS = {"int3": D_INT3, "int4": D_INT4, "int8": D_INT8}
+CODE_SHIFT = 23
+CODE_MASK = 0x7
 RANK_SHIFT = 26
 MAX_ATTENTION_RANKS = 1 << (31 - RANK_SHIFT)
 TOKEN_MASK = (1 << CODE_SHIFT) - 1
@@ -117,7 +128,7 @@ def row_bytes(code: int, hidden: int) -> int:
 
 
 def row_bytes_table(hidden: int, device: torch.device | str) -> torch.Tensor:
-    """int64 [4]: bytes of a row per format code."""
+    """int64 [len(CODE_FORMATS)]: bytes of a row per format code."""
     return torch.tensor(
         [row_bytes(code, hidden) for code in range(len(CODE_FORMATS))],
         dtype=torch.int64,
@@ -130,8 +141,10 @@ class DeltaDispatchConfig:
     mode: str = "off"
     early: int = 0
     late: int = 0
-    revisit: str = "int4"
+    # "": no revisit rule (the mode's own format).
+    revisit: str = ""
     rgap: int = 2
+    first: str = "bf16"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> DeltaDispatchConfig:
@@ -139,28 +152,46 @@ class DeltaDispatchConfig:
             return cls()
         if not isinstance(raw, Mapping):
             raise TypeError("delta_dispatch must be a mapping")
-        unknown = set(raw) - {"mode", "early", "late", "revisit", "rgap"}
+        unknown = set(raw) - {"mode", "early", "late", "revisit", "rgap", "first"}
         if unknown:
             raise ValueError(f"unknown delta_dispatch keys: {sorted(unknown)}")
         mode = str(raw.get("mode", "off"))
         if mode not in MODES:
             raise ValueError(f"delta_dispatch mode {mode!r} not in {MODES}")
         early, late = int(raw.get("early", 0)), int(raw.get("late", 0))
-        revisit, rgap = str(raw.get("revisit", "int4")), int(raw.get("rgap", 2))
+        revisit, rgap = str(raw.get("revisit", "")), int(raw.get("rgap", 2))
+        first = str(raw.get("first", "bf16"))
         if early < 0 or late < 0:
             raise ValueError("delta_dispatch early and late must be >= 0")
-        if revisit not in REVISIT_FORMATS:
+        if revisit and revisit not in REVISIT_FORMATS:
             raise ValueError(
-                f"delta_dispatch revisit {revisit!r} not in {REVISIT_FORMATS}"
+                f"delta_dispatch revisit {revisit!r} not in {tuple(REVISIT_FORMATS)}"
+            )
+        # Naming the mode's own format is no rule (int4 for the modes without
+        # a quantized difference, as before); a rule names a wider format.
+        own = DELTA_CODES.get(mode, D_INT4)
+        if revisit and REVISIT_FORMATS[revisit] == own:
+            revisit = ""
+        if revisit and CODE_BITS[REVISIT_FORMATS[revisit]] <= CODE_BITS[own]:
+            raise ValueError(
+                f"delta_dispatch revisit {revisit!r} is not wider than the rows "
+                f"of {mode}"
             )
         if rgap < 2:
             raise ValueError("delta_dispatch rgap must be >= 2")
-        rules = early or late or revisit != "int4" or rgap != 2
-        if rules and mode != "delta_int4":
+        if first not in FIRST_FORMATS:
             raise ValueError(
-                "delta_dispatch early/late/revisit/rgap apply to delta_int4 only"
+                f"delta_dispatch first {first!r} not in {tuple(FIRST_FORMATS)}"
             )
-        return cls(mode=mode, early=early, late=late, revisit=revisit, rgap=rgap)
+        rules = early or late or revisit or rgap != 2 or first != "bf16"
+        if rules and mode not in DELTA_CODES:
+            raise ValueError(
+                "delta_dispatch early/late/revisit/rgap/first apply to delta_int4 "
+                "and delta_int3 only"
+            )
+        return cls(
+            mode=mode, early=early, late=late, revisit=revisit, rgap=rgap, first=first
+        )
 
     @classmethod
     def from_extra_config(cls, extra: Mapping[str, Any] | None) -> DeltaDispatchConfig:
@@ -183,7 +214,7 @@ class DeltaDispatchConfig:
     @property
     def stateful(self) -> bool:
         """Both sides keep the per-FFN-rank states (the delta modes)."""
-        return self.mode in ("delta_fp32", "delta_int4")
+        return self.mode in ("delta_fp32", "delta_int4", "delta_int3")
 
     @property
     def sends_x(self) -> bool:
@@ -204,21 +235,32 @@ class DeltaDispatchConfig:
             rest = torch.full_like(last, D_FP32)
         elif layer_pos < self.early or layer_pos >= num_layers - self.late:
             rest = torch.full_like(last, D_INT8)
-        elif self.revisit == "int8":
-            rest = torch.where(layer_pos - last >= self.rgap, D_INT8, D_INT4).to(
-                last.dtype
-            )
+        elif self.revisit:
+            rest = torch.where(
+                layer_pos - last >= self.rgap,
+                REVISIT_FORMATS[self.revisit],
+                DELTA_CODES[self.mode],
+            ).to(last.dtype)
         else:
-            rest = torch.full_like(last, D_INT4)
-        return torch.where(last < 0, H_BF16, rest).to(last.dtype)
+            rest = torch.full_like(last, DELTA_CODES[self.mode])
+        # First visits keep their format on the early / late layers too.
+        return torch.where(last < 0, FIRST_FORMATS[self.first], rest).to(last.dtype)
 
     def _codes(self) -> tuple[int, ...]:
-        return {
+        """The formats the rows of this mode can have."""
+        fixed = {
             "full_bf16": (H_BF16,),
             "delta_fp32": (H_BF16, D_FP32),
-            "delta_int4": (H_BF16, D_INT8, D_INT4),
             "x_int4": (D_INT4,),
-        }[self.mode]
+        }
+        if self.mode in fixed:
+            return fixed[self.mode]
+        codes = {FIRST_FORMATS[self.first], DELTA_CODES[self.mode]}
+        if self.early or self.late:
+            codes.add(D_INT8)
+        if self.revisit:
+            codes.add(REVISIT_FORMATS[self.revisit])
+        return tuple(sorted(codes))
 
     def max_row_bytes(self, hidden: int) -> int:
         return max(row_bytes(c, hidden) for c in self._codes())
@@ -841,10 +883,12 @@ __all__ = [
     "CODE_MASK",
     "CODE_SHIFT",
     "D_FP32",
+    "D_INT3",
     "D_INT4",
     "D_INT8",
     "EXTRA_CONFIG_KEY",
     "H_BF16",
+    "H_INT4",
     "MODES",
     "QUANT_GROUP_SIZE",
     "RANK_SHIFT",

@@ -36,6 +36,8 @@ import triton.language as tl
 
 from afd_plugin.delta_dispatch import (
     CODE_BITS,
+    CODE_MASK,
+    CODE_SHIFT,
     MIN_GROUP_RANGE,
     QUANT_GROUP_SIZE,
     RANK_SHIFT,
@@ -95,6 +97,7 @@ def _encode_rows_kernel(
     hidden: tl.constexpr,
     group: tl.constexpr,
     stateful: tl.constexpr,
+    code_shift: tl.constexpr,
 ):
     half: tl.constexpr = group // 2
     i = tl.program_id(0)
@@ -169,7 +172,7 @@ def _encode_rows_kernel(
         tl.store(scales, lo.to(tl.float16))
         tl.store(scales + 1, step.to(tl.float16))
     if g == 0:
-        word = t + (code.to(tl.int64) << 24) + rank_word
+        word = t + (code.to(tl.int64) << code_shift) + rank_word
         tl.store(meta_ptr + i, word.to(tl.int32))
         if stateful:
             tl.store(last_ptr + flat, layer_pos)
@@ -188,11 +191,13 @@ def _decode_rows_kernel(
     hidden: tl.constexpr,
     group: tl.constexpr,
     stateful: tl.constexpr,
+    code_shift: tl.constexpr,
+    code_mask: tl.constexpr,
 ):
     half: tl.constexpr = group // 2
     i = tl.program_id(0)
     g = tl.program_id(1)
-    code = (tl.load(meta_ptr + i) >> 24) & 0x3
+    code = (tl.load(meta_ptr + i) >> code_shift) & code_mask
     row = data_ptr + tl.load(off_ptr + i)
     srow = tl.load(rows_ptr + i)
     base = g * group
@@ -389,6 +394,7 @@ def encode_rows(
         hidden=hidden,
         group=QUANT_GROUP_SIZE,
         stateful=stateful,
+        code_shift=CODE_SHIFT,
     )
 
 
@@ -423,6 +429,8 @@ def decode_rows(
         hidden=hidden,
         group=QUANT_GROUP_SIZE,
         stateful=stateful,
+        code_shift=CODE_SHIFT,
+        code_mask=CODE_MASK,
     )
 
 
