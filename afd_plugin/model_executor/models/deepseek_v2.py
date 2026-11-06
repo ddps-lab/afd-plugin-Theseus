@@ -117,6 +117,21 @@ def _checkpoint_weight_roles(
     return _FFN_ROLE
 
 
+def delta_dispatch_configs(
+    vllm_config: VllmConfig,
+) -> tuple[DeltaDispatchConfig, CombineConfig]:
+    """The delta dispatch and combine compression settings of ``vllm_config``;
+    combine compression needs delta dispatch (its rows carry the tokens)."""
+    delta = DeltaDispatchConfig.from_vllm_config(vllm_config)
+    combine = CombineConfig.from_vllm_config(vllm_config)
+    if combine.enabled and not delta.enabled:
+        raise ValueError(
+            "combine compression needs delta dispatch (mode full_bf16 sends "
+            "the same bf16 x as off)"
+        )
+    return delta, combine
+
+
 def norm_from_residual(norm: nn.Module, out: torch.Tensor, h: torch.Tensor) -> None:
     """Write ``Norm(h)`` into ``out`` the way the Attention side computes it.
 
@@ -950,13 +965,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         # Delta dispatch and combine compression (afd_plugin/delta_dispatch.py;
         # off by default).
         self.ffn_delta: FFNDeltaState | None = None
-        delta = DeltaDispatchConfig.from_vllm_config(vllm_config)
-        combine = CombineConfig.from_vllm_config(vllm_config)
-        if combine.enabled and not delta.enabled:
-            raise ValueError(
-                "combine compression needs delta dispatch (mode full_bf16 sends "
-                "the same bf16 x as off)"
-            )
+        delta, combine = delta_dispatch_configs(vllm_config)
         if delta.enabled:
             self._init_delta_dispatch(delta, vllm_config, afd_config, combine)
         # ### PATCH END

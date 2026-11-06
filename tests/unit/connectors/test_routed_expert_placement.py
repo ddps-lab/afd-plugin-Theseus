@@ -144,7 +144,23 @@ def test_plan_with_copies_sends_each_pair_to_its_copy():
     conn._mask_copied_ids(rows, 0, plan, pending)
     assert rows.tolist() == [[0, 1], [3, -1], [1, 2]]
     assert conn._copy_rank_of == {}
-    # Without copies the rows keep all their ids.
+    # Without a routed plan the rows keep all their ids.
     rows2 = topk_ids[plan.perm]
     conn._mask_copied_ids(rows2, 0, plan, pending)
     assert torch.equal(rows2, topk_ids[plan.perm])
+
+
+def test_rows_leave_out_the_copies_another_rank_computes():
+    # Expert 1 on both ranks (home 1); the token also needs 0 (rank 0 only)
+    # and 2 (rank 1 only), so it visits both and expert 1 goes home. Each
+    # row's other experts become an expert its rank does not hold (rank 0:
+    # 2, rank 1: 0), never -1 in a real row.
+    layers = {1: [[0, 1, 3], [1, 2]]}
+    router = CopyRouter(layers, {1: [0, 1, 1, 0]}, 4, 2, 3, 4, 1, "cpu")
+    conn = _plan_owner(None, router)
+    topk_ids = torch.tensor([[0, 1, 2]])
+    pending = conn._begin_plan(topk_ids, 0, 1)
+    plan = conn.engine.finish_plan_local(pending)
+    rows = topk_ids[plan.perm]
+    conn._mask_copied_ids(rows, 0, plan, pending)
+    assert rows.tolist() == [[0, 2, 2], [0, 1, 2]]

@@ -25,7 +25,9 @@ token order inside, as ``P2pAll2AllEngine.begin_plan`` orders them), are
 packed back to back at the size of their format code:
 
 * ``0`` ``h_bf16``: ``h'`` in bf16 (2 * hidden bytes).
-* ``1`` ``d_fp32``: ``d`` in fp32 (4 * hidden bytes); rebuilds ``h'`` exactly.
+* ``1`` ``d_fp32``: ``d`` in fp32 (4 * hidden bytes); rebuilds ``h'`` exactly
+  whenever ``S + (h' - S)`` rounds back to ``h'`` in fp32, which holds for the
+  bf16 values of a model (a check mode, not a compression).
 * ``2`` ``d_int8`` / ``3`` ``d_int4``: ``d`` quantized per group of
   ``QUANT_GROUP_SIZE`` values, asymmetric: per group the minimum ``lo`` and the
   step ``(max - lo) / (2^bits - 1)``, both rounded to fp16, and
@@ -210,14 +212,19 @@ class DeltaDispatchConfig:
             rest = torch.full_like(last, D_INT4)
         return torch.where(last < 0, H_BF16, rest).to(last.dtype)
 
-    def max_row_bytes(self, hidden: int) -> int:
-        codes = {
+    def _codes(self) -> tuple[int, ...]:
+        return {
             "full_bf16": (H_BF16,),
             "delta_fp32": (H_BF16, D_FP32),
             "delta_int4": (H_BF16, D_INT8, D_INT4),
             "x_int4": (D_INT4,),
         }[self.mode]
-        return max(row_bytes(c, hidden) for c in codes)
+
+    def max_row_bytes(self, hidden: int) -> int:
+        return max(row_bytes(c, hidden) for c in self._codes())
+
+    def min_row_bytes(self, hidden: int) -> int:
+        return min(row_bytes(c, hidden) for c in self._codes())
 
 
 @dataclass(frozen=True)
@@ -261,7 +268,9 @@ class CombineConfig:
 
     @property
     def code(self) -> int:
-        """The row format of the compressed partial sums (int formats only)."""
+        """The row format of the compressed partial sums."""
+        if not self.enabled:
+            raise ValueError("combine compression is off: no row format")
         return {"int8": D_INT8, "int4": D_INT4}[self.mode]
 
     def row_bytes(self, hidden: int) -> int:
@@ -740,6 +749,8 @@ class FFNDeltaState:
         if pos == 0 and stage in self._err:
             # A new forward: no residual is carried over from the last one.
             self._err[stage].zero_()
+        # The previous layer's compressed rows are stale from here on.
+        self._crows.pop(stage, None)
         meta = self._meta.pop(stage, None)
         if meta is None:
             raise RuntimeError(

@@ -145,9 +145,28 @@ def test_too_many_ranks_are_refused():
         CopyRouter(layers, None, 11, 11, 1, 4, 1, "cpu")
 
 
-def test_mask_keeps_only_the_rows_rank_experts():
+def test_mask_replaces_other_ranks_experts_by_an_absent_one():
+    # Not -1: the experts kernel would sum the stale slot of a -1 id in a real
+    # row; an expert the rank does not hold is written as zeros.
     ids = torch.tensor([[3, 5, 6], [3, 5, 6], [1, 2, -1]], dtype=torch.int32)
     rank_of = torch.tensor([[0, 1, 0], [0, 1, 0], [2, 2, -1]])
     dest = torch.tensor([0, 1, 2])
-    mask_other_ranks(ids, rank_of, dest)
-    assert ids.tolist() == [[3, -1, 6], [-1, 5, -1], [1, 2, -1]]
+    absent = torch.tensor([7, 0, 4])
+    mask_other_ranks(ids, rank_of, dest, absent)
+    assert ids.tolist() == [[3, 7, 6], [0, 5, 0], [1, 2, -1]]
+    assert ids.dtype == torch.int32
+
+
+def test_absent_experts_are_not_held():
+    layers, home = _placement(4, 9)
+    router = CopyRouter(layers, home, NUM_EXPERTS, 4, 2, 4, 1, "cpu")
+    for layer in LAYERS:
+        for rank, e in enumerate(router.absent(layer).tolist()):
+            assert e not in layers[layer][rank]
+    with pytest.raises(ValueError, match="holds every expert"):
+        CopyRouter({1: [[0, 1, 2, 3], [1]]}, None, 4, 2, 1, 4, 1, "cpu")
+
+
+def test_home_rank_out_of_range_is_refused():
+    with pytest.raises(ValueError, match="home rank"):
+        CopyRouter({1: [[0, 1], [1]]}, {1: [-1, 0]}, 2, 2, 1, 4, 1, "cpu")
