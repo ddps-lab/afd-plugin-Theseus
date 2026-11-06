@@ -88,7 +88,10 @@ class RoutedExpertsProxy(nn.Module):
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("RoutedExpertsProxy requires AFD forward metadata")
-        stage_idx = _current_stage_idx()
+        forward_context = get_forward_context()
+        stage_idx = int(
+            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
+        )
         afd_metadata.stage_idx = stage_idx
         connector = cast("P2pNcclRoutedAFDConnector", afd_metadata.connector)
         if connector.delta_dispatch.enabled != (self.delta is not None):
@@ -99,9 +102,13 @@ class RoutedExpertsProxy(nn.Module):
         if self.delta is None:
             a1q, a1q_scale = connector.quantize_for_dispatch(hidden_states)
         else:
-            a1q = self.delta.encode_dispatch(
-                self.layer_idx, stage_idx, self.h_prime.pop(stage_idx)
-            )
+            h_prime = self.h_prime.pop(stage_idx, None)
+            if h_prime is None:
+                raise RuntimeError(
+                    f"layer {self.layer_idx} stage {stage_idx}: no h' recorded by "
+                    "post_attention_layernorm before the dispatch",
+                )
+            a1q = self.delta.encode_dispatch(self.layer_idx, stage_idx, h_prime)
             a1q_scale = None
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=self.layer_idx,
@@ -130,7 +137,8 @@ class RoutedExpertsProxy(nn.Module):
 
 
 def _current_stage_idx() -> int:
-    """The micro-batch (stage) the current forward runs (0 without micro-batches)."""
+    """The micro-batch (stage) the current forward runs (0 without micro-batches),
+    as ``RoutedExpertsProxy.forward`` reads it."""
     afd_metadata = get_afd_metadata_from_forward_context()
     if afd_metadata is None:
         raise RuntimeError("routed AFD requires AFD forward metadata")

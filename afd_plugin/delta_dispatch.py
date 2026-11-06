@@ -54,6 +54,8 @@ from typing import Any
 
 import torch
 
+from afd_plugin.config import connector_extra_config_from_source
+
 MODES = ("off", "full_bf16", "delta_fp32", "delta_int4")
 EXTRA_CONFIG_KEY = "delta_dispatch"
 QUANT_GROUP_SIZE = 128
@@ -93,8 +95,17 @@ class DeltaDispatchConfig:
 
     @classmethod
     def from_extra_config(cls, extra: Mapping[str, Any] | None) -> DeltaDispatchConfig:
-        """From ``AFDConfig.connector_extra_config`` (the same source on every rank)."""
+        """From the connector extra config mapping of the AFD config."""
         return cls.from_mapping((extra or {}).get(EXTRA_CONFIG_KEY))
+
+    @classmethod
+    def from_vllm_config(cls, vllm_config: Any) -> DeltaDispatchConfig:
+        """From ``additional_config["afd"]["connector_extra_config"]`` of
+        ``vllm_config`` (the same source on every rank)."""
+        additional_config = getattr(vllm_config, "additional_config", None)
+        return cls.from_extra_config(
+            connector_extra_config_from_source(additional_config)
+        )
 
     @property
     def enabled(self) -> bool:
@@ -324,7 +335,8 @@ class FFNDeltaState:
     ) -> torch.Tensor:
         buf = store.get(stage)
         if buf is None or buf.shape[0] < rows or buf.dtype != dtype:
-            buf = torch.empty((rows, self.hidden), dtype=dtype, device=like.device)
+            # Zeros: the launch rows past the received ones stay finite.
+            buf = torch.zeros((rows, self.hidden), dtype=dtype, device=like.device)
             store[stage] = buf
         return buf
 
@@ -333,7 +345,7 @@ class FFNDeltaState:
         layer_idx: int,
         stage: int,
         rows: torch.Tensor,
-        norm_into: Callable[[torch.Tensor, torch.Tensor], None],
+        norm_into: Callable[[torch.Tensor, torch.Tensor], object],
         out_rows: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:

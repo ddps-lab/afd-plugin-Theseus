@@ -510,9 +510,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         _validate_routed_runtime(vllm_config, afd_config, self.spec)
         # Delta dispatch (afd_plugin/delta_dispatch.py); only the NIXL
         # connector accepts it in connector_extra_config, so it is off here.
-        self.delta_dispatch = DeltaDispatchConfig.from_extra_config(
-            afd_config.connector_extra_config
-        )
+        self.delta_dispatch = DeltaDispatchConfig.from_vllm_config(vllm_config)
         self._ffn_model: Any | None = None
         self.num_local_experts = self.spec.num_experts // self.ffn_size
         # Experts per FFN rank when the placement is uneven (None: even).

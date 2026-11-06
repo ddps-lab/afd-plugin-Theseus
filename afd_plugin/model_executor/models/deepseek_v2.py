@@ -116,6 +116,21 @@ def _checkpoint_weight_roles(
     return _FFN_ROLE
 
 
+def norm_from_residual(norm: nn.Module, out: torch.Tensor, h: torch.Tensor) -> None:
+    """Write ``Norm(h)`` into ``out`` the way the Attention side computes it.
+
+    The Attention side normalizes ``h'`` in the fused add + norm of
+    ``post_attention_layernorm(x, residual)``. Calling the same module with a
+    zero input and ``h`` as the residual runs that kernel on the same values
+    (``0 + h = h``), so the result matches it bit for bit; the plain norm is
+    another kernel whose reduction order differs. ``h`` is rewritten in place
+    with the same values.
+    """
+    out.zero_()
+    normed, _ = norm(out, h)
+    out.copy_(normed)
+
+
 def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
@@ -706,24 +721,9 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         self.input_layernorm = native.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # ### PATCH START: delta dispatch records h' for the routed proxy.
-        if (
-            afd_role == "attention"
-            and isinstance(self.mlp, AFDDeepseekV2RoutedAttentionMoE)
-            and DeltaDispatchConfig.from_extra_config(
-                afd_config.connector_extra_config
-            ).enabled
-        ):
-            self.post_attention_layernorm = ResidualRecordingRMSNorm(
-                config.hidden_size,
-                eps=config.rms_norm_eps,
-                record=self.mlp.experts.record_h_prime,
-            )
-        else:
-            self.post_attention_layernorm = native.RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-        # ### PATCH END
+        self.post_attention_layernorm = native.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
     def compute_attn_output(
@@ -946,6 +946,11 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             ),
             prefix=f"{prefix}.layers",
         )
+        # Delta dispatch (afd_plugin/delta_dispatch.py; off by default).
+        self.ffn_delta: FFNDeltaState | None = None
+        delta = DeltaDispatchConfig.from_vllm_config(vllm_config)
+        if delta.enabled:
+            self._init_delta_dispatch(delta, vllm_config, afd_config)
         # ### PATCH END
 
         if native.get_pp_group().is_last_rank:
@@ -969,12 +974,6 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
-        # ### PATCH START: delta dispatch states (one FFN rank).
-        self.ffn_delta: FFNDeltaState | None = None
-        delta = DeltaDispatchConfig.from_extra_config(afd_config.connector_extra_config)
-        if delta.enabled:
-            self._init_delta_dispatch(delta, vllm_config, afd_config)
-        # ### PATCH END
 
     def _init_delta_dispatch(
         self,
@@ -985,7 +984,9 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         """Wire the delta dispatch states into the routed MoE layers.
 
         The Attention side shares one ``AttentionDeltaState`` between the
-        layers' proxies; the FFN side keeps one ``FFNDeltaState`` used by
+        layers' proxies, and each routed layer's ``post_attention_layernorm``
+        becomes a ``ResidualRecordingRMSNorm`` (same normalization; it hands
+        ``h'`` to the proxy). The FFN side keeps one ``FFNDeltaState`` used by
         ``compute_routed_experts_output``. Both list the same routed layers.
         """
         if not is_routed_afd(afd_config) or int(afd_config.num_ffn_ranks) != 1:
@@ -1012,7 +1013,15 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         if afd_config.role == "attention":
             state = AttentionDeltaState(delta, layers, scale)
             for idx in layers:
-                self.layers[idx].mlp.experts.delta = state
+                layer = self.layers[idx]
+                proxy = layer.mlp.experts
+                proxy.delta = state
+                # Replaced before the weights are loaded (same parameters).
+                layer.post_attention_layernorm = ResidualRecordingRMSNorm(
+                    self.config.hidden_size,
+                    eps=self.config.rms_norm_eps,
+                    record=proxy.record_h_prime,
+                )
         else:
             self.ffn_delta = FFNDeltaState(delta, layers, scale, self.hidden_size)
 
@@ -1094,9 +1103,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
             layer_idx,
             stage,
             hidden_states,
-            # The layer's own norm module, so the FFN side normalizes with the
-            # same kernel as the Attention side.
-            lambda out, h: out.copy_(norm(h)),
+            lambda out, h: norm_from_residual(norm, out, h),
             out_rows=int(topk_ids.shape[0]),
             dtype=self.vllm_config.model_config.dtype,
         )
