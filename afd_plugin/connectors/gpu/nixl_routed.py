@@ -325,7 +325,12 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         delta = self.delta_dispatch
         if delta.enabled and self.ffn_size != 1:
             raise RuntimeError("delta dispatch supports one FFN rank only")
-        if delta.enabled and self.is_ffn and self._ffn_model.model.ffn_delta is None:
+        if (
+            delta.enabled
+            and self.is_ffn
+            and getattr(getattr(self._ffn_model, "model", None), "ffn_delta", None)
+            is None
+        ):
             raise RuntimeError("delta dispatch is not wired into the FFN model")
         self._rows = [
             buffer(delta.max_row_bytes(spec.hidden_size), torch.uint8)

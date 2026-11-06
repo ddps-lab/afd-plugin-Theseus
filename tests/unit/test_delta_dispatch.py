@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -113,6 +115,20 @@ def test_config_parsing() -> None:
         DeltaDispatchConfig.from_mapping({"mode": "off", "extra": 1})
     with pytest.raises(ValueError):
         DeltaDispatchConfig.from_mapping({"mode": "delta_fp32", "early": 2})
+    # Read from vLLM's additional_config like the connector extra config.
+    vllm_config = SimpleNamespace(
+        additional_config={
+            "afd": {
+                "role": "ffn",
+                "connector_extra_config": {"delta_dispatch": {"mode": "delta_fp32"}},
+            }
+        }
+    )
+    assert DeltaDispatchConfig.from_vllm_config(vllm_config).mode == "delta_fp32"
+    assert not DeltaDispatchConfig.from_vllm_config(SimpleNamespace()).enabled
+    assert not DeltaDispatchConfig.from_vllm_config(
+        SimpleNamespace(additional_config={"afd": {"role": "ffn"}})
+    ).enabled
 
 
 def test_row_formats() -> None:
