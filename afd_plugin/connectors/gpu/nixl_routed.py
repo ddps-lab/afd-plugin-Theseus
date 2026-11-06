@@ -231,9 +231,9 @@ class PendingCombineWrite:
 
 
 class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
-    _carries_copies = True
-
     """``P2pNcclRoutedAFDConnector`` with the rows carried by NIXL WRITEs."""
+
+    _carries_copies = True
 
     # AFD_NIXL_DEBUG: seq of the plan being handled, count exchanges posted
     # (class defaults so connectors built without __init__ in tests have them).
@@ -964,6 +964,9 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 data,
             )
             state, packed, sent = self._delta_pending.pop(stage)
+            if packed.flat.is_cuda:
+                # Allocated on the communication stream like ``perm`` below.
+                packed.flat.record_stream(torch.cuda.current_stream(self.device))
             partials = state.decode_combine(stage, data, sent)
             state.after_combine(packed, sent, partials)
             back = partials.to(self._results.dtype)
@@ -986,6 +989,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 # Delta dispatch: each FFN rank's partial sums into its
                 # states, before they are summed.
                 state, packed, sent = self._delta_pending.pop(stage)
+                if packed.flat.is_cuda:
+                    packed.flat.record_stream(torch.cuda.current_stream(self.device))
                 state.after_combine(packed, sent, back)
         output = torch.empty_like(ref_tensor)
         if plan.perm.is_cuda:
@@ -1039,6 +1044,18 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 f"dispatch byte counts {attn_bytes} with delta dispatch "
                 f"{self.delta_dispatch.mode}",
             )
+        if delta:
+            # The rows' sizes lie between the mode's smallest and largest
+            # format (a host check, no GPU sync).
+            low = self.delta_dispatch.min_row_bytes(self.spec.hidden_size)
+            high = self.delta_dispatch.max_row_bytes(self.spec.hidden_size)
+            for count, nbytes in zip(attn_counts, attn_bytes, strict=True):
+                assert nbytes is not None
+                if not count * low <= nbytes <= count * high:
+                    raise RuntimeError(
+                        f"stage {stage} seq {seq}: {count} rows of {nbytes} bytes "
+                        f"cannot be {self.delta_dispatch.mode} rows",
+                    )
         plan = self.engine.recv_plan(stage, seq, [0] * self.ffn_size + attn_counts)
         self._dbg("F recv stage=%d seq=%d counts=%s", stage, plan.seq, attn_counts)
         # Gather the stage's receive regions into one block on the GPU grouped

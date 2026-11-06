@@ -204,8 +204,15 @@ def _drive(
                         "received": back.float(),
                     }
                 )
-            steps[-1]["ffn_states"] = [f_state._state.get(s) for f_state in ffn]
-            steps[-1]["attn_states"] = [a_state._state.get(s) for a_state in attn]
+            # Snapshots: the states right after this (layer, stage).
+            steps[-1]["ffn_states"] = [
+                None if f_state._state.get(s) is None else f_state._state[s].clone()
+                for f_state in ffn
+            ]
+            steps[-1]["attn_states"] = [
+                None if a_state._state.get(s) is None else a_state._state[s].clone()
+                for a_state in attn
+            ]
     return steps
 
 

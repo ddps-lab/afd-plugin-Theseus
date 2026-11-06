@@ -455,6 +455,14 @@ def expert_placement_digest(
     return digest or 1
 
 
+def wire_settings_digest(delta: DeltaDispatchConfig, combine: CombineConfig) -> int:
+    """A nonzero 63-bit digest of the delta dispatch and combine settings,
+    compared across ranks at init (both sides must encode and decode alike)."""
+    text = json.dumps([repr(delta), repr(combine)])
+    digest = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big") >> 1
+    return digest or 1
+
+
 def _validate_routed_runtime(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
@@ -557,11 +565,11 @@ class RoutedPrefetch:
 
 
 class P2pNcclRoutedAFDConnector(AFDConnectorBase):
+    """One-hop Attention -> owning FFN ranks -> Attention connector."""
+
     # Whether the connector packs the rows itself and can leave each FFN rank
     # only its experts of a token (needed by expert copies).
     _carries_copies = False
-
-    """One-hop Attention -> owning FFN ranks -> Attention connector."""
 
     # Read by the FFN runner and the model wrappers to select the routed path.
     is_routed = True
@@ -618,7 +626,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         # With copies: the per-pair FFN ranks of the stages whose rows are
         # being packed (Attention).
         self._copy_router: CopyRouter | None = None
-        self._copy_rank_of: dict[int, torch.Tensor] = {}
+        self._copy_rank_of: dict[int, tuple[int, torch.Tensor]] = {}
         self.max_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
         # FFN: rows handed to the experts kernel per stage (fixed-size launch;
         # every token of every Attention rank is the most one stage brings).
@@ -859,24 +867,37 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         self.spec = spec
 
     def _check_expert_counts(self) -> None:
-        """Check that every rank routes by the placement of FFN role rank 0.
+        """Check that every rank routes by the placement of FFN role rank 0
+        and uses its delta dispatch / combine settings.
 
         Attention routes by its own ``--expert-placement-counts`` or
         ``--expert-placement-file`` while the FFN expert maps follow theirs,
-        so the counts and the file's digest must agree everywhere.
+        so the counts and the file's digest must agree everywhere; both sides
+        encode and decode the rows by their own settings.
         """
         mine = torch.tensor(
-            [*(self.expert_counts or [0] * self.ffn_size), self._placement_digest],
+            [
+                *(self.expert_counts or [0] * self.ffn_size),
+                self._placement_digest,
+                wire_settings_digest(self.delta_dispatch, self.combine),
+            ],
             dtype=torch.int64,
             device=self.device,
         )
         reference = mine.clone()
         dist.broadcast(reference, src=0, group=self.dispatch_pg)
+        if not torch.equal(reference[-1:], mine[-1:]):
+            raise RuntimeError(
+                "routed AFD: delta dispatch / combine settings differ from FFN "
+                f"rank 0 (this rank {self.delta_dispatch}, {self.combine}); "
+                "pass the same connector_extra_config to every Attention and FFN "
+                "rank",
+            )
         if not torch.equal(reference, mine):
             raise RuntimeError(
                 "routed AFD: expert placement differs from FFN rank 0 (counts "
-                f"{reference[:-1].tolist()}, file digest {int(reference[-1])}; "
-                f"this rank {mine[:-1].tolist()}, {int(mine[-1])}); pass the "
+                f"{reference[:-2].tolist()}, file digest {int(reference[-2])}; "
+                f"this rank {mine[:-2].tolist()}, {int(mine[-2])}); pass the "
                 "same --expert-placement-counts / --expert-placement-file to "
                 "every Attention and FFN rank",
             )
@@ -891,7 +912,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             if layer_idx is None:
                 raise RuntimeError("expert copies need the dispatch's MoE layer")
             rank_of = self._copy_router.route(int(layer_idx), topk_ids, stage)
-            self._copy_rank_of[stage] = rank_of
+            self._copy_rank_of[stage] = (int(layer_idx), rank_of)
             return self.engine.begin_plan(topk_ids, slot=stage, rank_of=rank_of)
         if self._layer_owner is None:
             return self.engine.begin_plan(topk_ids, slot=stage)
@@ -910,14 +931,22 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         plan: P2pAll2AllPlan,
         pending: P2pAll2AllPendingPlan,
     ) -> None:
-        """With expert copies, set the packed rows' experts that another FFN
-        rank computes to -1 (in place); no-op otherwise."""
-        rank_of = self._copy_rank_of.pop(stage, None)
-        if rank_of is None:
+        """With expert copies, replace in the packed rows the experts that
+        another FFN rank computes by one the row's rank does not hold (in
+        place, see ``afd_plugin/expert_copies.py``); no-op otherwise."""
+        routed = self._copy_rank_of.pop(stage, None)
+        if routed is None:
             return
+        assert self._copy_router is not None
+        layer_idx, rank_of = routed
         n = plan.num_send
         dest = torch.div(pending.order[:n], pending.num_tokens, rounding_mode="floor")
-        mask_other_ranks(rows_ids[:n], rank_of.index_select(0, plan.perm), dest)
+        mask_other_ranks(
+            rows_ids[:n],
+            rank_of.index_select(0, plan.perm),
+            dest,
+            self._copy_router.absent(layer_idx),
+        )
 
     @property
     def is_initialized(self) -> bool:

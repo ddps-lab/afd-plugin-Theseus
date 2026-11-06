@@ -159,8 +159,10 @@ class _FFNLayer(nn.Module):
         self.inputs.append(x[:real].clone())
         out = torch.zeros(x.shape[0], HIDDEN)
         for r in range(real):
-            # The plan sends a row only to the ranks holding its experts.
-            assert any(e >= 0 and bool(self.held[e]) for e in topk_ids[r].tolist())
+            # The plan sends a row only to the ranks holding its experts, and a
+            # real row has no -1 id (vLLM's Triton experts would sum its slot).
+            assert all(e >= 0 for e in topk_ids[r].tolist())
+            assert any(bool(self.held[e]) for e in topk_ids[r].tolist())
             for k in range(TOP_K):
                 e = int(topk_ids[r, k])
                 if e >= 0 and bool(self.held[e]):
@@ -700,6 +702,14 @@ def test_combine_int8_stays_close_to_off(cpu_config, context):
         torch.testing.assert_close(h_on.float(), h_off.float(), rtol=0.03, atol=0.03)
 
 
+def test_model_refuses_combine_without_delta_dispatch():
+    on = _vllm_config({"mode": "full_bf16"}, {"mode": "int4"})
+    delta, combine = adapter.delta_dispatch_configs(on)
+    assert delta.mode == "full_bf16" and combine.mode == "int4"
+    with pytest.raises(ValueError, match="needs delta dispatch"):
+        adapter.delta_dispatch_configs(_vllm_config(None, {"mode": "int8"}))
+
+
 def test_nixl_connector_combine_needs_delta_dispatch():
     pytest.importorskip("nixl")
     from afd_plugin.connectors.gpu.nixl_routed import NixlRoutedAFDConnector
@@ -891,3 +901,108 @@ def test_nixl_dispatch_notification_carries_the_byte_count():
     assert conn._wait_counts(b"d7:", [1, 2]) == {1: (3, 5248), 2: (0, 0)}
     conn.agent.inbox = {"attn-0": [b"d8:5"], "attn-1": [b"d8:2"]}
     assert conn._wait_counts(b"d8:", [1, 2]) == {1: (5, None), 2: (2, None)}
+
+
+def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch):
+    # The connector's own combine path with a host-memory NIXL stand-in: two
+    # FFN ranks stage their compressed rows (send_ffn_output, _post_combine,
+    # _write_spans) into two Attention ranks' result regions, which gather and
+    # rebuild them (recv_ffn_output). Each Attention rank must get, in its
+    # dispatch order, exactly what every FFN rank compressed.
+    pytest.importorskip("nixl")
+    from afd_plugin.connectors.gpu import nixl_routed
+    from afd_plugin.connectors.gpu.routed import RoutedTransferState
+    from afd_plugin.delta_dispatch import (
+        AttentionDeltaState,
+        CombineConfig,
+        DeltaDispatchConfig,
+        FFNDeltaState,
+    )
+
+    class _Event:
+        def record(self, stream=None):
+            pass
+
+        def query(self):
+            return True
+
+    monkeypatch.setattr(nixl_routed.torch.cuda, "Event", _Event)
+    monkeypatch.setattr(
+        nixl_routed.torch.cuda, "current_stream", lambda device=None: None
+    )
+    num_ffn, num_attn, max_tokens, tokens = 2, 2, 4, 3
+    cfg = DeltaDispatchConfig(mode="full_bf16")
+    combine = CombineConfig(mode="int4")
+    gen = torch.Generator().manual_seed(12)
+    attn, ffn, plans, states = [], [], [], []
+    for a in range(num_attn):
+        conn = _host_connector(nixl_routed, role_rank=a, max_tokens=max_tokens)
+        conn.is_ffn, conn.device = False, torch.device("cpu")
+        conn.ffn_size, conn.attn_size = num_ffn, num_attn
+        conn.delta_dispatch, conn.combine = cfg, combine
+        conn.engine = P2pAll2AllEngine(
+            None, num_ffn + a, num_ffn + num_attn, 2, max_tokens, "cpu"
+        )
+        conn._results = torch.zeros(num_ffn * max_tokens, HIDDEN, dtype=torch.bfloat16)
+        conn._peer_agents = {f: f"ffn-{f}" for f in range(num_ffn)}
+        ids = torch.stack([torch.randperm(4, generator=gen)[:2] for _ in range(tokens)])
+        pending = conn.engine.begin_plan(ids)
+        state = AttentionDeltaState(
+            cfg, MOE_LAYERS, SCALE, num_ffn, max_tokens, HIDDEN, combine
+        )
+        packed = state.prepare(MOE_LAYERS[0], 0, pending.order, tokens)
+        plan = conn.engine.finish_plan_local(pending)
+        conn._nixl_pending = {0: plan}
+        conn._delta_pending = {0: (state, packed, plan.num_send)}
+        attn.append(conn)
+        plans.append(plan)
+        states.append(state)
+    for f in range(num_ffn):
+        conn = _host_connector(nixl_routed, role_rank=f, max_tokens=max_tokens)
+        conn.is_ffn, conn.device = True, torch.device("cpu")
+        conn.ffn_size, conn.attn_size, conn.combine = num_ffn, num_attn, combine
+        conn._results = torch.zeros(num_attn * max_tokens, HIDDEN, dtype=torch.bfloat16)
+        conn._slot_consumed = {}
+        conn._peer_agents = {num_ffn + a: f"attn-{a}" for a in range(num_attn)}
+        conn._peer_regions = {
+            num_ffn + a: [(attn[a]._results.data_ptr(), HIDDEN * 2)]
+            for a in range(num_attn)
+        }
+        # Rows received from each Attention rank, Attention rank major.
+        counts = [plans[a].send_counts[f] for a in range(num_attn)]
+        starts = [sum(plans[a].send_counts[:f]) for a in range(num_attn)]
+        rows = torch.cat(
+            [
+                a * max_tokens + plans[a].perm[starts[a] : starts[a] + counts[a]]
+                for a in range(num_attn)
+            ]
+        )
+        delta = FFNDeltaState(
+            cfg, MOE_LAYERS, SCALE, HIDDEN, num_attn, max_tokens, combine
+        )
+        delta._rows[0] = rows
+        launch = rows.numel() + 2  # fixed-size launch: two padding rows
+        partial = torch.randn(launch, HIDDEN, generator=gen).to(torch.bfloat16)
+        delta.after_experts(0, partial)
+        conn._ffn_model = SimpleNamespace(model=SimpleNamespace(ffn_delta=delta))
+        engine = P2pAll2AllEngine(None, f, num_ffn + num_attn, 2, max_tokens, "cpu")
+        plan = engine.recv_plan(0, 0, [0] * num_ffn + counts)
+        conn.send_ffn_output(
+            partial, SimpleNamespace(states=RoutedTransferState(plan=plan, stream=None))
+        )
+        assert not conn._pending_combines
+        for peer, notif in conn.agent.posted:
+            a = int(peer.split("-")[1])
+            attn[a].agent.inbox.setdefault(f"ffn-{f}", []).append(notif)
+        ffn.append((rows, delta._deq[0][: rows.numel()].clone()))
+    for a, conn in enumerate(attn):
+        out = conn.recv_ffn_output(torch.zeros(tokens, HIDDEN), 0)
+        # What every FFN rank compressed for this Attention rank, in the
+        # dispatch order (FFN rank major, token order), rebuilt bit for bit.
+        want = torch.cat([deq[rows // max_tokens == a] for rows, deq in ffn])
+        assert want.shape[0] == plans[a].num_send
+        assert torch.equal(states[a]._back[0][: want.shape[0]], want)
+        summed = torch.zeros(tokens, HIDDEN)
+        summed.index_add_(0, plans[a].perm, want.to(torch.bfloat16).float())
+        torch.testing.assert_close(out.float(), summed, rtol=0.01, atol=0.02)
+        assert conn._delta_pending == {} and conn._nixl_pending == {}
