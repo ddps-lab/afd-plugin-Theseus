@@ -725,7 +725,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # WRITEs of the other stages keep completing), copies its own per-FFN
         # counts and never hands the CPU away before the rows are on the
         # wire. The FFN ranks learn the counts from the notifications.
-        pending = engine.begin_plan(tensors[1], slot=stage)
+        pending = self._begin_plan(tensors[1], stage, context.metadata.layer_idx)
         planned = torch.cuda.Event()
         planned.record(stream)
         with _profile_range(f"afd_nixl.plan_wait[{stage}]"):
@@ -813,7 +813,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         engine = self.engine
         dbo_switch_to_comm_sync()
         stream = torch.cuda.current_stream(self.device)
-        pending = engine.begin_plan(ids, slot=stage)
+        pending = self._begin_plan(ids, stage, int(layer_idx))
         # Formats, byte offsets and per-FFN byte counts on the same stream,
         # before the event the host waits for anyway: the counts are in host
         # memory once it fires (no extra synchronization).

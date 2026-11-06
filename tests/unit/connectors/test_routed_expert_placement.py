@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+"""Routed connector with a per-layer expert placement (--expert-placement-file):
+the owner tables, the cross-rank digest, the config check and the plan."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("vllm")
+
+from vllm.distributed.device_communicators.p2p_nccl_all2all import (  # noqa: E402
+    P2pAll2AllEngine,
+)
+
+from afd_plugin.connectors.gpu import routed  # noqa: E402
+
+PLACEMENT = {
+    1: [[3, 0], [1, 2]],
+    2: [[2], [0, 3, 1]],
+}
+
+
+def test_owner_tables_give_each_expert_its_ffn_rank():
+    tables = routed.expert_owner_tables(PLACEMENT, 4, "cpu")
+    assert tables[1].tolist() == [0, 1, 1, 0]
+    assert tables[2].tolist() == [1, 1, 0, 1]
+    assert tables[1].dtype == torch.int64
+
+
+@pytest.mark.parametrize(
+    "layers",
+    [
+        {1: [[0, 1], [1, 2, 3]]},  # expert 1 on two ranks (a copy)
+        {1: [[0, 1], [2]]},  # expert 3 on no rank
+    ],
+)
+def test_owner_tables_reject_copies_and_missing_experts(layers):
+    with pytest.raises(RuntimeError):
+        routed.expert_owner_tables(layers, 4, "cpu")
+
+
+def test_placement_digest_follows_the_content_only():
+    same = {2: [[2], [0, 3, 1]], 1: [[3, 0], [1, 2]]}
+    other = {1: [[0, 3], [1, 2]], 2: [[2], [0, 3, 1]]}  # slot order differs
+    digest = routed.expert_placement_digest(PLACEMENT)
+    assert 0 < digest < 2**63
+    assert routed.expert_placement_digest(same) == digest
+    assert routed.expert_placement_digest(other) != digest
+
+
+def _plan_owner(owners):
+    conn = routed.P2pNcclRoutedAFDConnector.__new__(routed.P2pNcclRoutedAFDConnector)
+    # Two FFN ranks and one Attention rank (world rank 2), four experts.
+    conn.engine = P2pAll2AllEngine(None, 2, 3, 2, 4, "cpu")
+    conn._layer_owner = owners
+    conn.expert_placement_file = None if owners is None else "placement.json"
+    return conn
+
+
+def test_plan_routes_by_the_layer_table():
+    conn = _plan_owner(routed.expert_owner_tables(PLACEMENT, 4, "cpu"))
+    topk_ids = torch.tensor([[0, 1], [3, -1], [2, 3]])
+    conn._begin_plan(topk_ids, 0, 1)
+    # Layer 1: experts 0, 3 on rank 0 and 1, 2 on rank 1.
+    assert conn.engine._count_buf(0)[0].tolist() == [3, 2, 0]
+    conn._begin_plan(topk_ids, 0, 2)
+    # Layer 2: expert 2 on rank 0, the others on rank 1.
+    assert conn.engine._count_buf(0)[0].tolist() == [1, 3, 0]
+    with pytest.raises(RuntimeError, match="no MoE layer 5"):
+        conn._begin_plan(topk_ids, 0, 5)
+
+
+def test_plan_without_a_placement_routes_like_the_engine():
+    conn = _plan_owner(None)
+    topk_ids = torch.tensor([[0, 1], [3, -1], [2, 3]])
+    pending = conn._begin_plan(topk_ids, 0, None)
+    expected = P2pAll2AllEngine(None, 2, 3, 2, 4, "cpu").begin_plan(topk_ids)
+    assert torch.equal(pending.order, expected.order)
+    assert conn.engine._count_buf(0)[0].tolist() == [1, 2, 0]
+
+
+def _runtime_config(placement_file):
+    parallel = SimpleNamespace(
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        expert_placement_counts=None,
+        expert_placement_file=placement_file,
+    )
+    return SimpleNamespace(
+        parallel_config=parallel, model_config=SimpleNamespace(enforce_eager=True)
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_ranks", "num_experts", "ok"), [(2, 4, True), (3, 4, False), (2, 6, False)]
+)
+def test_runtime_check_matches_the_file_to_the_deployment(
+    monkeypatch, num_ranks, num_experts, ok
+):
+    monkeypatch.setattr(
+        routed,
+        "load_expert_placement",
+        lambda path: SimpleNamespace(num_ranks=num_ranks, num_experts=num_experts),
+    )
+    afd = SimpleNamespace(num_ffn_ranks=2, role="attention")
+    spec = SimpleNamespace(num_experts=4)
+    if ok:
+        routed._validate_routed_runtime(_runtime_config("p.json"), afd, spec)
+    else:
+        with pytest.raises(RuntimeError, match="expert placement file"):
+            routed._validate_routed_runtime(_runtime_config("p.json"), afd, spec)
+
+
+def test_runtime_check_accepts_indivisible_experts_with_a_file(monkeypatch):
+    monkeypatch.setattr(
+        routed,
+        "load_expert_placement",
+        lambda path: SimpleNamespace(num_ranks=2, num_experts=5),
+    )
+    afd = SimpleNamespace(num_ffn_ranks=2, role="attention")
+    spec = SimpleNamespace(num_experts=5)
+    routed._validate_routed_runtime(_runtime_config("p.json"), afd, spec)
+    with pytest.raises(RuntimeError, match="divisible"):
+        routed._validate_routed_runtime(_runtime_config(None), afd, spec)
