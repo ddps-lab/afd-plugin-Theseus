@@ -37,6 +37,7 @@ from vllm.distributed.device_communicators.p2p_nccl_all2all import (  # noqa: E4
 from vllm.model_executor.layers.layernorm import RMSNorm  # noqa: E402
 
 from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.connectors.gpu import routed as routed_connector  # noqa: E402
 from afd_plugin.delta_dispatch import (  # noqa: E402
     D_INT4,
     D_INT8,
@@ -127,17 +128,23 @@ def _expert(x: torch.Tensor, expert: int) -> torch.Tensor:
 
 
 class _FFNLayer(nn.Module):
-    """FFN rank ``ffn`` of ``num_ffn``: owns experts ``ffn * E/F`` onwards
-    (the plan's contiguous placement); records its experts' inputs."""
+    """FFN rank ``ffn`` of ``num_ffn``: owns the experts ``owner`` gives it
+    (default: ``ffn * E/F`` onwards, the plan's contiguous placement); records
+    its experts' inputs."""
 
-    def __init__(self, layer_idx: int, ffn: int, num_ffn: int) -> None:
+    def __init__(
+        self, layer_idx: int, ffn: int, num_ffn: int, owner: torch.Tensor | None
+    ) -> None:
         super().__init__()
         if layer_idx in MOE_LAYERS:
             self.mlp = _routed_shell(adapter.AFDDeepseekV2RoutedFFNMoE, layer_idx)
         else:
             self.mlp = nn.Identity()
         self.post_attention_layernorm = RMSNorm(HIDDEN, eps=EPS)
-        self.ffn, self.local = ffn, NUM_EXPERTS // num_ffn
+        self.ffn = ffn
+        if owner is None:
+            owner = torch.arange(NUM_EXPERTS) // (NUM_EXPERTS // num_ffn)
+        self.owner = owner
         self.inputs: list[torch.Tensor] = []
 
     def compute_routed_experts_output(
@@ -148,9 +155,11 @@ class _FFNLayer(nn.Module):
         self.inputs.append(x[:real].clone())
         out = torch.zeros(x.shape[0], HIDDEN)
         for r in range(real):
+            # The plan sends a row only to the ranks owning its experts.
+            assert any(int(self.owner[e]) == self.ffn for e in topk_ids[r].tolist())
             for k in range(TOP_K):
                 e = int(topk_ids[r, k])
-                if e // self.local == self.ffn:
+                if int(self.owner[e]) == self.ffn:
                     out[r] += topk_weights[r, k] * _expert(x[r], e)
         return out.to(x.dtype)
 
@@ -171,11 +180,14 @@ def _model(
     num_ffn: int = 1,
     ffn: int = 0,
     connector: str = "NixlRoutedAFDConnector",
+    owners: dict[int, torch.Tensor] | None = None,
 ):
     """The parts of AFDDeepseekV2Model the delta wiring and the FFN compute use."""
     vllm_config = _vllm_config(delta)
     layers = [
-        _AttnLayer(idx) if role == "attention" else _FFNLayer(idx, ffn, num_ffn)
+        _AttnLayer(idx)
+        if role == "attention"
+        else _FFNLayer(idx, ffn, num_ffn, None if owners is None else owners.get(idx))
         for idx in range(LAYERS)
     ]
     model = SimpleNamespace(
@@ -200,14 +212,17 @@ def _model(
 class _Loopback:
     """The NIXL connector's steps between the ranks (``_send_attn_delta``,
     ``_complete_prefetch``, ``recv_attn_output``, ``recv_ffn_output``) on the
-    real dispatch plan, handing each FFN model its rows."""
+    real dispatch plan, handing each FFN model its rows. The plan starts with
+    the connector's own ``_begin_plan`` (per-layer expert placement)."""
 
-    def __init__(self, cfg, ffns, ctx) -> None:
+    def __init__(self, cfg, ffns, ctx, owners=None) -> None:
         self.delta_dispatch, self.ffns, self.ctx = cfg, ffns, ctx
         num_ffn = len(ffns)
         self.engine = P2pAll2AllEngine(
             None, num_ffn, num_ffn + 1, NUM_EXPERTS // num_ffn, TOKENS, "cpu"
         )
+        self.expert_placement_file = None if owners is None else "test"
+        self._layer_owner = owners
         self.sent: list[dict] = []
 
     def quantize_for_dispatch(self, hidden_states):
@@ -228,7 +243,9 @@ class _Loopback:
         cfg = self.delta_dispatch
         stage = context.metadata.stage_idx
         assert self.ctx.afd.stage_idx == stage
-        pending = self.engine.begin_plan(topk_ids, slot=stage)
+        pending = routed_connector.P2pNcclRoutedAFDConnector._begin_plan(
+            self, topk_ids, stage, context.metadata.layer_idx
+        )
         packed = None
         if cfg.enabled:
             packed = delta.prepare(layer_idx, stage, pending.order, pending.num_tokens)
@@ -296,12 +313,25 @@ class _Router:
         return weights, ids.to(topk_indices_dtype)
 
 
-def _run(delta: dict | None, ctx, stages: int, num_ffn: int) -> dict:
+def _run(
+    delta: dict | None,
+    ctx,
+    stages: int,
+    num_ffn: int,
+    placement: dict[int, list[list[int]]] | None = None,
+) -> dict:
     """One forward over the MoE layers, ``stages`` micro-batches interleaved
     per layer like the pipeline; returns what every FFN rank's experts saw,
-    the final hidden states, the dispatched rows and the models."""
+    the final hidden states, the dispatched rows and the models. With
+    ``placement`` (per MoE layer, the experts of each FFN rank) the plan and
+    the FFN ranks follow it."""
+    owners = (
+        None
+        if placement is None
+        else routed_connector.expert_owner_tables(placement, NUM_EXPERTS, "cpu")
+    )
     attn, cfg = _model("attention", delta, num_ffn)
-    ffns = [_model("ffn", delta, num_ffn, f)[0] for f in range(num_ffn)]
+    ffns = [_model("ffn", delta, num_ffn, f, owners=owners)[0] for f in range(num_ffn)]
     gen = torch.Generator().manual_seed(0)
     # Same loaded norm weights on all ranks (the norm is a both-roles weight).
     for idx in range(LAYERS):
@@ -309,7 +339,7 @@ def _run(delta: dict | None, ctx, stages: int, num_ffn: int) -> dict:
         with torch.no_grad():
             for model in (attn, *ffns):
                 model.layers[idx].post_attention_layernorm.weight.copy_(weight)
-    wire = _Loopback(cfg, ffns, ctx)
+    wire = _Loopback(cfg, ffns, ctx, owners)
     ctx.afd.connector = wire
     router = _Router(gen)
     residual = [
@@ -441,6 +471,66 @@ def test_x_int4_sends_the_plainly_quantized_x(cpu_config, context):
         got = torch.cat(by_layer[item["layer"]])
         assert torch.equal(got, want)
     assert next(inputs, None) is not None
+
+
+def _shuffled_placement(num_ffn: int, seed: int = 3) -> dict[int, list[list[int]]]:
+    """Per MoE layer its own expert -> FFN rank split (E/F experts each)."""
+    gen = torch.Generator().manual_seed(seed)
+    per = NUM_EXPERTS // num_ffn
+    placement = {}
+    for layer in MOE_LAYERS:
+        perm = torch.randperm(NUM_EXPERTS, generator=gen).tolist()
+        placement[layer] = [
+            sorted(perm[r * per : (r + 1) * per]) for r in range(num_ffn)
+        ]
+    return placement
+
+
+def test_contiguous_placement_table_routes_like_the_default(cpu_config, context):
+    per = NUM_EXPERTS // 4
+    contiguous = {
+        layer: [list(range(r * per, (r + 1) * per)) for r in range(4)]
+        for layer in MOE_LAYERS
+    }
+    for delta in (None, {"mode": "delta_int4"}):
+        default = _run(delta, context, 2, 4)
+        table = _run(delta, context, 2, 4, contiguous)
+        for a, b in zip(table["inputs"], default["inputs"], strict=True):
+            assert torch.equal(a, b)
+        for a, b in zip(table["hidden"], default["hidden"], strict=True):
+            assert torch.equal(a, b)
+        assert [s["bytes"] for s in table["sent"]] == [
+            s["bytes"] for s in default["sent"]
+        ]
+
+
+@pytest.mark.parametrize("mode", ["full_bf16", "delta_fp32"])
+def test_per_layer_placement_uncompressed_modes_reproduce_off(
+    cpu_config, context, mode
+):
+    placement = _shuffled_placement(4)
+    off = _run(None, context, 2, 4, placement)
+    on = _run({"mode": mode}, context, 2, 4, placement)
+    # The rows follow the placement (each FFN rank checks it owns one of the
+    # row's experts), and the delta path gives every rank the off path's x.
+    assert len(on["inputs"]) == len(off["inputs"])
+    for x_on, x_off in zip(on["inputs"], off["inputs"], strict=True):
+        assert torch.equal(x_on, x_off)
+    for h_on, h_off in zip(on["hidden"], off["hidden"], strict=True):
+        assert torch.equal(h_on, h_off)
+
+
+def test_per_layer_placement_keeps_both_int4_states_identical(cpu_config, context):
+    placement = _shuffled_placement(4)
+    delta = {"mode": "delta_int4", "early": 1, "late": 1, "revisit": "int8"}
+    on = _run(delta, context, 2, 4, placement)
+    attn_state = on["attn"].layers[MOE_LAYERS[0]].mlp.experts.delta._state
+    for f, model in enumerate(on["ffns"]):
+        for stage in range(2):
+            assert torch.equal(
+                model.ffn_delta._state[stage][:TOKENS],
+                attn_state[stage][f * TOKENS : (f + 1) * TOKENS],
+            )
 
 
 def test_delta_dispatch_needs_the_routed_connector(cpu_config, context):
