@@ -903,7 +903,8 @@ def test_nixl_dispatch_notification_carries_the_byte_count():
     assert conn._wait_counts(b"d8:", [1, 2]) == {1: (5, None), 2: (2, None)}
 
 
-def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch):
+@pytest.mark.parametrize("mode,stage", [("full_bf16", 0), ("delta_fp32", 1)])
+def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch, mode, stage):
     # The connector's own combine path with a host-memory NIXL stand-in: two
     # FFN ranks stage their compressed rows (send_ffn_output, _post_combine,
     # _write_spans) into two Attention ranks' result regions, which gather and
@@ -930,8 +931,8 @@ def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch):
     monkeypatch.setattr(
         nixl_routed.torch.cuda, "current_stream", lambda device=None: None
     )
-    num_ffn, num_attn, max_tokens, tokens = 2, 2, 4, 3
-    cfg = DeltaDispatchConfig(mode="full_bf16")
+    num_ffn, num_attn, max_tokens, tokens, slots = 2, 2, 4, 3, 2
+    cfg = DeltaDispatchConfig(mode=mode)
     combine = CombineConfig(mode="int4")
     gen = torch.Generator().manual_seed(12)
     attn, ffn, plans, states = [], [], [], []
@@ -943,17 +944,19 @@ def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch):
         conn.engine = P2pAll2AllEngine(
             None, num_ffn + a, num_ffn + num_attn, 2, max_tokens, "cpu"
         )
-        conn._results = torch.zeros(num_ffn * max_tokens, HIDDEN, dtype=torch.bfloat16)
+        conn._results = torch.zeros(
+            slots * num_ffn * max_tokens, HIDDEN, dtype=torch.bfloat16
+        )
         conn._peer_agents = {f: f"ffn-{f}" for f in range(num_ffn)}
         ids = torch.stack([torch.randperm(4, generator=gen)[:2] for _ in range(tokens)])
-        pending = conn.engine.begin_plan(ids)
+        pending = conn.engine.begin_plan(ids, slot=stage)
         state = AttentionDeltaState(
             cfg, MOE_LAYERS, SCALE, num_ffn, max_tokens, HIDDEN, combine
         )
-        packed = state.prepare(MOE_LAYERS[0], 0, pending.order, tokens)
+        packed = state.prepare(MOE_LAYERS[0], stage, pending.order, tokens)
         plan = conn.engine.finish_plan_local(pending)
-        conn._nixl_pending = {0: plan}
-        conn._delta_pending = {0: (state, packed, plan.num_send)}
+        conn._nixl_pending = {stage: plan}
+        conn._delta_pending = {stage: (state, packed, plan.num_send)}
         attn.append(conn)
         plans.append(plan)
         states.append(state)
@@ -961,7 +964,9 @@ def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch):
         conn = _host_connector(nixl_routed, role_rank=f, max_tokens=max_tokens)
         conn.is_ffn, conn.device = True, torch.device("cpu")
         conn.ffn_size, conn.attn_size, conn.combine = num_ffn, num_attn, combine
-        conn._results = torch.zeros(num_attn * max_tokens, HIDDEN, dtype=torch.bfloat16)
+        conn._results = torch.zeros(
+            slots * num_attn * max_tokens, HIDDEN, dtype=torch.bfloat16
+        )
         conn._slot_consumed = {}
         conn._peer_agents = {num_ffn + a: f"attn-{a}" for a in range(num_attn)}
         conn._peer_regions = {
@@ -980,13 +985,15 @@ def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch):
         delta = FFNDeltaState(
             cfg, MOE_LAYERS, SCALE, HIDDEN, num_attn, max_tokens, combine
         )
-        delta._rows[0] = rows
+        delta._rows[stage] = rows
+        if cfg.stateful:
+            delta._state[stage] = torch.zeros(num_attn * max_tokens, HIDDEN)
         launch = rows.numel() + 2  # fixed-size launch: two padding rows
         partial = torch.randn(launch, HIDDEN, generator=gen).to(torch.bfloat16)
-        delta.after_experts(0, partial)
+        delta.after_experts(stage, partial)
         conn._ffn_model = SimpleNamespace(model=SimpleNamespace(ffn_delta=delta))
         engine = P2pAll2AllEngine(None, f, num_ffn + num_attn, 2, max_tokens, "cpu")
-        plan = engine.recv_plan(0, 0, [0] * num_ffn + counts)
+        plan = engine.recv_plan(stage, 0, [0] * num_ffn + counts)
         conn.send_ffn_output(
             partial, SimpleNamespace(states=RoutedTransferState(plan=plan, stream=None))
         )
@@ -994,15 +1001,25 @@ def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch):
         for peer, notif in conn.agent.posted:
             a = int(peer.split("-")[1])
             attn[a].agent.inbox.setdefault(f"ffn-{f}", []).append(notif)
-        ffn.append((rows, delta._deq[0][: rows.numel()].clone()))
+        ffn.append((rows, delta._deq[stage][: rows.numel()].clone(), delta))
     for a, conn in enumerate(attn):
-        out = conn.recv_ffn_output(torch.zeros(tokens, HIDDEN), 0)
+        out = conn.recv_ffn_output(torch.zeros(tokens, HIDDEN), stage)
         # What every FFN rank compressed for this Attention rank, in the
         # dispatch order (FFN rank major, token order), rebuilt bit for bit.
-        want = torch.cat([deq[rows // max_tokens == a] for rows, deq in ffn])
+        want = torch.cat([deq[rows // max_tokens == a] for rows, deq, _ in ffn])
         assert want.shape[0] == plans[a].num_send
-        assert torch.equal(states[a]._back[0][: want.shape[0]], want)
+        assert torch.equal(states[a]._back[stage][: want.shape[0]], want)
         summed = torch.zeros(tokens, HIDDEN)
         summed.index_add_(0, plans[a].perm, want.to(torch.bfloat16).float())
         torch.testing.assert_close(out.float(), summed, rtol=0.01, atol=0.02)
         assert conn._delta_pending == {} and conn._nixl_pending == {}
+        if cfg.stateful:
+            # Both sides added the received values: attention's copy of every
+            # FFN rank's states equals that rank's states.
+            for f, (_, _, delta) in enumerate(ffn):
+                # Attention rows: FFN rank * tokens + token; FFN rows:
+                # Attention rank * max_tokens + token.
+                assert torch.equal(
+                    states[a]._state[stage][f * tokens : (f + 1) * tokens],
+                    delta._state[stage][a * max_tokens : a * max_tokens + tokens],
+                )

@@ -140,9 +140,9 @@ def test_home_must_hold_its_expert():
 
 
 def test_too_many_ranks_are_refused():
-    layers = {1: [[e] for e in range(11)]}
-    with pytest.raises(ValueError, match="more than"):
-        CopyRouter(layers, None, 11, 11, 1, 4, 1, "cpu")
+    layers = {1: [[e] for e in range(9)]}
+    with pytest.raises(ValueError, match="more than 8"):
+        CopyRouter(layers, None, 9, 9, 1, 4, 1, "cpu")
 
 
 def test_mask_replaces_other_ranks_experts_by_an_absent_one():

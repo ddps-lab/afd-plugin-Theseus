@@ -53,6 +53,29 @@ def test_placement_digest_follows_the_content_only():
     assert routed.expert_placement_digest(other) != digest
 
 
+def test_settings_digest_tells_configs_apart():
+    from afd_plugin.delta_dispatch import CombineConfig, DeltaDispatchConfig
+
+    base = routed.wire_settings_digest(DeltaDispatchConfig(), CombineConfig())
+    assert 0 < base < 2**63
+    assert base == routed.wire_settings_digest(DeltaDispatchConfig(), CombineConfig())
+    others = {
+        routed.wire_settings_digest(
+            DeltaDispatchConfig(mode="delta_int4"), CombineConfig()
+        ),
+        routed.wire_settings_digest(
+            DeltaDispatchConfig(mode="delta_int4"), CombineConfig(mode="int4")
+        ),
+        routed.wire_settings_digest(
+            DeltaDispatchConfig(mode="delta_int4"), CombineConfig(mode="int4", ef=False)
+        ),
+        routed.wire_settings_digest(
+            DeltaDispatchConfig(mode="delta_int4", late=1), CombineConfig()
+        ),
+    }
+    assert base not in others and len(others) == 4
+
+
 def _plan_owner(owners, router=None):
     conn = routed.P2pNcclRoutedAFDConnector.__new__(routed.P2pNcclRoutedAFDConnector)
     # Two FFN ranks and one Attention rank (world rank 2), four experts.
