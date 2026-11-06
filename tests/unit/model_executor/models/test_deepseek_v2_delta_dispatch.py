@@ -39,9 +39,11 @@ from vllm.model_executor.layers.layernorm import RMSNorm  # noqa: E402
 from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.connectors.gpu import routed as routed_connector  # noqa: E402
 from afd_plugin.delta_dispatch import (  # noqa: E402
+    D_INT3,
     D_INT4,
     D_INT8,
     H_BF16,
+    H_INT4,
     QUANT_GROUP_SIZE,
     row_bytes,
 )
@@ -476,11 +478,30 @@ def test_off_mode_keeps_native_modules(cpu_config, context):
 
 
 @pytest.mark.parametrize("stages", [1, 2])
-@pytest.mark.parametrize("num_ffn,revisit", [(1, "int4"), (4, "int4"), (4, "int8")])
-def test_int4_rows_keep_both_states_identical(
-    cpu_config, context, stages, num_ffn, revisit
+@pytest.mark.parametrize(
+    "num_ffn,mode,first,revisit",
+    [
+        (1, "delta_int4", "bf16", "int4"),
+        (4, "delta_int4", "bf16", "int4"),
+        (4, "delta_int4", "bf16", "int8"),
+        (4, "delta_int4", "int4", "int8"),
+        (1, "delta_int3", "int4", "int4"),
+        (4, "delta_int3", "bf16", "int3"),
+        (4, "delta_int3", "int4", "int4"),
+    ],
+)
+def test_quantized_rows_keep_both_states_identical(
+    cpu_config, context, stages, num_ffn, mode, first, revisit
 ):
-    delta = {"mode": "delta_int4", "early": 2, "late": 1, "revisit": revisit}
+    delta = {
+        "mode": mode,
+        "early": 2,
+        "late": 1,
+        "revisit": revisit,
+        "first": first,
+    }
+    first_code = {"bf16": H_BF16, "int4": H_INT4}[first]
+    own = {"delta_int4": D_INT4, "delta_int3": D_INT3}[mode]
     on = _run(delta, context, stages, num_ffn)
     attn_layers = on["attn"].layers
     proxies = [attn_layers[idx].mlp.experts for idx in MOE_LAYERS]
@@ -500,22 +521,23 @@ def test_int4_rows_keep_both_states_identical(
                 model.ffn_delta._state[stage][:TOKENS],
                 attn_state[stage][f * TOKENS : (f + 1) * TOKENS],
             )
-    # Formats: first MoE layer h' bf16; early (2 first) and late (last) MoE
-    # layers d_int8; with several FFN ranks also first visits and revisits.
+    # Formats: first MoE layer h' (bf16 or int4); early (2 first) and late
+    # (last) MoE layers d_int8; else the mode's own; with several FFN ranks
+    # also first visits and revisits.
     for sent in on["sent"]:
         pos = MOE_LAYERS.index(sent["layer"])
         codes = set(sent["codes"])
         if pos == 0:
-            assert codes == {H_BF16}
+            assert codes == {first_code}
         elif pos < 2 or pos == len(MOE_LAYERS) - 1:
-            assert codes <= {H_BF16, D_INT8}
+            assert codes <= {first_code, D_INT8}
         elif num_ffn == 1:
-            assert codes == {D_INT4}
+            assert codes == {own}
         sizes = [row_bytes(c, HIDDEN) for c in sent["codes"]]
         assert sum(sent["bytes"]) == sum(sizes)
     all_codes = {c for sent in on["sent"] for c in sent["codes"]}
     if num_ffn == 4:
-        assert H_BF16 in all_codes and D_INT4 in all_codes
+        assert {first_code, own, D_INT8} <= all_codes
 
 
 def test_x_int4_sends_the_plainly_quantized_x(cpu_config, context):
@@ -901,6 +923,52 @@ def test_nixl_dispatch_notification_carries_the_byte_count():
     assert conn._wait_counts(b"d7:", [1, 2]) == {1: (3, 5248), 2: (0, 0)}
     conn.agent.inbox = {"attn-0": [b"d8:5"], "attn-1": [b"d8:2"]}
     assert conn._wait_counts(b"d8:", [1, 2]) == {1: (5, None), 2: (2, None)}
+
+
+@pytest.mark.parametrize(
+    "rows,nbytes,fits",
+    [
+        (3, 3 * 832, True),
+        (3, 3 * 1088, True),
+        (3, 2 * 832 + 1088, True),
+        (3, 3 * 832 - 1, False),
+        (3, 3 * 1088 + 1, False),
+        (3, 3 * 4096, False),
+        (0, 0, True),
+        (0, 832, False),
+    ],
+)
+def test_nixl_byte_counts_must_fit_the_row_formats(rows, nbytes, fits):
+    # delta_int3 with int4 first visits: every row is 832 (d_int3) or 1088
+    # (h_int4) bytes at hidden 2048, so an Attention rank's byte count must
+    # lie between rows * 832 and rows * 1088 (checked before the plan).
+    pytest.importorskip("nixl")
+    from afd_plugin.connectors.gpu import nixl_routed
+    from afd_plugin.delta_dispatch import DeltaDispatchConfig
+
+    class _PlanReachedError(Exception):
+        pass
+
+    def recv_plan(*args):
+        raise _PlanReachedError
+
+    conn = _host_connector(nixl_routed, role_rank=0, max_tokens=8)
+    conn.ffn_size, conn.attn_size = 1, 2
+    conn.delta_dispatch = DeltaDispatchConfig(mode="delta_int3", first="int4")
+    conn.spec = SimpleNamespace(hidden_size=2048)
+    conn.engine = SimpleNamespace(next_plan_seq=lambda: 7, recv_plan=recv_plan)
+    conn._peer_agents = {1: "attn-0", 2: "attn-1"}
+    conn.agent.inbox = {
+        "attn-0": [f"d7:{rows}:{nbytes}".encode()],
+        "attn-1": [b"d7:1:832"],
+    }
+    prefetch = nixl_routed.NixlPrefetch(stage=0, stream=None)
+    if fits:
+        with pytest.raises(_PlanReachedError):
+            conn._complete_prefetch(prefetch)
+    else:
+        with pytest.raises(RuntimeError, match="cannot be delta_int3 rows"):
+            conn._complete_prefetch(prefetch)
 
 
 @pytest.mark.parametrize("mode,stage", [("full_bf16", 0), ("delta_fp32", 1)])
