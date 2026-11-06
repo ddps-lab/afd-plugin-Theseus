@@ -126,7 +126,12 @@ from afd_plugin.connectors.metadata import (
     recv_control_payload,
     send_control_payload,
 )
-from afd_plugin.delta_dispatch import CombineConfig, DeltaDispatchConfig
+from afd_plugin.delta_dispatch import (
+    CODE_FORMATS,
+    CODE_SHIFT,
+    CombineConfig,
+    DeltaDispatchConfig,
+)
 from afd_plugin.distributed import init_afd_process_group
 from afd_plugin.expert_copies import CopyRouter, mask_other_ranks, placement_has_copies
 
@@ -456,9 +461,10 @@ def expert_placement_digest(
 
 
 def wire_settings_digest(delta: DeltaDispatchConfig, combine: CombineConfig) -> int:
-    """A nonzero 63-bit digest of the delta dispatch and combine settings,
-    compared across ranks at init (both sides must encode and decode alike)."""
-    text = json.dumps([repr(delta), repr(combine)])
+    """A nonzero 63-bit digest of the delta dispatch and combine settings and
+    of the row formats and word layout, compared across ranks at init (both
+    sides must encode and decode alike, also when built from different code)."""
+    text = json.dumps([repr(delta), repr(combine), CODE_FORMATS, CODE_SHIFT])
     digest = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big") >> 1
     return digest or 1
 
