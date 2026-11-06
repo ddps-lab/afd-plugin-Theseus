@@ -1089,11 +1089,14 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         if afd_metadata is None:
             raise RuntimeError("delta dispatch needs the stage of the received rows")
         stage = int(afd_metadata.stage_idx)
+        norm = layer.post_attention_layernorm
         x = self.ffn_delta.decode_dispatch(
             layer_idx,
             stage,
             hidden_states,
-            layer.post_attention_layernorm,
+            # The layer's own norm module, so the FFN side normalizes with the
+            # same kernel as the Attention side.
+            lambda out, h: out.copy_(norm(h)),
             out_rows=int(topk_ids.shape[0]),
             dtype=self.vllm_config.model_config.dtype,
         )
