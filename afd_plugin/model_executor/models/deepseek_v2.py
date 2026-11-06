@@ -26,15 +26,21 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models import deepseek_v2 as native
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
+from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
     AFDTransferContext,
     AFDTransferMetadata,
 )
+from afd_plugin.delta_dispatch import (
+    AttentionDeltaState,
+    DeltaDispatchConfig,
+    FFNDeltaState,
+)
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.routed_moe import (
+    ResidualRecordingRMSNorm,
     RoutedExpertsProxy,
     is_routed_afd,
     routed_moe_forward,
@@ -700,9 +706,24 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         self.input_layernorm = native.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = native.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        # ### PATCH START: delta dispatch records h' for the routed proxy.
+        if (
+            afd_role == "attention"
+            and isinstance(self.mlp, AFDDeepseekV2RoutedAttentionMoE)
+            and DeltaDispatchConfig.from_extra_config(
+                afd_config.connector_extra_config
+            ).enabled
+        ):
+            self.post_attention_layernorm = ResidualRecordingRMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                record=self.mlp.experts.record_h_prime,
+            )
+        else:
+            self.post_attention_layernorm = native.RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+        # ### PATCH END
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
     def compute_attn_output(
@@ -948,6 +969,52 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
+        # ### PATCH START: delta dispatch states (one FFN rank).
+        self.ffn_delta: FFNDeltaState | None = None
+        delta = DeltaDispatchConfig.from_extra_config(afd_config.connector_extra_config)
+        if delta.enabled:
+            self._init_delta_dispatch(delta, vllm_config, afd_config)
+        # ### PATCH END
+
+    def _init_delta_dispatch(
+        self,
+        delta: DeltaDispatchConfig,
+        vllm_config: VllmConfig,
+        afd_config: AFDConfig,
+    ) -> None:
+        """Wire the delta dispatch states into the routed MoE layers.
+
+        The Attention side shares one ``AttentionDeltaState`` between the
+        layers' proxies; the FFN side keeps one ``FFNDeltaState`` used by
+        ``compute_routed_experts_output``. Both list the same routed layers.
+        """
+        if not is_routed_afd(afd_config) or int(afd_config.num_ffn_ranks) != 1:
+            raise ValueError(
+                "delta dispatch needs the routed connector and one FFN rank"
+            )
+        if vllm_config.model_config.dtype != torch.bfloat16:
+            raise ValueError("delta dispatch needs a bf16 model")
+        if get_tensor_model_parallel_world_size() != 1:
+            raise ValueError("delta dispatch needs tensor parallel size 1")
+        if not vllm_config.model_config.enforce_eager:
+            raise ValueError("delta dispatch needs --enforce-eager")
+        routed_cls = (
+            AFDDeepseekV2RoutedAttentionMoE
+            if afd_config.role == "attention"
+            else AFDDeepseekV2RoutedFFNMoE
+        )
+        layers = [
+            idx
+            for idx in range(self.start_layer, self.end_layer)
+            if isinstance(self.layers[idx].mlp, routed_cls)
+        ]
+        scale = getattr(self.config, "routed_scaling_factor", 1.0)
+        if afd_config.role == "attention":
+            state = AttentionDeltaState(delta, layers, scale)
+            for idx in layers:
+                self.layers[idx].mlp.experts.delta = state
+        else:
+            self.ffn_delta = FFNDeltaState(delta, layers, scale, self.hidden_size)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1008,12 +1075,36 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         topk_ids: torch.Tensor,
         a1q_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.layers[layer_idx].compute_routed_experts_output(
+        layer = self.layers[layer_idx]
+        if self.ffn_delta is None:
+            return layer.compute_routed_experts_output(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                a1q_scale=a1q_scale,
+            )
+        # Delta dispatch: rebuild h' from the received rows and normalize it
+        # here, then run the experts as for x rows; keep the partial sum.
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if afd_metadata is None:
+            raise RuntimeError("delta dispatch needs the stage of the received rows")
+        stage = int(afd_metadata.stage_idx)
+        x = self.ffn_delta.decode_dispatch(
+            layer_idx,
+            stage,
             hidden_states,
+            layer.post_attention_layernorm,
+            out_rows=int(topk_ids.shape[0]),
+            dtype=self.vllm_config.model_config.dtype,
+        )
+        output = layer.compute_routed_experts_output(
+            x,
             topk_weights,
             topk_ids,
             a1q_scale=a1q_scale,
         )
+        self.ffn_delta.after_experts(layer_idx, stage, output)
+        return output
 
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(
