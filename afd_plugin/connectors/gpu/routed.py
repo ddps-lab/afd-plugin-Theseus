@@ -126,7 +126,7 @@ from afd_plugin.connectors.metadata import (
     recv_control_payload,
     send_control_payload,
 )
-from afd_plugin.delta_dispatch import DeltaDispatchConfig
+from afd_plugin.delta_dispatch import CombineConfig, DeltaDispatchConfig
 from afd_plugin.distributed import init_afd_process_group
 from afd_plugin.expert_copies import CopyRouter, mask_other_ranks, placement_has_copies
 
@@ -603,6 +603,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         # Delta dispatch (afd_plugin/delta_dispatch.py); only the NIXL
         # connector accepts it in connector_extra_config, so it is off here.
         self.delta_dispatch = DeltaDispatchConfig.from_vllm_config(vllm_config)
+        self.combine = CombineConfig.from_vllm_config(vllm_config)
         self._ffn_model: Any | None = None
         self.num_local_experts = self.spec.num_experts // self.ffn_size
         # Experts per FFN rank when the placement is uneven (None: even).

@@ -53,6 +53,19 @@ Codes by mode (``connector_extra_config = {"delta_dispatch": {...}}``):
 * ``x_int4``: no state: every row is ``x = Norm(h')`` in int4 and the FFN rank
   uses the dequantized ``x`` as is (plain quantization, the baseline).
 
+Combine compression (``connector_extra_config = {"combine": {"mode": ...,
+"ef": ...}}``, needs delta dispatch for the rows' tokens): each FFN rank
+returns its partial sum of a row quantized like the int formats above
+(``int8`` or ``int4``, every row the same size). With ``ef`` (error feedback)
+it adds to the partial the residual it cut from that (Attention rank, token)
+at its previous visit in this forward and keeps the new residual:
+
+    v = partial + e,   send Q(v),   e = v - deq(Q(v))
+
+Both sides add ``deq(Q(v))``, what the Attention side received, to the FFN
+rank's state, so the states stay identical. Every forward starts with ``e``
+at zero.
+
 The fused Triton kernels (``delta_dispatch_triton.py``) run on CUDA tensors and
 the torch reference below elsewhere (unit tests). Requirements (checked by the
 callers): bf16 model, Attention TP 1, ``--enforce-eager``.
@@ -71,6 +84,8 @@ from afd_plugin.config import connector_extra_config_from_source
 MODES = ("off", "full_bf16", "delta_fp32", "delta_int4", "x_int4")
 REVISIT_FORMATS = ("int4", "int8")
 EXTRA_CONFIG_KEY = "delta_dispatch"
+COMBINE_KEY = "combine"
+COMBINE_MODES = ("off", "int8", "int4")
 H_BF16, D_FP32, D_INT8, D_INT4 = 0, 1, 2, 3
 CODE_FORMATS = ("h_bf16", "d_fp32", "d_int8", "d_int4")
 CODE_BITS = {D_INT8: 8, D_INT4: 4}
@@ -203,6 +218,54 @@ class DeltaDispatchConfig:
             "x_int4": (D_INT4,),
         }[self.mode]
         return max(row_bytes(c, hidden) for c in codes)
+
+
+@dataclass(frozen=True)
+class CombineConfig:
+    """Combine compression: ``mode`` off / int8 / int4, ``ef`` error feedback."""
+
+    mode: str = "off"
+    ef: bool = True
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any] | None) -> CombineConfig:
+        if raw is None:
+            return cls()
+        if not isinstance(raw, Mapping):
+            raise TypeError("combine must be a mapping")
+        unknown = set(raw) - {"mode", "ef"}
+        if unknown:
+            raise ValueError(f"unknown combine keys: {sorted(unknown)}")
+        mode = str(raw.get("mode", "off"))
+        if mode not in COMBINE_MODES:
+            raise ValueError(f"combine mode {mode!r} not in {COMBINE_MODES}")
+        ef = raw.get("ef", True)
+        if not isinstance(ef, bool):
+            raise ValueError("combine ef must be true or false")
+        return cls(mode=mode, ef=ef)
+
+    @classmethod
+    def from_extra_config(cls, extra: Mapping[str, Any] | None) -> CombineConfig:
+        return cls.from_mapping((extra or {}).get(COMBINE_KEY))
+
+    @classmethod
+    def from_vllm_config(cls, vllm_config: Any) -> CombineConfig:
+        additional_config = getattr(vllm_config, "additional_config", None)
+        return cls.from_extra_config(
+            connector_extra_config_from_source(additional_config)
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "off"
+
+    @property
+    def code(self) -> int:
+        """The row format of the compressed partial sums (int formats only)."""
+        return {"int8": D_INT8, "int4": D_INT4}[self.mode]
+
+    def row_bytes(self, hidden: int) -> int:
+        return row_bytes(self.code, hidden)
 
 
 # ------------------------------------------------------- torch reference
@@ -357,6 +420,61 @@ def decode_rows_reference(
         h_out[sel] = value.to(h_out.dtype)
 
 
+def encode_combine_reference(
+    code: int,
+    partial: torch.Tensor,
+    rows: torch.Tensor,
+    err: torch.Tensor | None,
+    out: torch.Tensor,
+    deq: torch.Tensor,
+) -> None:
+    """FFN side: quantize ``partial`` (``[n, hidden]``) plus, with error
+    feedback, ``err`` at ``rows`` into ``out`` (uint8 flat, ``n`` rows of
+    ``row_bytes(code)`` back to back); ``deq`` (fp32 ``[n, hidden]``) gets
+    what the Attention side will rebuild and ``err`` the new residual."""
+    n, hidden = partial.shape
+    if not n:
+        return
+    v = partial.float()
+    if err is not None:
+        v = v + err[rows]
+    packed, d = _quantized_rows(code, v)
+    out[: packed.numel()].copy_(packed.view(-1))
+    deq.copy_(d)
+    if err is not None:
+        err[rows] = v - d
+
+
+def decode_combine_reference(code: int, data: torch.Tensor, out: torch.Tensor) -> None:
+    """Attention side: ``out`` (fp32 ``[n, hidden]``) from the ``n`` packed rows
+    of ``data`` (uint8 flat)."""
+    n, hidden = out.shape
+    if not n:
+        return
+    size = row_bytes(code, hidden)
+    out.copy_(_dequantized_rows(code, data[: n * size].view(n, size), hidden))
+
+
+def encode_combine(code: int, *args: Any) -> None:
+    """``encode_combine_reference``, fused on CUDA."""
+    if args[0].is_cuda:
+        from afd_plugin import delta_dispatch_triton
+
+        delta_dispatch_triton.encode_combine(code, *args)
+    else:
+        encode_combine_reference(code, *args)
+
+
+def decode_combine(code: int, *args: Any) -> None:
+    """``decode_combine_reference``, fused on CUDA."""
+    if args[0].is_cuda:
+        from afd_plugin import delta_dispatch_triton
+
+        delta_dispatch_triton.decode_combine(code, *args)
+    else:
+        decode_combine_reference(code, *args)
+
+
 def encode_rows(cfg: DeltaDispatchConfig, *args: Any) -> None:
     if args[0].is_cuda:
         # Lazy import: Triton is only needed (and installed) with CUDA.
@@ -424,11 +542,15 @@ class AttentionDeltaState:
         num_ffn: int,
         max_tokens: int,
         hidden: int,
+        combine: CombineConfig | None = None,
     ) -> None:
         if max_tokens > TOKEN_MASK + 1:
             raise ValueError(f"delta dispatch words hold tokens < {TOKEN_MASK + 1}")
         self.cfg, self.layers, self.scale = cfg, _LayerOrder(moe_layers), routed_scale
         self.num_ffn, self.max_tokens, self.hidden = num_ffn, max_tokens, hidden
+        self.combine = combine or CombineConfig()
+        # stage -> fp32 [num_ffn * max_tokens, hidden]: rebuilt partial sums.
+        self._back: dict[int, torch.Tensor] = {}
         # stage -> fp32 [num_ffn * max_tokens, hidden], int32 [num_ffn * max_tokens]
         self._state: dict[int, torch.Tensor] = {}
         self._last: dict[int, torch.Tensor] = {}
@@ -517,6 +639,23 @@ class AttentionDeltaState:
             meta[:num_send],
         )
 
+    def decode_combine(
+        self, stage: int, data: torch.Tensor, num_rows: int
+    ) -> torch.Tensor:
+        """The returned partial sums (fp32 ``[num_rows, hidden]``, dispatch
+        order) rebuilt from the compressed rows in ``data`` (uint8 flat)."""
+        back = self._back.get(stage)
+        if back is None:
+            back = torch.empty(
+                self.num_ffn * self.max_tokens,
+                self.hidden,
+                dtype=torch.float32,
+                device=data.device,
+            )
+            self._back[stage] = back
+        decode_combine(self.combine.code, data, back[:num_rows])
+        return back[:num_rows]
+
     def after_combine(
         self, packed: PackedDispatch, num_send: int, partials: torch.Tensor
     ) -> None:
@@ -541,9 +680,19 @@ class FFNDeltaState:
         hidden: int,
         num_attn: int,
         max_tokens: int,
+        combine: CombineConfig | None = None,
     ) -> None:
         self.cfg, self.layers, self.scale = cfg, _LayerOrder(moe_layers), routed_scale
         self.hidden, self.num_attn, self.max_tokens = int(hidden), num_attn, max_tokens
+        self.combine = combine or CombineConfig()
+        # Combine compression, per stage: the residuals of error feedback
+        # (fp32 [num_attn * max_tokens, hidden], by state row), the compressed
+        # rows of the last layer (uint8 flat) and their count, and the values
+        # the Attention side rebuilds from them.
+        self._err: dict[int, torch.Tensor] = {}
+        self._cbytes: dict[int, torch.Tensor] = {}
+        self._crows: dict[int, int] = {}
+        self._deq: dict[int, torch.Tensor] = {}
         self._state: dict[int, torch.Tensor] = {}
         self._rows: dict[int, torch.Tensor] = {}
         # stage -> words of the received rows (handed over by the connector).
@@ -587,7 +736,10 @@ class FFNDeltaState:
         finite values of earlier layers, masked by the launch's expert ids
         like the plain path's fixed-size buffers). ``norm_into(out, h)``
         writes ``Norm(h)`` into ``out``."""
-        self.layers.position(layer_idx)
+        pos = self.layers.position(layer_idx)
+        if pos == 0 and stage in self._err:
+            # A new forward: no residual is carried over from the last one.
+            self._err[stage].zero_()
         meta = self._meta.pop(stage, None)
         if meta is None:
             raise RuntimeError(
@@ -628,15 +780,52 @@ class FFNDeltaState:
         return x[:out_rows]
 
     def after_experts(self, stage: int, output: torch.Tensor) -> None:
-        """Add the partial sums returned for this layer (its first rows)."""
-        if self.cfg.stateful:
-            rows = self._rows[stage]
-            self._state[stage].index_add_(
-                0, rows, output[: rows.shape[0]].float(), alpha=self.scale
+        """Take the partial sums returned for this layer (its first rows):
+        compress them (combine compression) and add what the Attention side
+        will get to the states."""
+        rows = self._rows[stage]
+        n = int(rows.shape[0])
+        returned = output[:n]
+        if self.combine.enabled:
+            device = output.device
+            capacity = self.num_attn * self.max_tokens
+            data = self._cbytes.get(stage)
+            if data is None:
+                data = torch.empty(
+                    capacity * self.combine.row_bytes(self.hidden),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                self._cbytes[stage] = data
+            err = None
+            if self.combine.ef:
+                err = self._err.get(stage)
+                if err is None:
+                    err = torch.zeros(
+                        capacity, self.hidden, dtype=torch.float32, device=device
+                    )
+                    self._err[stage] = err
+            deq = self._buffer(self._deq, stage, capacity, device, torch.float32)[:n]
+            encode_combine(self.combine.code, returned, rows, err, data, deq)
+            self._crows[stage] = n
+            returned = deq
+        if self.cfg.stateful and n:
+            self._state[stage].index_add_(0, rows, returned.float(), alpha=self.scale)
+
+    def combine_bytes(self, stage: int, num_rows: int) -> torch.Tensor:
+        """The compressed partial sums of the stage's last layer (uint8 flat,
+        ``num_rows`` rows back to back) for the connector to send."""
+        if self._crows.get(stage) != num_rows:
+            raise RuntimeError(
+                f"stage {stage}: {self._crows.get(stage)} compressed rows, the "
+                f"connector sends {num_rows}"
             )
+        return self._cbytes[stage][: num_rows * self.combine.row_bytes(self.hidden)]
 
 
 __all__ = [
+    "COMBINE_KEY",
+    "COMBINE_MODES",
     "CODE_FORMATS",
     "CODE_MASK",
     "CODE_SHIFT",
@@ -649,10 +838,13 @@ __all__ = [
     "QUANT_GROUP_SIZE",
     "RANK_SHIFT",
     "AttentionDeltaState",
+    "CombineConfig",
     "DeltaDispatchConfig",
     "FFNDeltaState",
     "PackedDispatch",
+    "decode_combine_reference",
     "decode_rows_reference",
+    "encode_combine_reference",
     "encode_rows_reference",
     "row_bytes",
 ]

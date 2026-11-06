@@ -97,6 +97,14 @@ rows into the pack buffer, and adds each FFN rank's returned partial sums to
 that rank's states before summing them. The FFN side hands the words to the
 FFN model, which rebuilds and normalizes the rows.
 
+Combine compression (``connector_extra_config = {"combine": {...}}``, with
+delta dispatch): the FFN model compresses each row's partial sum (int8 or int4,
+error feedback by default) right after the experts; the connector stages those
+bytes back to back at the head of the slot's result block and WRITEs each
+Attention rank's rows as one span at the head of its region. The Attention
+side gathers each FFN rank's bytes, rebuilds the partial sums in fp32, adds
+them to the states and sums them in the model dtype.
+
 Limitations: unquantized rows, Attention TP=1.
 """
 
@@ -135,8 +143,10 @@ from afd_plugin.connectors.gpu.routed import (
 )
 from afd_plugin.connectors.metadata import AFDA2FTransferPayload, AFDTransferContext
 from afd_plugin.delta_dispatch import (
+    COMBINE_KEY,
     EXTRA_CONFIG_KEY,
     AttentionDeltaState,
+    CombineConfig,
     DeltaDispatchConfig,
     PackedDispatch,
 )
@@ -216,6 +226,8 @@ class PendingCombineWrite:
     ready: torch.cuda.Event
     shares: list[tuple[int, tuple[int, int], int, int]]
     notif: bytes
+    # Combine compression: the rows are packed bytes, WRITTEN as one span.
+    packed: bool = False
 
 
 class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
@@ -233,10 +245,17 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         cls,
         raw: Mapping[str, Any] | None,
     ) -> ConnectorExtraInfo:
-        # Delta dispatch is the one extra setting of the NIXL routed connector;
-        # anything else is rejected by the parent as before.
+        # Delta dispatch and combine compression are the extra settings of the
+        # NIXL routed connector; anything else is rejected by the parent as
+        # before.
         rest = dict(raw or {})
-        DeltaDispatchConfig.from_mapping(rest.pop(EXTRA_CONFIG_KEY, None))
+        delta = DeltaDispatchConfig.from_mapping(rest.pop(EXTRA_CONFIG_KEY, None))
+        combine = CombineConfig.from_mapping(rest.pop(COMBINE_KEY, None))
+        if combine.enabled and not delta.enabled:
+            raise ValueError(
+                "combine compression needs delta dispatch (its rows carry the "
+                "tokens; mode full_bf16 sends the same bf16 x as off)",
+            )
         return super().parse_extra_config(rest)
 
     def __init__(
@@ -925,23 +944,49 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # (``plan.perm``) order, on the GPU.
         rows_per_region = self.max_tokens
         counts = plan.send_counts[: self.ffn_size]
-        back = torch.empty(
-            (sum(counts), self._results.shape[1]),
-            dtype=self._results.dtype,
-            device=self.device,
-        )
-        self._gather_rows(
-            [
-                self._results[(stage * self.ffn_size + ffn) * rows_per_region :][:count]
-                for ffn, count in enumerate(counts)
-            ],
-            back,
-        )
-        if self.delta_dispatch.enabled:
-            # Delta dispatch: each FFN rank's partial sums into its states,
-            # before they are summed.
+        if self.combine.enabled:
+            # Combine compression: each FFN rank's rows are packed bytes at
+            # the head of its region; rebuilt in fp32, they go into its
+            # states as they are, and are summed in the model dtype.
+            row_bytes = self.combine.row_bytes(self._results.shape[1])
+            data = torch.empty(
+                sum(counts) * row_bytes, dtype=torch.uint8, device=self.device
+            )
+            self._gather_rows(
+                [
+                    self._results[(stage * self.ffn_size + ffn) * rows_per_region :][
+                        :rows_per_region
+                    ]
+                    .view(torch.uint8)
+                    .view(-1)[: count * row_bytes]
+                    for ffn, count in enumerate(counts)
+                ],
+                data,
+            )
             state, packed, sent = self._delta_pending.pop(stage)
-            state.after_combine(packed, sent, back)
+            partials = state.decode_combine(stage, data, sent)
+            state.after_combine(packed, sent, partials)
+            back = partials.to(self._results.dtype)
+        else:
+            back = torch.empty(
+                (sum(counts), self._results.shape[1]),
+                dtype=self._results.dtype,
+                device=self.device,
+            )
+            self._gather_rows(
+                [
+                    self._results[(stage * self.ffn_size + ffn) * rows_per_region :][
+                        :count
+                    ]
+                    for ffn, count in enumerate(counts)
+                ],
+                back,
+            )
+            if self.delta_dispatch.enabled:
+                # Delta dispatch: each FFN rank's partial sums into its
+                # states, before they are summed.
+                state, packed, sent = self._delta_pending.pop(stage)
+                state.after_combine(packed, sent, back)
         output = torch.empty_like(ref_tensor)
         if plan.perm.is_cuda:
             # ``perm`` was allocated on the communication stream; the plan
@@ -1084,9 +1129,19 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         self._dbg("F post combine slot=%d notif=%s", pending.slot, pending.notif)
         with _profile_range(f"afd_nixl.combine_post[{pending.slot}]"):
             for peer, rows, num_rows, region_row in pending.shares:
-                self._write(
-                    pending.slot, peer, [rows], region_row, num_rows, pending.notif
-                )
+                if pending.packed:
+                    addr, row_bytes = rows
+                    self._write_spans(
+                        pending.slot,
+                        peer,
+                        [(addr, num_rows * row_bytes)],
+                        region_row,
+                        pending.notif,
+                    )
+                else:
+                    self._write(
+                        pending.slot, peer, [rows], region_row, num_rows, pending.notif
+                    )
 
     def _flush_combines(self, slot: int | None = None) -> None:
         """Post the staged partial sums of ``slot`` (of every slot when None)
@@ -1134,18 +1189,31 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # consumed them before it sent this stage's rows).
         self._flush_combines(slot)
         base = slot * self.attn_size * self.max_tokens
-        staged = self._results[base : base + plan.num_recv]
+        if self.combine.enabled:
+            # The FFN model compressed the rows after the experts: stage the
+            # bytes back to back at the head of the slot's block.
+            assert self._ffn_model is not None
+            data = self._ffn_model.model.ffn_delta.combine_bytes(slot, plan.num_recv)
+            block = self._results[base : base + self.attn_size * self.max_tokens]
+            staged = block.view(torch.uint8).view(-1)[: data.numel()]
+        else:
+            data = ffn_output
+            staged = self._results[base : base + plan.num_recv]
         with _profile_range(f"afd_nixl.combine_stage[{slot}]"):
             # Under host staging into pinned host memory: asynchronous,
             # ``ready`` fires once it has landed.
-            staged.copy_(ffn_output, non_blocking=True)
+            staged.copy_(data, non_blocking=True)
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream(self.device))
         # The experts kernel that read the slot's gather buffers precedes
         # this copy on the compute stream.
         self._slot_consumed[slot] = ready
         shares: list[tuple[int, tuple[int, int], int, int]] = []
-        addr, row_bytes = staged.data_ptr(), staged.stride(0) * staged.element_size()
+        addr = staged.data_ptr()
+        if self.combine.enabled:
+            row_bytes = self.combine.row_bytes(self._results.shape[1])
+        else:
+            row_bytes = staged.stride(0) * staged.element_size()
         offset = 0
         for attn, count in enumerate(plan.recv_counts[self.ffn_size :]):
             if count:
@@ -1160,7 +1228,11 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             offset += count
         self._pending_combines.append(
             PendingCombineWrite(
-                slot=slot, ready=ready, shares=shares, notif=f"c{plan.seq}".encode()
+                slot=slot,
+                ready=ready,
+                shares=shares,
+                notif=f"c{plan.seq}".encode(),
+                packed=self.combine.enabled,
             )
         )
         self._dbg(
