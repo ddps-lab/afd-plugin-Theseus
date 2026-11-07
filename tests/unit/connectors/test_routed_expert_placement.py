@@ -139,6 +139,22 @@ def test_plan_routes_by_the_layer_table():
         conn._begin_plan(topk_ids, 0, 5)
 
 
+def test_plan_by_pair_ranks_matches_the_engine_table_path():
+    """_begin_plan hands the engine per-pair ranks (a table with -1 at the
+    end, one gather); the plan must be the engine's own expert_owner plan,
+    padding ids included."""
+    owners = routed.expert_owner_tables(PLACEMENT, 4, "cpu")
+    conn = _plan_owner(owners)
+    topk_ids = torch.tensor([[0, 1], [3, -1], [-1, -1], [2, 3], [1, 0]])
+    for layer in (1, 2):
+        pending = conn._begin_plan(topk_ids, 0, layer)
+        got = conn.engine._count_buf(0)[0].tolist()
+        engine = P2pAll2AllEngine(None, 2, 3, 2, 4, "cpu")
+        expected = engine.begin_plan(topk_ids, expert_owner=owners[layer])
+        assert torch.equal(pending.order, expected.order)
+        assert got == engine._count_buf(0)[0].tolist()
+
+
 def test_plan_without_a_placement_routes_like_the_engine():
     conn = _plan_owner(None)
     topk_ids = torch.tensor([[0, 1], [3, -1], [2, 3]])
