@@ -859,6 +859,10 @@ def test_triton_one_row_size_paths_match_reference(mode: str, first: str) -> Non
     # from the words: Attention rank * max_tokens + token.
     k = int((flat < tokens).sum())
     ffn_state = torch.randn(4 * max_tokens, MODEL_HIDDEN, generator=gen).cuda()
+    want = (rank * max_tokens + flat[:k] % tokens).cuda()
+    # The FFN holds what Attention held before this layer (delta rows add to
+    # it; first visits overwrite it).
+    ffn_state[want] = state[flat[:k]].cuda()
     h_out = torch.empty(k, MODEL_HIDDEN, dtype=torch.bfloat16, device="cuda")
     rows_out = torch.empty(k, dtype=torch.int32, device="cuda")
     delta_dispatch_triton.decode_rows(
@@ -873,7 +877,6 @@ def test_triton_one_row_size_paths_match_reference(mode: str, first: str) -> Non
         max_tokens=max_tokens,
         row_size=size,
     )
-    want = (rank * max_tokens + flat[:k] % tokens).cuda()
     assert torch.equal(rows_out.long(), want)
     if cfg.stateful:
         assert torch.equal(ffn_state[want], gpu_state[flat[:k].cuda()])
