@@ -45,6 +45,7 @@ from afd_plugin.delta_dispatch import (
     MIN_GROUP_RANGE,
     QUANT_GROUP_SIZE,
     RANK_SHIFT,
+    TOKEN_MASK,
     DeltaDispatchConfig,
     row_bytes,
 )
@@ -101,17 +102,29 @@ def _encode_rows_kernel(
     rank_word,
     layer_pos,
     min_range,
+    first_code,
+    rest_code,
     hidden: tl.constexpr,
     group: tl.constexpr,
     stateful: tl.constexpr,
     code_shift: tl.constexpr,
+    codes_in_kernel: tl.constexpr,
 ):
     half: tl.constexpr = group // 2
     i = tl.program_id(0)
     g = tl.program_id(1)
     flat = tl.load(flat_ptr + i)
     t = flat % num_tokens
-    code = tl.load(code_ptr + i)
+    if codes_in_kernel:
+        # One row size: a first visit (no earlier visit to the FFN rank in this
+        # forward) or a later one. Every program of the row reads ``last``
+        # before the host updates it after the launch (not here).
+        if stateful:
+            code = tl.where(tl.load(last_ptr + flat) < 0, first_code, rest_code)
+        else:
+            code = rest_code + 0 * flat
+    else:
+        code = tl.load(code_ptr + i)
     row = out_ptr + tl.load(off_ptr + i)
     base = g * group
     if code == 0:  # h_bf16
@@ -220,7 +233,7 @@ def _encode_rows_kernel(
     if g == 0:
         word = t + (code.to(tl.int64) << code_shift) + rank_word
         tl.store(meta_ptr + i, word.to(tl.int32))
-        if stateful:
+        if stateful and not codes_in_kernel:
             tl.store(last_ptr + flat, layer_pos)
 
 
@@ -234,18 +247,35 @@ def _decode_rows_kernel(
     state_stride,
     out_ptr,
     out_stride,
+    row_size,
+    max_tokens,
     hidden: tl.constexpr,
     group: tl.constexpr,
     stateful: tl.constexpr,
     code_shift: tl.constexpr,
     code_mask: tl.constexpr,
+    rank_shift: tl.constexpr,
+    token_mask: tl.constexpr,
+    fixed: tl.constexpr,
+    rows_from_meta: tl.constexpr,
 ):
     half: tl.constexpr = group // 2
     i = tl.program_id(0)
     g = tl.program_id(1)
-    code = (tl.load(meta_ptr + i) >> code_shift) & code_mask
-    row = data_ptr + tl.load(off_ptr + i)
-    srow = tl.load(rows_ptr + i)
+    word = tl.load(meta_ptr + i)
+    code = (word >> code_shift) & code_mask
+    if fixed:
+        row = data_ptr + i.to(tl.int64) * row_size
+    else:
+        row = data_ptr + tl.load(off_ptr + i)
+    if rows_from_meta:
+        # The state row from the word (Attention rank * max_tokens + token),
+        # written out for the combine of this layer.
+        srow = (word >> rank_shift).to(tl.int64) * max_tokens + (word & token_mask)
+        if g == 0:
+            tl.store(rows_ptr + i, srow.to(rows_ptr.dtype.element_ty))
+    else:
+        srow = tl.load(rows_ptr + i)
     base = g * group
     out_ty = out_ptr.dtype.element_ty
     if code == 0:  # h_bf16
@@ -449,6 +479,8 @@ def encode_rows(
         raise ValueError("delta dispatch needs row-contiguous src and flat uint8 out")
     stateful = cfg.stateful
     state_arg, state_stride = _state_args(state if stateful else None, src)
+    in_kernel = codes is None
+    first, rest = cfg.first_rest_codes() if in_kernel else (0, 0)
     _encode_rows_kernel[(rows, hidden // QUANT_GROUP_SIZE)](
         src,
         src.stride(0),
@@ -456,7 +488,7 @@ def encode_rows(
         state_stride,
         last if (stateful and last is not None) else flat,
         flat,
-        codes,
+        flat if in_kernel else codes,
         offsets,
         out,
         meta,
@@ -464,21 +496,30 @@ def encode_rows(
         rank << RANK_SHIFT,
         layer_pos,
         MIN_GROUP_RANGE,
+        first,
+        rest,
         hidden=hidden,
         group=QUANT_GROUP_SIZE,
         stateful=stateful,
         code_shift=CODE_SHIFT,
+        codes_in_kernel=in_kernel,
     )
+    if in_kernel and stateful and last is not None:
+        # After the kernel (same stream): every program read the old value.
+        last.index_fill_(0, flat, layer_pos)
 
 
 def decode_rows(
     cfg: DeltaDispatchConfig,
     data: torch.Tensor,
     meta: torch.Tensor,
-    offsets: torch.Tensor,
-    state_rows: torch.Tensor,
+    offsets: torch.Tensor | None,
+    state_rows: torch.Tensor | None,
     state: torch.Tensor | None,
     h_out: torch.Tensor,
+    rows_out: torch.Tensor | None = None,
+    max_tokens: int = 0,
+    row_size: int = 0,
 ) -> None:
     """Fused FFN kernel (see ``decode_rows_reference``)."""
     rows, hidden = int(meta.shape[0]), h_out.shape[1]
@@ -490,20 +531,31 @@ def decode_rows(
         )
     stateful = cfg.stateful
     state_arg, state_stride = _state_args(state if stateful else None, h_out)
+    from_meta = state_rows is None
+    if from_meta and rows_out is None:
+        raise ValueError("decode_rows without state_rows writes them to rows_out")
+    if offsets is None and row_size <= 0:
+        raise ValueError("decode_rows without offsets needs the row size")
     _decode_rows_kernel[(rows, hidden // QUANT_GROUP_SIZE)](
         data,
         meta,
-        offsets,
-        state_rows,
+        meta if offsets is None else offsets,
+        rows_out if from_meta else state_rows,
         state_arg,
         state_stride,
         h_out,
         h_out.stride(0),
+        row_size,
+        max_tokens,
         hidden=hidden,
         group=QUANT_GROUP_SIZE,
         stateful=stateful,
         code_shift=CODE_SHIFT,
         code_mask=CODE_MASK,
+        rank_shift=RANK_SHIFT,
+        token_mask=TOKEN_MASK,
+        fixed=offsets is None,
+        rows_from_meta=from_meta,
     )
 
 
