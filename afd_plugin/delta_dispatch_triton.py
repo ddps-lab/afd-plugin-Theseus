@@ -11,17 +11,17 @@ of every format.
 * ``encode_rows`` (Attention): per row, ``h'`` in bf16 (first visit, the state
   becomes ``h'``) or ``d = h' - S`` in fp32 / int8 / int4 / int3 (the group's
   ``lo`` / ``step`` rounded to fp16, IEEE divisions, ``q = round_half_even((d -
-  lo) / step)`` clamped) with ``S += deq`` in place; ``h_int4`` (first visit)
-  quantizes ``h'`` with ``S`` taken as zero, so ``S = deq``. Also the row's
-  word and the MoE layer of the visit. Without states (``x_int4``, ``x_int8``) ``S`` is
-  zero.
+  lo) / step)`` clamped) with ``S += deq`` in place; ``h_int4`` / ``h_int8``
+  (first visit) quantizes ``h'`` with ``S`` taken as zero, so ``S = deq``.
+  Also the row's word and the MoE layer of the visit. Without states
+  (``x_int4``, ``x_int8``) ``S`` is zero.
 * ``decode_rows`` (FFN): per row, the value rebuilt from the bytes: ``S = h'``
-  (``h_int4``: ``S = 0 + deq``) or ``S += deq`` and ``h_out = S`` in the model
-  dtype (``h_out = deq`` without states).
+  (``h_int4`` / ``h_int8``: ``S = 0 + deq``) or ``S += deq`` and ``h_out = S``
+  in the model dtype (``h_out = deq`` without states).
 * ``encode_combine`` (FFN) / ``decode_combine`` (Attention): the compressed
-  partial sums of combine compression, every row in one int format: ``v =
-  partial (+ e)``, the bytes, ``deq`` and the new residual ``e = v - deq``; and
-  ``deq`` back from the bytes.
+  partial sums of combine compression, every row of a layer in one int
+  format: ``v = partial (+ e)``, the bytes, ``deq`` and the new residual ``e =
+  v - deq``; and ``deq`` back from the bytes.
 
 Both sides dequantize with the same ``_dequantize`` (an explicit fused
 multiply-add), so the states the FFN rank rebuilds are bit-identical to the
@@ -127,11 +127,14 @@ def _encode_rows_kernel(
         d = h - s
         tl.store(row.to(tl.pointer_type(tl.float32)) + base + k, d)
         tl.store(state_ptr + flat * state_stride + base + k, s + d)
-    elif code == 2:  # d_int8
+    elif (code == 2) | (code == 6):  # d_int8, h_int8
         k = tl.arange(0, group)
         h = tl.load(src_ptr + t * src_stride + base + k).to(tl.float32)
         if stateful:
-            s = tl.load(state_ptr + flat * state_stride + base + k)
+            # h_int8 quantizes h' itself and replaces the state (counts as 0).
+            s = tl.load(
+                state_ptr + flat * state_stride + base + k, mask=code == 2, other=0.0
+            )
         else:
             s = tl.zeros([group], dtype=tl.float32)
         d = h - s
@@ -257,14 +260,22 @@ def _decode_rows_kernel(
         s = tl.load(state_ptr + srow * state_stride + base + k) + d
         tl.store(state_ptr + srow * state_stride + base + k, s)
         tl.store(out_ptr + i * out_stride + base + k, s.to(out_ty))
-    elif code == 2:  # d_int8
+    elif (code == 2) | (code == 6):  # d_int8, h_int8
         k = tl.arange(0, group)
         scales = row.to(tl.pointer_type(tl.float16)) + hidden // 2 + 2 * g
         lo = tl.load(scales).to(tl.float32)
         step = tl.load(scales + 1).to(tl.float32)
         v = _dequantize(tl.load(row + base + k).to(tl.float32), lo, step)
         if stateful:
-            v = tl.load(state_ptr + srow * state_stride + base + k) + v
+            # h_int8 replaces the state (counts as 0, as on the Attention side).
+            v = (
+                tl.load(
+                    state_ptr + srow * state_stride + base + k,
+                    mask=code == 2,
+                    other=0.0,
+                )
+                + v
+            )
             tl.store(state_ptr + srow * state_stride + base + k, v)
         tl.store(out_ptr + i * out_stride + base + k, v.to(out_ty))
     elif (code == 3) | (code == 4):  # d_int4, h_int4
