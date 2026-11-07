@@ -99,8 +99,10 @@ FFN model, which rebuilds and normalizes the rows.
 
 Combine compression (``connector_extra_config = {"combine": {...}}``, with
 delta dispatch): the FFN model compresses each row's partial sum (int8 or int4,
-error feedback by default) right after the experts; the connector stages those
-bytes back to back at the head of the slot's result block and WRITEs each
+error feedback by default; with int4, the ``early`` / ``late`` MoE layers in
+int8, so the row size is the layer's) right after the experts; the connector
+stages those bytes back to back at the head of the slot's result block and
+WRITEs each
 Attention rank's rows as one span at the head of its region. The Attention
 side gathers each FFN rank's bytes, rebuilds the partial sums in fp32, adds
 them to the states and sums them in the model dtype.
