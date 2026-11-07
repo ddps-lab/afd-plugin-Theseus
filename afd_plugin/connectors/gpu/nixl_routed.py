@@ -69,7 +69,10 @@ and every step starts as soon as its input has arrived):
 Every host wait is a polling loop that also drives the posted WRITEs to
 completion, because NIXL sends the notification of a WRITE only when its
 state is checked after it finished. The NIXL agent runs NIXL's progress
-thread as well (NIXL's default).
+thread as well (NIXL's default), unless ``AFD_NIXL_PROGRESS_THREAD=0``: that
+thread polls the UCX worker with no pause and keeps a CPU busy even when
+idle, which on a node with two physical cores slows the main thread's host
+work; the polling loops above move the transfers on without it.
 
 Host staging: the NIXL buffers are pinned host memory, and the connector
 itself moves the rows between them and the GPU, with asynchronous copies on
@@ -124,6 +127,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.distributed as dist
 from nixl import nixl_agent, nixl_agent_config
+
+# Not ``nixl.nixl_thread_sync_t``: that name is the raw binding, and the
+# config only takes this enum.
+from nixl._api import nixl_thread_sync_t
 from vllm.distributed.device_communicators.p2p_nccl_all2all import (
     P2pAll2AllPlan,
 )
@@ -174,6 +181,11 @@ _DEBUG_LEVEL = int(os.environ.get("AFD_NIXL_DEBUG", "0") or 0)
 _DEBUG = _DEBUG_LEVEL >= 1
 _DEBUG_PLANS = 400
 _DEBUG_WAIT_S = 5.0
+# AFD_NIXL_PROGRESS_THREAD=0: create the NIXL agent without its progress
+# thread (see the module docstring); the agent then uses NIXL_THREAD_SYNC_RW,
+# which keeps the UCX worker thread-safe for the micro-batch threads that
+# call it in turn. Unset or 1: NIXL's default, with the thread.
+_PROGRESS_THREAD = os.environ.get("AFD_NIXL_PROGRESS_THREAD", "1") != "0"
 
 
 def _agent_name(world_rank: int) -> str:
@@ -398,7 +410,13 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             ]
         self.agent = nixl_agent(
             _agent_name(self.world_rank),
-            nixl_agent_config(backends=[NIXL_BACKEND], enable_prog_thread=True),
+            nixl_agent_config(
+                backends=[NIXL_BACKEND],
+                enable_prog_thread=_PROGRESS_THREAD,
+                sync_mode=None
+                if _PROGRESS_THREAD
+                else nixl_thread_sync_t.NIXL_THREAD_SYNC_RW,
+            ),
         )
         self.agent.register_memory([*self._rows, self._results])
 
@@ -433,13 +451,14 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             self._peer_regions[peer] = regions
         logger.info(
             "NIXL routed AFD connector ready: role=%s world_rank=%d peers=%s "
-            "region_rows=%d slots=%d backend=%s",
+            "region_rows=%d slots=%d backend=%s progress_thread=%s",
             self.afd_config.role,
             self.world_rank,
             list(self._peer_agents),
             self.max_tokens,
             self.num_slots,
             NIXL_BACKEND,
+            _PROGRESS_THREAD,
         )
         if _DEBUG:
             # kill -USR1 <pid>: every thread's stack, the process keeps running.
