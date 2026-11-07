@@ -262,8 +262,10 @@ def _decode_rows_kernel(
     half: tl.constexpr = group // 2
     i = tl.program_id(0)
     g = tl.program_id(1)
-    word = tl.load(meta_ptr + i)
-    code = (word >> code_shift) & code_mask
+    # Not ``word``: the d_int3 branch below has its own (vector) ``word``, and
+    # Triton needs one type per name across the branches.
+    meta_w = tl.load(meta_ptr + i)
+    code = (meta_w >> code_shift) & code_mask
     if fixed:
         row = data_ptr + i.to(tl.int64) * row_size
     else:
@@ -271,7 +273,7 @@ def _decode_rows_kernel(
     if rows_from_meta:
         # The state row from the word (Attention rank * max_tokens + token),
         # written out for the combine of this layer.
-        srow = (word >> rank_shift).to(tl.int64) * max_tokens + (word & token_mask)
+        srow = (meta_w >> rank_shift).to(tl.int64) * max_tokens + (meta_w & token_mask)
         if g == 0:
             tl.store(rows_ptr + i, srow.to(rows_ptr.dtype.element_ty))
     else:
