@@ -325,7 +325,9 @@ class _Loopback:
             # The connector's steps: bytes gathered in FFN rank order,
             # rebuilt in fp32, into the states, summed in the model dtype.
             data = torch.cat(compressed)
-            received = delta.decode_combine(ubatch_idx, data, plan.num_send)
+            received = delta.decode_combine(
+                ubatch_idx, data, plan.num_send, packed.layer_pos
+            )
             delta.after_combine(packed, plan.num_send, received)
             back = received.to(back.dtype)
         elif self.delta_dispatch.enabled:
@@ -974,8 +976,20 @@ def test_nixl_byte_counts_must_fit_the_row_formats(rows, nbytes, fits):
             conn._complete_prefetch(prefetch)
 
 
-@pytest.mark.parametrize("mode,stage", [("full_bf16", 0), ("delta_fp32", 1)])
-def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch, mode, stage):
+@pytest.mark.parametrize(
+    "mode,stage,int8_layers,pos",
+    [
+        ("full_bf16", 0, 0, 0),
+        ("delta_fp32", 1, 0, 0),
+        # int8 layers of the int4 mode (combine early / late): a wide layer
+        # and a narrow one between them.
+        ("delta_fp32", 1, 1, 0),
+        ("full_bf16", 0, 1, 3),
+    ],
+)
+def test_nixl_combine_bytes_reach_every_attention_rank(
+    monkeypatch, mode, stage, int8_layers, pos
+):
     # The connector's own combine path with a host-memory NIXL stand-in: two
     # FFN ranks stage their compressed rows (send_ffn_output, _post_combine,
     # _write_spans) into two Attention ranks' result regions, which gather and
@@ -1004,7 +1018,7 @@ def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch, mode, stage)
     )
     num_ffn, num_attn, max_tokens, tokens, slots = 2, 2, 4, 3, 2
     cfg = DeltaDispatchConfig(mode=mode)
-    combine = CombineConfig(mode="int4")
+    combine = CombineConfig(mode="int4", early=int8_layers, late=int8_layers)
     gen = torch.Generator().manual_seed(12)
     attn, ffn, plans, states = [], [], [], []
     for a in range(num_attn):
@@ -1024,7 +1038,7 @@ def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch, mode, stage)
         state = AttentionDeltaState(
             cfg, MOE_LAYERS, SCALE, num_ffn, max_tokens, HIDDEN, combine
         )
-        packed = state.prepare(MOE_LAYERS[0], stage, pending.order, tokens)
+        packed = state.prepare(MOE_LAYERS[pos], stage, pending.order, tokens)
         plan = conn.engine.finish_plan_local(pending)
         conn._nixl_pending = {stage: plan}
         conn._delta_pending = {stage: (state, packed, plan.num_send)}
@@ -1057,6 +1071,7 @@ def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch, mode, stage)
             cfg, MOE_LAYERS, SCALE, HIDDEN, num_attn, max_tokens, combine
         )
         delta._rows[stage] = rows
+        delta._pos[stage] = pos
         if cfg.stateful:
             delta._state[stage] = torch.zeros(num_attn * max_tokens, HIDDEN)
         launch = rows.numel() + 2  # fixed-size launch: two padding rows
@@ -1073,6 +1088,10 @@ def test_nixl_combine_bytes_reach_every_attention_rank(monkeypatch, mode, stage)
             a = int(peer.split("-")[1])
             attn[a].agent.inbox.setdefault(f"ffn-{f}", []).append(notif)
         ffn.append((rows, delta._deq[stage][: rows.numel()].clone(), delta))
+        wide = pos < int8_layers or pos >= len(MOE_LAYERS) - int8_layers
+        # int8: a byte per value, int4: half; plus an fp16 (lo, step) per group.
+        data = HIDDEN if wide else HIDDEN // 2
+        assert delta.combine_row_bytes(stage) == data + 4 * (HIDDEN // 128)
     for a, conn in enumerate(attn):
         out = conn.recv_ffn_output(torch.zeros(tokens, HIDDEN), stage)
         # What every FFN rank compressed for this Attention rank, in the

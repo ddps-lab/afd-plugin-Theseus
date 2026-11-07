@@ -19,6 +19,7 @@ from afd_plugin.delta_dispatch import (
     D_INT8,
     H_BF16,
     H_INT4,
+    H_INT8,
     MAX_ATTENTION_RANKS,
     QUANT_GROUP_SIZE,
     RANK_SHIFT,
@@ -99,7 +100,7 @@ def _drive(
     gen = torch.Generator().manual_seed(0)
     owner = torch.arange(NUM_EXPERTS) % num_ffn
     combine = combine or CombineConfig()
-    rb = combine.row_bytes(HIDDEN) if combine.enabled else 0
+    rb = 0
     attn = [
         AttentionDeltaState(
             cfg, MOE_LAYERS, ROUTED_SCALE, num_ffn, TOKENS, HIDDEN, combine
@@ -163,8 +164,11 @@ def _drive(
                 partial = partial.to(torch.bfloat16)
                 ffn[f].after_experts(s, partial)
                 if combine.enabled:
-                    # The compressed rows, Attention rank major like the
-                    # received ones: each Attention rank's share is a span.
+                    # The compressed rows (this layer's row size), Attention
+                    # rank major like the received ones: each Attention
+                    # rank's share is a span.
+                    rb = ffn[f].combine_row_bytes(s)
+                    assert rb == attn[0].combine_row_bytes(MOE_LAYERS.index(layer))
                     cbytes = ffn[f].combine_bytes(s, len(origin)).clone()
                     assert cbytes.numel() == len(origin) * rb
                 for r, (a, i) in enumerate(origin):
@@ -182,7 +186,9 @@ def _drive(
                     # connector reads the regions), rebuilt, into the states.
                     by_row = sorted(results[a], key=lambda item: item[0])
                     data = torch.cat([item[4] for item in by_row])
-                    received = attn[a].decode_combine(s, data, n).clone()
+                    received = (
+                        attn[a].decode_combine(s, data, n, packed.layer_pos).clone()
+                    )
                     attn[a].after_combine(packed, n, received)
                     back = received.to(torch.bfloat16)
                 else:
@@ -244,6 +250,9 @@ def test_config_parsing() -> None:
     for mode in ("x_int4", "x_int8"):
         assert DeltaDispatchConfig(mode=mode).sends_x
         assert not DeltaDispatchConfig(mode=mode).stateful
+    cfg = DeltaDispatchConfig.from_mapping({"mode": "delta_int8", "first": "int8"})
+    assert (cfg.mode, cfg.first) == ("delta_int8", "int8")
+    assert cfg.stateful and not cfg.sends_x
     for bad in (
         {"mode": "int3"},
         {"mode": "off", "extra": 1},
@@ -282,6 +291,7 @@ def test_first_and_revisit_config() -> None:
     # Naming the mode's own format is no revisit rule: equal configs, equal
     # repr (the settings digest); int4 stays no rule in the other modes.
     for mode, own in (
+        ("delta_int8", "int8"),
         ("delta_int4", "int4"),
         ("delta_int3", "int3"),
         ("x_int4", "int4"),
@@ -301,7 +311,13 @@ def test_first_and_revisit_config() -> None:
             {"mode": mode, "revisit": revisit, "first": "int4"}
         )
         assert (cfg.revisit, cfg.first) == (revisit, "int4")
+    wide_first = DeltaDispatchConfig.from_mapping(
+        {"mode": "delta_int4", "first": "int8"}
+    )
+    assert wide_first.first == "int8"
     for bad in (
+        {"mode": "delta_int8", "revisit": "int4"},
+        {"mode": "x_int8", "first": "int8"},
         {"mode": "delta_int4", "revisit": "int3"},
         {"mode": "x_int4", "revisit": "int3"},
         {"mode": "delta_int3", "revisit": "fp8"},
@@ -322,6 +338,7 @@ def test_row_formats_and_codes() -> None:
     assert row_bytes(D_INT8, MODEL_HIDDEN) == 2112
     assert row_bytes(D_INT4, MODEL_HIDDEN) == 1088
     assert row_bytes(H_INT4, MODEL_HIDDEN) == 1088
+    assert row_bytes(H_INT8, MODEL_HIDDEN) == 2112
     assert row_bytes(D_INT3, MODEL_HIDDEN) == 832
     assert row_bytes(D_INT3, QUANT_GROUP_SIZE) == 52
     # (min, max) row bytes per config; the existing ones as before.
@@ -434,23 +451,29 @@ def test_quantization_matches_offline_experiment(code: int, bits: int) -> None:
     assert torch.equal(h_out, state)
 
 
-def test_first_visit_in_int4_replaces_the_state() -> None:
-    # h_int4: h' itself in the offline int4 quantizer; both sides overwrite
-    # the (stale, nonzero) state with it instead of adding.
-    cfg = DeltaDispatchConfig(mode="delta_int3", first="int4")
+@pytest.mark.parametrize(
+    "mode,first,code,bits",
+    [("delta_int3", "int4", H_INT4, 4), ("delta_int8", "int8", H_INT8, 8)],
+)
+def test_first_visit_in_int_replaces_the_state(
+    mode: str, first: str, code: int, bits: int
+) -> None:
+    # h_int4 / h_int8: h' itself in the offline int quantizer; both sides
+    # overwrite the (stale, nonzero) state with it instead of adding.
+    cfg = DeltaDispatchConfig(mode=mode, first=first)
     gen = torch.Generator().manual_seed(3)
     h = (torch.randn(TOKENS, HIDDEN, generator=gen) * 3).to(torch.bfloat16)
     state = torch.randn(TOKENS, HIDDEN, generator=gen) * 3
-    size = row_bytes(H_INT4, HIDDEN)
+    size = row_bytes(code, HIDDEN)
     flat, offsets = torch.arange(TOKENS), torch.arange(TOKENS) * size
     out = torch.zeros(TOKENS * size, dtype=torch.uint8)
     meta = torch.zeros(TOKENS, dtype=torch.int32)
     last = torch.full((TOKENS,), -1, dtype=torch.int32)
-    codes = torch.full((TOKENS,), H_INT4, dtype=torch.int32)
+    codes = torch.full((TOKENS,), code, dtype=torch.int32)
     encode_rows_reference(
         cfg, h, state, last, 0, flat, codes, offsets, TOKENS, 1, out, meta
     )
-    want = _offline_quantize(h.float(), 4)
+    want = _offline_quantize(h.float(), bits)
     assert torch.equal(state, want)
     assert torch.equal((meta >> CODE_SHIFT) & CODE_MASK, codes)
     ffn_state = torch.full((TOKENS, HIDDEN), 7.0)
@@ -527,6 +550,7 @@ def test_row_words_hold_every_code_token_and_rank() -> None:
         D_INT4: _offline_quantize(h.float(), 4),
         H_INT4: _offline_quantize(h.float(), 4),
         D_INT3: _offline_quantize(h.float(), 3),
+        H_INT8: _offline_quantize(h.float(), 8),
     }
     for code in codes.tolist():
         assert torch.equal(h_out[code], want[code].view(-1)), CODE_FORMATS[code]
@@ -576,6 +600,8 @@ def test_uncompressed_modes_give_norm_of_h_prime(
         ("delta_int3", "bf16", "", {H_BF16, D_INT3, D_INT8}),
         ("delta_int3", "int4", "", {H_INT4, D_INT3, D_INT8}),
         ("delta_int3", "int4", "int4", {H_INT4, D_INT3, D_INT4, D_INT8}),
+        ("delta_int8", "int8", "", {H_INT8, D_INT8}),
+        ("delta_int8", "bf16", "", {H_BF16, D_INT8}),
     ],
 )
 def test_quantized_states_stay_identical_across_ffn_ranks(
@@ -663,6 +689,8 @@ def test_missing_rows_are_an_error() -> None:
         ("delta_int3", "int4"),
         ("delta_int4", "int4"),
         ("delta_int3", "bf16"),
+        ("delta_int8", "int8"),
+        ("delta_int8", "bf16"),
     ],
 )
 def test_triton_kernels_match_reference(mode: str, first: str, hidden: int) -> None:
@@ -756,11 +784,34 @@ def test_combine_config_parsing() -> None:
     assert not CombineConfig.from_extra_config(None).enabled
     cfg = CombineConfig.from_extra_config({"combine": {"mode": "int4"}})
     assert cfg.enabled and cfg.ef and cfg.code == D_INT4
-    assert cfg.row_bytes(MODEL_HIDDEN) == 1088
+    assert cfg.max_row_bytes(MODEL_HIDDEN) == 1088
+    assert {cfg.row_bytes_at(p, 27, MODEL_HIDDEN) for p in range(27)} == {1088}
     cfg = CombineConfig.from_mapping({"mode": "int8", "ef": False})
     assert cfg.code == D_INT8 and not cfg.ef
-    assert cfg.row_bytes(MODEL_HIDDEN) == 2112
-    for bad in ({"mode": "fp8"}, {"mode": "int4", "ef": 1}, {"bits": 4}):
+    assert cfg.max_row_bytes(MODEL_HIDDEN) == 2112
+    cfg = CombineConfig.from_mapping({"mode": "int4", "early": 4, "late": 4})
+    assert (cfg.early, cfg.late, cfg.code) == (4, 4, D_INT4)
+    # 27 MoE layers: positions 0-3 and 23-26 int8, the rest int4.
+    assert [cfg.code_at(p, 27) for p in (0, 3, 4, 22, 23, 26)] == [
+        D_INT8,
+        D_INT8,
+        D_INT4,
+        D_INT4,
+        D_INT8,
+        D_INT8,
+    ]
+    assert cfg.row_bytes_at(3, 27, MODEL_HIDDEN) == 2112
+    assert cfg.row_bytes_at(4, 27, MODEL_HIDDEN) == 1088
+    assert cfg.max_row_bytes(MODEL_HIDDEN) == 2112
+    assert CombineConfig(mode="int4").max_row_bytes(MODEL_HIDDEN) == 1088
+    for bad in (
+        {"mode": "fp8"},
+        {"mode": "int4", "ef": 1},
+        {"bits": 4},
+        {"mode": "int8", "early": 2},
+        {"mode": "off", "late": 1},
+        {"mode": "int4", "early": -1},
+    ):
         with pytest.raises(ValueError):
             CombineConfig.from_mapping(bad)
 
@@ -811,8 +862,9 @@ def test_combine_error_feedback_keeps_the_sum(mode: str) -> None:
     exact = torch.zeros(TOKENS, HIDDEN)
     received = torch.zeros(TOKENS, HIDDEN)
     rows = torch.arange(TOKENS)
-    for _ in MOE_LAYERS:
+    for pos, _ in enumerate(MOE_LAYERS):
         ffn._rows[0] = rows
+        ffn._pos[0] = pos
         partial = (torch.randn(TOKENS, HIDDEN, generator=gen)).to(torch.bfloat16)
         ffn._state[0] = torch.zeros(TOKENS, HIDDEN)
         ffn.after_experts(0, partial)
@@ -826,7 +878,8 @@ def test_combine_error_feedback_keeps_the_sum(mode: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "delta_mode", ["delta_int4", "delta_int3", "delta_fp32", "x_int4", "x_int8"]
+    "delta_mode",
+    ["delta_int4", "delta_int3", "delta_int8", "delta_fp32", "x_int4", "x_int8"],
 )
 @pytest.mark.parametrize("mode,ef", [("int4", True), ("int8", True), ("int4", False)])
 def test_combine_keeps_both_states_identical(
@@ -836,7 +889,7 @@ def test_combine_keeps_both_states_identical(
     # add what the Attention side received, so the states stay identical; the
     # received partial sums are the offline quantizer's of partial (+ residual).
     revisit = {"delta_int4": "int8", "delta_int3": "int4"}.get(delta_mode, "")
-    first = "int4" if delta_mode == "delta_int3" else "bf16"
+    first = {"delta_int3": "int4", "delta_int8": "int8"}.get(delta_mode, "bf16")
     cfg = DeltaDispatchConfig(mode=delta_mode, revisit=revisit, first=first)
     steps = _drive(cfg, 4, 2, 2, CombineConfig(mode=mode, ef=ef), forwards=2)
     for step in steps:
@@ -858,6 +911,42 @@ def test_combine_keeps_both_states_identical(
                 step["received"],
                 _offline_quantize(step["exact"], bits).to(torch.bfloat16).float(),
             )
+
+
+@pytest.mark.parametrize("ef", [False, True])
+def test_combine_int8_layers_follow_early_and_late(ef: bool) -> None:
+    # int4 with int8 on the first 2 and the last 1 MoE layers (the offline
+    # cearly / clate): each layer's rows are the offline quantizer's at that
+    # layer's width, both sides agree on the row size, the states stay equal.
+    combine = CombineConfig(mode="int4", ef=ef, early=2, late=1)
+    cfg = DeltaDispatchConfig(mode="delta_int4", first="int4")
+    steps = _drive(cfg, 4, 2, 2, combine, forwards=2)
+    count = len(MOE_LAYERS)
+    wide = {MOE_LAYERS[p] for p in range(count) if p < 2 or p >= count - 1}
+    for step in steps:
+        bits = 8 if step["layer"] in wide else 4
+        if not ef:
+            assert torch.equal(
+                step["received"],
+                _offline_quantize(step["exact"], bits).to(torch.bfloat16).float(),
+            )
+        if "ffn_states" in step:
+            for f, f_state in enumerate(step["ffn_states"]):
+                for a, a_state in enumerate(step["attn_states"]):
+                    assert torch.equal(
+                        f_state[a * TOKENS : (a + 1) * TOKENS],
+                        a_state[f * TOKENS : (f + 1) * TOKENS],
+                    )
+    # int8 layers cut less than int4 layers.
+    err = {
+        w: max(
+            float((s["received"] - s["exact"]).abs().max())
+            for s in steps
+            if (s["layer"] in wide) == w
+        )
+        for w in (True, False)
+    }
+    assert err[True] < err[False]
 
 
 def test_combine_residual_starts_at_zero_every_forward() -> None:

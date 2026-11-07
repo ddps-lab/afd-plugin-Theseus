@@ -946,9 +946,11 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         counts = plan.send_counts[: self.ffn_size]
         if self.combine.enabled:
             # Combine compression: each FFN rank's rows are packed bytes at
-            # the head of its region; rebuilt in fp32, they go into its
-            # states as they are, and are summed in the model dtype.
-            row_bytes = self.combine.row_bytes(self._results.shape[1])
+            # the head of its region (the row size of this MoE layer); rebuilt
+            # in fp32, they go into its states as they are, and are summed in
+            # the model dtype.
+            state, packed, sent = self._delta_pending.pop(stage)
+            row_bytes = state.combine_row_bytes(packed.layer_pos)
             data = torch.empty(
                 sum(counts) * row_bytes, dtype=torch.uint8, device=self.device
             )
@@ -963,11 +965,10 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 ],
                 data,
             )
-            state, packed, sent = self._delta_pending.pop(stage)
             if packed.flat.is_cuda:
                 # Allocated on the communication stream like ``perm`` below.
                 packed.flat.record_stream(torch.cuda.current_stream(self.device))
-            partials = state.decode_combine(stage, data, sent)
+            partials = state.decode_combine(stage, data, sent, packed.layer_pos)
             state.after_combine(packed, sent, partials)
             back = partials.to(self._results.dtype)
         else:
@@ -1228,7 +1229,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         shares: list[tuple[int, tuple[int, int], int, int]] = []
         addr = staged.data_ptr()
         if self.combine.enabled:
-            row_bytes = self.combine.row_bytes(self._results.shape[1])
+            assert self._ffn_model is not None
+            row_bytes = self._ffn_model.model.ffn_delta.combine_row_bytes(slot)
         else:
             row_bytes = staged.stride(0) * staged.element_size()
         offset = 0

@@ -40,6 +40,8 @@ packed back to back at the size of their format code:
 * ``4`` ``h_int4``: ``h'`` itself quantized like ``d_int4`` (a first visit
   with ``first: "int4"``); the state becomes the dequantized value.
 * ``5`` ``d_int3``: ``d`` quantized like ``d_int4`` in 3 bits.
+* ``6`` ``h_int8``: ``h'`` itself quantized like ``d_int8`` (a first visit
+  with ``first: "int8"``); the state becomes the dequantized value.
 
 Each row also carries a 4-byte word ``token | code << CODE_SHIFT | rank <<
 RANK_SHIFT``: the token's index in the Attention rank's batch, the row's format
@@ -53,13 +55,14 @@ Codes by mode (``connector_extra_config = {"delta_dispatch": {...}}``):
   the byte rows).
 * ``delta_fp32``: first visit ``h_bf16``, then ``d_fp32`` (checks the states
   and the closed loop; outputs must equal ``off``).
-* ``delta_int4`` / ``delta_int3``: first visit ``h_bf16`` (``h_int4`` with
-  ``first: "int4"``, on every MoE layer); then ``d_int8`` on the ``early``
-  first and ``late`` last MoE layers and, with ``revisit`` naming a format
-  wider than the mode's own (``"int8"``; for delta_int3 also ``"int4"``), that
-  format on rows whose last visit to the FFN rank was ``rgap`` or more MoE
-  layers before; else ``d_int4`` / ``d_int3`` (the rules of the offline
-  experiment's ``sim.FFNSim``).
+* ``delta_int8`` / ``delta_int4`` / ``delta_int3``: first visit ``h_bf16``
+  (``h_int4`` / ``h_int8`` with ``first: "int4"`` / ``"int8"``, on every MoE
+  layer); then ``d_int8`` on the ``early`` first and ``late`` last MoE layers
+  and, with ``revisit`` naming a format wider than the mode's own (``"int8"``;
+  for delta_int3 also ``"int4"``), that format on rows whose last visit to the
+  FFN rank was ``rgap`` or more MoE layers before; else ``d_int8`` /
+  ``d_int4`` / ``d_int3`` (the rules of the offline experiment's
+  ``sim.FFNSim``).
 * ``x_int4`` / ``x_int8``: no state: every row is ``x = Norm(h')`` in int4 /
   int8 (``d_int4`` / ``d_int8`` of ``x - 0``) and the FFN rank uses the
   dequantized ``x`` as is (plain quantization, the baselines; int8 stands in
@@ -68,7 +71,10 @@ Codes by mode (``connector_extra_config = {"delta_dispatch": {...}}``):
 Combine compression (``connector_extra_config = {"combine": {"mode": ...,
 "ef": ...}}``, needs delta dispatch for the rows' tokens): each FFN rank
 returns its partial sum of a row quantized like the int formats above
-(``int8`` or ``int4``, every row the same size). With ``ef`` (error feedback)
+(``int8`` or ``int4``; every row of a layer the same size). With ``int4``,
+``early`` / ``late`` put the first ``early`` and the last ``late`` MoE layers
+in ``int8`` (the offline experiment's ``cearly`` / ``clate``: the layers whose
+combine error costs the most). With ``ef`` (error feedback)
 it adds to the partial the residual it cut from that (Attention rank, token)
 at its previous visit in this forward and keeps the new residual:
 
@@ -101,19 +107,22 @@ MODES = (
     "delta_int3",
     "x_int4",
     "x_int8",
+    "delta_int8",
 )
 EXTRA_CONFIG_KEY = "delta_dispatch"
 COMBINE_KEY = "combine"
 COMBINE_MODES = ("off", "int8", "int4")
-H_BF16, D_FP32, D_INT8, D_INT4, H_INT4, D_INT3 = 0, 1, 2, 3, 4, 5
-CODE_FORMATS = ("h_bf16", "d_fp32", "d_int8", "d_int4", "h_int4", "d_int3")
-CODE_BITS = {D_INT8: 8, D_INT4: 4, H_INT4: 4, D_INT3: 3}
+H_BF16, D_FP32, D_INT8, D_INT4, H_INT4, D_INT3, H_INT8 = 0, 1, 2, 3, 4, 5, 6
+CODE_FORMATS = ("h_bf16", "d_fp32", "d_int8", "d_int4", "h_int4", "d_int3", "h_int8")
+CODE_BITS = {D_INT8: 8, D_INT4: 4, H_INT4: 4, D_INT3: 3, H_INT8: 8}
+# The first-visit formats: h' itself (the state becomes what was sent).
+H_CODES = (H_BF16, H_INT4, H_INT8)
 # The format of a quantized delta mode's later visits, and the formats
 # ``first`` and ``revisit`` name.
-DELTA_CODES = {"delta_int4": D_INT4, "delta_int3": D_INT3}
+DELTA_CODES = {"delta_int8": D_INT8, "delta_int4": D_INT4, "delta_int3": D_INT3}
 # The format of every row of a plain-quantization (stateless) mode.
 X_CODES = {"x_int4": D_INT4, "x_int8": D_INT8}
-FIRST_FORMATS = {"bf16": H_BF16, "int4": H_INT4}
+FIRST_FORMATS = {"bf16": H_BF16, "int4": H_INT4, "int8": H_INT8}
 REVISIT_FORMATS = {"int3": D_INT3, "int4": D_INT4, "int8": D_INT8}
 CODE_SHIFT = 23
 CODE_MASK = 0x7
@@ -199,8 +208,8 @@ class DeltaDispatchConfig:
         rules = early or late or revisit or rgap != 2 or first != "bf16"
         if rules and mode not in DELTA_CODES:
             raise ValueError(
-                "delta_dispatch early/late/revisit/rgap/first apply to delta_int4 "
-                "and delta_int3 only"
+                "delta_dispatch early/late/revisit/rgap/first apply to the "
+                f"quantized delta modes {tuple(DELTA_CODES)} only"
             )
         return cls(
             mode=mode, early=early, late=late, revisit=revisit, rgap=rgap, first=first
@@ -227,7 +236,7 @@ class DeltaDispatchConfig:
     @property
     def stateful(self) -> bool:
         """Both sides keep the per-FFN-rank states (the delta modes)."""
-        return self.mode in ("delta_fp32", "delta_int4", "delta_int3")
+        return self.mode == "delta_fp32" or self.mode in DELTA_CODES
 
     @property
     def sends_x(self) -> bool:
@@ -284,10 +293,13 @@ class DeltaDispatchConfig:
 
 @dataclass(frozen=True)
 class CombineConfig:
-    """Combine compression: ``mode`` off / int8 / int4, ``ef`` error feedback."""
+    """Combine compression: ``mode`` off / int8 / int4, ``ef`` error feedback;
+    with int4, ``int8`` on the first ``early`` and last ``late`` MoE layers."""
 
     mode: str = "off"
     ef: bool = True
+    early: int = 0
+    late: int = 0
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> CombineConfig:
@@ -295,7 +307,7 @@ class CombineConfig:
             return cls()
         if not isinstance(raw, Mapping):
             raise TypeError("combine must be a mapping")
-        unknown = set(raw) - {"mode", "ef"}
+        unknown = set(raw) - {"mode", "ef", "early", "late"}
         if unknown:
             raise ValueError(f"unknown combine keys: {sorted(unknown)}")
         mode = str(raw.get("mode", "off"))
@@ -304,7 +316,12 @@ class CombineConfig:
         ef = raw.get("ef", True)
         if not isinstance(ef, bool):
             raise ValueError("combine ef must be true or false")
-        return cls(mode=mode, ef=ef)
+        early, late = int(raw.get("early", 0)), int(raw.get("late", 0))
+        if early < 0 or late < 0:
+            raise ValueError("combine early and late must be >= 0")
+        if (early or late) and mode != "int4":
+            raise ValueError("combine early/late (int8 layers) apply to mode int4 only")
+        return cls(mode=mode, ef=ef, early=early, late=late)
 
     @classmethod
     def from_extra_config(cls, extra: Mapping[str, Any] | None) -> CombineConfig:
@@ -323,13 +340,24 @@ class CombineConfig:
 
     @property
     def code(self) -> int:
-        """The row format of the compressed partial sums."""
+        """The row format of the compressed partial sums (outside the int8
+        layers of ``early`` / ``late``)."""
         if not self.enabled:
             raise ValueError("combine compression is off: no row format")
         return {"int8": D_INT8, "int4": D_INT4}[self.mode]
 
-    def row_bytes(self, hidden: int) -> int:
-        return row_bytes(self.code, hidden)
+    def code_at(self, layer_pos: int, num_layers: int) -> int:
+        """The row format at the ``layer_pos``-th of ``num_layers`` MoE layers."""
+        if layer_pos < self.early or layer_pos >= num_layers - self.late:
+            return D_INT8
+        return self.code
+
+    def row_bytes_at(self, layer_pos: int, num_layers: int, hidden: int) -> int:
+        return row_bytes(self.code_at(layer_pos, num_layers), hidden)
+
+    def max_row_bytes(self, hidden: int) -> int:
+        codes = {self.code} | ({D_INT8} if self.early or self.late else set())
+        return max(row_bytes(c, hidden) for c in codes)
 
 
 # ------------------------------------------------------- torch reference
@@ -433,7 +461,7 @@ def encode_rows_reference(
             if cfg.stateful:
                 assert state is not None
                 state[rows_flat] = h.to(torch.bfloat16).float()
-        elif code == H_INT4:
+        elif code in (H_INT4, H_INT8):
             # h' itself: the state becomes what was sent.
             data, deq = _quantized_rows(code, h.float())
             if cfg.stateful:
@@ -482,7 +510,7 @@ def decode_rows_reference(
             continue
         size = row_bytes(code, hidden)
         rows = data[_byte_positions(offsets[sel], size)]
-        if code in (H_BF16, H_INT4):
+        if code in H_CODES:
             # h' itself: the new state.
             if code == H_BF16:
                 value = rows.contiguous().view(torch.bfloat16).float()
@@ -724,11 +752,16 @@ class AttentionDeltaState:
             meta[:num_send],
         )
 
+    def combine_row_bytes(self, layer_pos: int) -> int:
+        """Bytes of a compressed combine row at MoE layer position ``layer_pos``."""
+        return self.combine.row_bytes_at(layer_pos, self.layers.count, self.hidden)
+
     def decode_combine(
-        self, stage: int, data: torch.Tensor, num_rows: int
+        self, stage: int, data: torch.Tensor, num_rows: int, layer_pos: int
     ) -> torch.Tensor:
         """The returned partial sums (fp32 ``[num_rows, hidden]``, dispatch
-        order) rebuilt from the compressed rows in ``data`` (uint8 flat)."""
+        order) of MoE layer position ``layer_pos`` rebuilt from the compressed
+        rows in ``data`` (uint8 flat)."""
         back = self._back.get(stage)
         if back is None:
             back = torch.empty(
@@ -738,7 +771,8 @@ class AttentionDeltaState:
                 device=data.device,
             )
             self._back[stage] = back
-        decode_combine(self.combine.code, data, back[:num_rows])
+        code = self.combine.code_at(layer_pos, self.layers.count)
+        decode_combine(code, data, back[:num_rows])
         return back[:num_rows]
 
     def after_combine(
@@ -778,6 +812,8 @@ class FFNDeltaState:
         self._cbytes: dict[int, torch.Tensor] = {}
         self._crows: dict[int, int] = {}
         self._deq: dict[int, torch.Tensor] = {}
+        # stage -> MoE layer position of the rows being processed.
+        self._pos: dict[int, int] = {}
         self._state: dict[int, torch.Tensor] = {}
         self._rows: dict[int, torch.Tensor] = {}
         # stage -> words of the received rows (handed over by the connector).
@@ -822,6 +858,7 @@ class FFNDeltaState:
         like the plain path's fixed-size buffers). ``norm_into(out, h)``
         writes ``Norm(h)`` into ``out``."""
         pos = self.layers.position(layer_idx)
+        self._pos[stage] = pos
         if pos == 0 and stage in self._err:
             # A new forward: no residual is carried over from the last one.
             self._err[stage].zero_()
@@ -879,7 +916,7 @@ class FFNDeltaState:
             data = self._cbytes.get(stage)
             if data is None:
                 data = torch.empty(
-                    capacity * self.combine.row_bytes(self.hidden),
+                    capacity * self.combine.max_row_bytes(self.hidden),
                     dtype=torch.uint8,
                     device=device,
                 )
@@ -893,11 +930,18 @@ class FFNDeltaState:
                     )
                     self._err[stage] = err
             deq = self._buffer(self._deq, stage, capacity, device, torch.float32)[:n]
-            encode_combine(self.combine.code, returned, rows, err, data, deq)
+            code = self.combine.code_at(self._pos[stage], self.layers.count)
+            encode_combine(code, returned, rows, err, data, deq)
             self._crows[stage] = n
             returned = deq
         if self.cfg.stateful and n:
             self._state[stage].index_add_(0, rows, returned.float(), alpha=self.scale)
+
+    def combine_row_bytes(self, stage: int) -> int:
+        """Bytes of a compressed combine row of the stage's last layer."""
+        return self.combine.row_bytes_at(
+            self._pos[stage], self.layers.count, self.hidden
+        )
 
     def combine_bytes(self, stage: int, num_rows: int) -> torch.Tensor:
         """The compressed partial sums of the stage's last layer (uint8 flat,
@@ -907,7 +951,7 @@ class FFNDeltaState:
                 f"stage {stage}: {self._crows.get(stage)} compressed rows, the "
                 f"connector sends {num_rows}"
             )
-        return self._cbytes[stage][: num_rows * self.combine.row_bytes(self.hidden)]
+        return self._cbytes[stage][: num_rows * self.combine_row_bytes(stage)]
 
 
 __all__ = [
@@ -922,7 +966,9 @@ __all__ = [
     "D_INT8",
     "EXTRA_CONFIG_KEY",
     "H_BF16",
+    "H_CODES",
     "H_INT4",
+    "H_INT8",
     "MODES",
     "QUANT_GROUP_SIZE",
     "RANK_SHIFT",
