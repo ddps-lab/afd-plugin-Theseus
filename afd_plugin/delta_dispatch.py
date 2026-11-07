@@ -11,7 +11,7 @@ times the partial sum it returned then. The Attention side keeps a copy of
 every FFN rank's states. At a MoE layer, for a row of FFN rank ``f``:
 
     first visit of the forward:  send h' in bf16,              S_f = h'
-               (first "int4"):   send Q(h'),                   S_f = deq(Q(h'))
+      (first "int4" / "int8"):   send Q(h'),                   S_f = deq(Q(h'))
     later visit:                 d = h' - S_f, send Q(d),      S_f += deq(Q(d))
 
 the FFN rank normalizes ``S_f`` itself (``x = Norm(S_f in bf16)``), and after
@@ -194,6 +194,9 @@ class DeltaDispatchConfig:
         own = DELTA_CODES.get(mode, D_INT4)
         if revisit and REVISIT_FORMATS[revisit] == own:
             revisit = ""
+        # The early / late rows are d_int8: already the rows of delta_int8.
+        if own == D_INT8:
+            early = late = 0
         if revisit and CODE_BITS[REVISIT_FORMATS[revisit]] <= CODE_BITS[own]:
             raise ValueError(
                 f"delta_dispatch revisit {revisit!r} is not wider than the rows "

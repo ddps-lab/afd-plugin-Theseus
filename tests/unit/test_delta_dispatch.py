@@ -315,6 +315,11 @@ def test_first_and_revisit_config() -> None:
         {"mode": "delta_int4", "first": "int8"}
     )
     assert wide_first.first == "int8"
+    # delta_int8 rows are already int8: early / late are no rule (same setting).
+    ruled = DeltaDispatchConfig.from_mapping(
+        {"mode": "delta_int8", "early": 4, "late": 4}
+    )
+    assert ruled == DeltaDispatchConfig.from_mapping({"mode": "delta_int8"})
     for bad in (
         {"mode": "delta_int8", "revisit": "int4"},
         {"mode": "x_int8", "first": "int8"},
@@ -368,6 +373,15 @@ def test_row_formats_and_codes() -> None:
         "delta_int4 first": (
             DeltaDispatchConfig(mode="delta_int4", first="int4"),
             (1088, 1088),
+        ),
+        "delta_int4 first int8": (
+            DeltaDispatchConfig(mode="delta_int4", first="int8"),
+            (1088, 2112),
+        ),
+        "delta_int8": (DeltaDispatchConfig(mode="delta_int8"), (2112, 4096)),
+        "delta_int8 first": (
+            DeltaDispatchConfig(mode="delta_int8", first="int8"),
+            (2112, 2112),
         ),
     }
     for name, (cfg, limits) in bounds.items():
