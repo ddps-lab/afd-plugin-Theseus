@@ -628,6 +628,8 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             vllm_config.parallel_config, "expert_placement_file", None
         )
         self._layer_owner: dict[int, torch.Tensor] | None = None
+        # _layer_owner tables with -1 appended (filled by _begin_plan).
+        self._layer_owner_pad: dict[int, torch.Tensor] = {}
         self._placement_digest = 0
         # With copies: the per-pair FFN ranks of the stages whose rows are
         # being packed (Attention).
@@ -928,7 +930,16 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                 f"expert placement file {self.expert_placement_file} has no "
                 f"MoE layer {layer_idx}",
             )
-        return self.engine.begin_plan(topk_ids, slot=stage, expert_owner=owner)
+        # The table with one more entry, -1 (no rank), at the end: padding ids
+        # (< 0) clamp to -1 and read it, so the rank of every pair is one
+        # gather (the engine's expert_owner path spends five small kernels
+        # per layer on the padding). Same plan as expert_owner=owner.
+        pads = self.__dict__.setdefault("_layer_owner_pad", {})
+        padded = pads.get(int(layer_idx))
+        if padded is None:
+            padded = pads[int(layer_idx)] = torch.cat([owner, owner.new_full((1,), -1)])
+        rank_of = padded[topk_ids.clamp(min=-1)]
+        return self.engine.begin_plan(topk_ids, slot=stage, rank_of=rank_of)
 
     def _mask_copied_ids(
         self,
