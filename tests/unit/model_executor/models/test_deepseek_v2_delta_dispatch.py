@@ -39,6 +39,8 @@ from vllm.model_executor.layers.layernorm import RMSNorm  # noqa: E402
 from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.connectors.gpu import routed as routed_connector  # noqa: E402
 from afd_plugin.delta_dispatch import (  # noqa: E402
+    CODE_MASK,
+    CODE_SHIFT,
     D_INT3,
     D_INT4,
     D_INT8,
@@ -272,7 +274,7 @@ class _Loopback:
         plan = self.engine.finish_plan_local(pending)
         n = plan.num_send
         if cfg.enabled:
-            totals = packed.totals.tolist()
+            totals = delta.ffn_bytes(packed, plan.send_counts[: delta.num_ffn])
             data = torch.zeros(sum(totals), dtype=torch.uint8)
             words = torch.zeros(n, dtype=torch.int32)
             src = hidden_states if cfg.sends_x else h_prime
@@ -281,7 +283,7 @@ class _Loopback:
                 {
                     "layer": layer_idx,
                     "stage": stage,
-                    "codes": packed.codes[:n].tolist(),
+                    "codes": ((words >> CODE_SHIFT) & CODE_MASK).tolist(),
                     "bytes": totals,
                     "x": hidden_states[plan.perm].clone(),
                 }

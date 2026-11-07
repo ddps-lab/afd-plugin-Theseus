@@ -293,6 +293,32 @@ class DeltaDispatchConfig:
     def min_row_bytes(self, hidden: int) -> int:
         return min(row_bytes(c, hidden) for c in self._codes())
 
+    def fixed_row_bytes(self, hidden: int) -> int:
+        """The row size when every row of the mode has the same size, else 0.
+        Then a row's byte offset is its index times the size, the bytes per
+        FFN rank its row count times the size, and the format depends only on
+        whether the row is a first visit (``first_rest_codes``): a mode with an
+        early / late / revisit rule mixes sizes."""
+        sizes = {row_bytes(c, hidden) for c in self._codes()}
+        return sizes.pop() if len(sizes) == 1 else 0
+
+    def first_rest_codes(self) -> tuple[int, int]:
+        """(format of a first visit, format of a later visit) of a mode whose
+        rows all have the same size (``fixed_row_bytes``)."""
+        if self.mode == "full_bf16":
+            return H_BF16, H_BF16
+        if self.mode in X_CODES:
+            return X_CODES[self.mode], X_CODES[self.mode]
+        rest = DELTA_CODES.get(self.mode)
+        # early / late rows are d_int8: the same format only for delta_int8.
+        if (
+            rest is None
+            or self.revisit
+            or ((self.early or self.late) and rest != D_INT8)
+        ):
+            raise ValueError(f"{self} has rows of more than one size")
+        return FIRST_FORMATS[self.first], rest
+
 
 @dataclass(frozen=True)
 class CombineConfig:
@@ -451,9 +477,17 @@ def encode_rows_reference(
     """Torch reference of the fused Attention kernel for ``len(flat)`` rows:
     row ``i`` is token ``flat[i] % num_tokens`` of ``src`` against state row
     ``flat[i]`` in format ``codes[i]``, written to ``out`` (uint8, flat) at
-    ``offsets[i]``; the states (and ``last``) are updated in place."""
+    ``offsets[i]``; the states (and ``last``) are updated in place. With
+    ``codes`` None (a mode whose rows all have one size) the format is the
+    first-visit one where ``last[flat] < 0``, else the later-visit one."""
     hidden = src.shape[1]
     tokens = flat % num_tokens
+    if codes is None:
+        first, rest = cfg.first_rest_codes()
+        if cfg.stateful and last is not None:
+            codes = torch.where(last[flat] < 0, first, rest).to(torch.int32)
+        else:
+            codes = torch.full_like(flat, rest, dtype=torch.int32)
     for code in range(len(CODE_FORMATS)):
         sel = (codes == code).nonzero().view(-1)
         if not sel.numel():
@@ -497,15 +531,29 @@ def decode_rows_reference(
     cfg: DeltaDispatchConfig,
     data: torch.Tensor,
     meta: torch.Tensor,
-    offsets: torch.Tensor,
-    state_rows: torch.Tensor,
+    offsets: torch.Tensor | None,
+    state_rows: torch.Tensor | None,
     state: torch.Tensor | None,
     h_out: torch.Tensor,
+    rows_out: torch.Tensor | None = None,
+    max_tokens: int = 0,
+    row_size: int = 0,
 ) -> None:
     """Torch reference of the fused FFN kernel: rebuild every row's value from
     the packed bytes into ``h_out`` (``h'``, or ``x`` when ``cfg.sends_x``) and
-    update the states (rows ``state_rows``) in place."""
+    update the states (rows ``state_rows``) in place. With ``state_rows``
+    None the state row of a row is read from its word (Attention rank *
+    ``max_tokens`` + token) and written to ``rows_out``; with ``offsets``
+    None every row is ``row_size`` bytes (offset index * ``row_size``)."""
     hidden = h_out.shape[1]
+    if state_rows is None:
+        state_rows = (meta >> RANK_SHIFT).long() * max_tokens + (
+            meta & TOKEN_MASK
+        ).long()
+        if rows_out is not None:
+            rows_out.copy_(state_rows)
+    if offsets is None:
+        offsets = torch.arange(meta.shape[0], device=meta.device) * row_size
     codes = (meta >> CODE_SHIFT) & CODE_MASK
     for code in range(len(CODE_FORMATS)):
         sel = (codes == code).nonzero().view(-1)
@@ -601,13 +649,13 @@ def encode_rows(cfg: DeltaDispatchConfig, *args: Any) -> None:
     encode_rows_reference(cfg, *args)
 
 
-def decode_rows(cfg: DeltaDispatchConfig, *args: Any) -> None:
+def decode_rows(cfg: DeltaDispatchConfig, *args: Any, **kwargs: Any) -> None:
     if args[0].is_cuda:
         from afd_plugin import delta_dispatch_triton
 
-        delta_dispatch_triton.decode_rows(cfg, *args)
+        delta_dispatch_triton.decode_rows(cfg, *args, **kwargs)
         return
-    decode_rows_reference(cfg, *args)
+    decode_rows_reference(cfg, *args, **kwargs)
 
 
 # ------------------------------------------------------------------ states
@@ -638,12 +686,16 @@ class PackedDispatch:
     num_tokens: int
     # Per padded dispatch entry: the state row (FFN rank * num_tokens +
     # token), the format code and the byte offset in the packed block.
+    # A mode whose rows all have one size (``row_size``) leaves the codes to
+    # the encode kernel (None) and its entries past the sent ones unmasked.
     flat: torch.Tensor
-    codes: torch.Tensor
+    codes: torch.Tensor | None
     offsets: torch.Tensor
     # Bytes per FFN rank, copied to host memory without waiting (readable
-    # once the stream has passed ``prepare``).
-    totals: torch.Tensor
+    # once the stream has passed ``prepare``); None with one row size (the
+    # host knows them from the plan's row counts, ``ffn_bytes``).
+    totals: torch.Tensor | None
+    row_size: int = 0
 
 
 class AttentionDeltaState:
@@ -672,6 +724,11 @@ class AttentionDeltaState:
         self._last: dict[int, torch.Tensor] = {}
         self._totals: dict[int, torch.Tensor] = {}
         self._table: torch.Tensor | None = None
+        # One row size for every row of the mode (0: sizes differ): the
+        # offsets are index * size (``_offsets``, made once) and the codes are
+        # chosen in the encode kernel.
+        self._fixed = cfg.fixed_row_bytes(hidden)
+        self._offsets: torch.Tensor | None = None
 
     def _stage(
         self, stage: int, device: torch.device
@@ -709,6 +766,28 @@ class AttentionDeltaState:
         if pos == 0:
             # A new forward: every token starts with a first visit.
             last.fill_(-1)
+        if self._fixed:
+            # One row size: no per-row work here. The sent entries come first
+            # in ``order`` and only those are encoded and read back.
+            if self._offsets is None or self._offsets.device != order.device:
+                self._offsets = (
+                    torch.arange(
+                        self.num_ffn * self.max_tokens,
+                        dtype=torch.int64,
+                        device=order.device,
+                    )
+                    * self._fixed
+                )
+            return PackedDispatch(
+                stage,
+                pos,
+                num_tokens,
+                order,
+                None,
+                self._offsets[: order.shape[0]],
+                None,
+                self._fixed,
+            )
         valid = order < self.num_ffn * num_tokens
         flat = torch.where(valid, order, 0)
         codes = self.cfg.row_codes(pos, self.layers.count, last[flat])
@@ -747,13 +826,22 @@ class AttentionDeltaState:
             last,
             packed.layer_pos,
             packed.flat[:num_send],
-            packed.codes[:num_send],
+            None if packed.codes is None else packed.codes[:num_send],
             packed.offsets[:num_send],
             packed.num_tokens,
             rank,
             out,
             meta[:num_send],
         )
+
+    def ffn_bytes(
+        self, packed: PackedDispatch, send_counts: Sequence[int]
+    ) -> list[int]:
+        """Bytes of this dispatch per FFN rank (``send_counts``: its rows per
+        FFN rank from the plan)."""
+        if packed.totals is None:
+            return [int(c) * packed.row_size for c in send_counts]
+        return [int(b) for b in packed.totals.tolist()]
 
     def combine_row_bytes(self, layer_pos: int) -> int:
         """Bytes of a compressed combine row at MoE layer position ``layer_pos``."""
@@ -825,6 +913,11 @@ class FFNDeltaState:
         self._h: dict[int, torch.Tensor] = {}
         self._x: dict[int, torch.Tensor] = {}
         self._table: torch.Tensor | None = None
+        # One row size for every row of the mode (0: sizes differ): the decode
+        # kernel finds each row at index * size. It always reads each row's
+        # state row from its word and writes it here (int32, per stage).
+        self._fixed = cfg.fixed_row_bytes(self.hidden)
+        self._row_ids: dict[int, torch.Tensor] = {}
 
     def _buffer(
         self,
@@ -878,15 +971,21 @@ class FFNDeltaState:
         if not n:
             self._rows[stage] = meta.new_empty(0, dtype=torch.int64)
             return x[:out_rows]
-        if self._table is None:
-            self._table = row_bytes_table(self.hidden, device)
-        codes = ((meta >> CODE_SHIFT) & CODE_MASK).long()
-        nbytes = self._table[codes]
-        offsets = torch.cumsum(nbytes, 0) - nbytes
-        rows = (meta >> RANK_SHIFT).long() * self.max_tokens + (
-            meta & TOKEN_MASK
-        ).long()
+        offsets = None
+        if not self._fixed:
+            if self._table is None:
+                self._table = row_bytes_table(self.hidden, device)
+            nbytes = self._table[((meta >> CODE_SHIFT) & CODE_MASK).long()]
+            offsets = torch.cumsum(nbytes, 0) - nbytes
+        ids = self._row_ids.get(stage)
+        if ids is None or ids.device != device:
+            ids = torch.empty(
+                self.num_attn * self.max_tokens, dtype=torch.int32, device=device
+            )
+            self._row_ids[stage] = ids
+        rows = ids[:n]
         self._rows[stage] = rows
+        kw = {"rows_out": rows, "max_tokens": self.max_tokens, "row_size": self._fixed}
         state = None
         if self.cfg.stateful:
             state = self._state.get(stage)
@@ -899,10 +998,10 @@ class FFNDeltaState:
                 )
                 self._state[stage] = state
         if self.cfg.sends_x:
-            decode_rows(self.cfg, data, meta, offsets, rows, state, x[:n])
+            decode_rows(self.cfg, data, meta, offsets, None, state, x[:n], **kw)
             return x[:out_rows]
         h = self._buffer(self._h, stage, n, device, dtype)[:n]
-        decode_rows(self.cfg, data, meta, offsets, rows, state, h)
+        decode_rows(self.cfg, data, meta, offsets, None, state, h, **kw)
         norm_into(x[:n], h)
         return x[:out_rows]
 

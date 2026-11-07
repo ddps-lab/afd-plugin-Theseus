@@ -843,14 +843,17 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         pending = self._begin_plan(ids, stage, int(layer_idx))
         # Formats, byte offsets and per-FFN byte counts on the same stream,
         # before the event the host waits for anyway: the counts are in host
-        # memory once it fires (no extra synchronization).
+        # memory once it fires (no extra synchronization). With one row size
+        # there is nothing to do here (the encode kernel picks the formats).
         packed = state.prepare(int(layer_idx), stage, pending.order, pending.num_tokens)
         planned = torch.cuda.Event()
         planned.record(stream)
         with _profile_range(f"afd_nixl.plan_wait[{stage}]"):
             self._wait_event(planned, "plan")
         plan = engine.finish_plan_local(pending)
-        totals = packed.totals.tolist()
+        # Bytes per FFN rank: with one row size the row counts times the size
+        # (no device work), else the totals ``prepare`` copied to host memory.
+        totals = state.ffn_bytes(packed, plan.send_counts[: self.ffn_size])
         self._dbg_plan = plan.seq
         self._dbg(
             "A send stage=%d seq=%d tokens=%d send=%s bytes=%s",

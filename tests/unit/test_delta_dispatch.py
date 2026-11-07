@@ -129,22 +129,24 @@ def _drive(
                 order = _order(owner, ids, num_ffn)
                 packed = attn[a].prepare(layer, s, order, TOKENS)
                 n = int((order < num_ffn * TOKENS).sum())
-                out = torch.zeros(int(packed.totals.sum()) + 16, dtype=torch.uint8)
+                counts = torch.bincount(order[:n] // TOKENS, minlength=num_ffn)
+                totals = attn[a].ffn_bytes(packed, counts.tolist())
+                out = torch.zeros(sum(totals) + 16, dtype=torch.uint8)
                 meta = torch.zeros(n, dtype=torch.int32)
                 src = _norm(h_prime) if cfg.sends_x else h_prime
                 attn[a].encode(packed, src, n, out, meta, a)
-                sent[a] = (h_prime, ids, weights, packed, n, out, meta)
+                sent[a] = (h_prime, ids, weights, packed, n, out, meta, totals)
             # Every FFN rank receives its rows of all Attention ranks
             # (Attention rank major), rebuilds them and runs its experts.
             results: dict[int, list] = {a: [] for a in range(num_attn)}
             for f in range(num_ffn):
                 datas, words, origin = [], [], []
                 for a in range(num_attn):
-                    _, ids, weights, packed, n, out, meta = sent[a]
+                    _, ids, weights, packed, n, out, meta, totals = sent[a]
                     rows = (packed.flat[:n] // TOKENS == f).nonzero().view(-1)
                     if rows.numel():
                         start = int(packed.offsets[rows[0]])
-                        datas.append(out[start : start + int(packed.totals[f])])
+                        datas.append(out[start : start + totals[f]])
                         words.append(meta[rows])
                         origin += [(a, int(i)) for i in rows]
                 data = torch.cat(datas) if datas else torch.zeros(0, dtype=torch.uint8)
@@ -156,7 +158,7 @@ def _drive(
                 assert torch.isfinite(x[len(origin) :]).all()
                 partial = torch.zeros(launch, HIDDEN)
                 for r, (a, i) in enumerate(origin):
-                    _, ids, weights, packed, _, _, _ = sent[a]
+                    _, ids, weights, packed, _, _, _, _ = sent[a]
                     t = int(packed.flat[i]) % TOKENS
                     for k in range(TOP_K):
                         if int(owner[ids[t, k]]) == f:
@@ -175,7 +177,7 @@ def _drive(
                     wire = cbytes[r * rb : (r + 1) * rb] if combine.enabled else None
                     results[a].append((i, partial[r], x[r].clone(), f, wire))
             for a in range(num_attn):
-                h_prime, ids, weights, packed, n, _, meta = sent[a]
+                h_prime, ids, weights, packed, n, _, meta, totals = sent[a]
                 exact = torch.zeros(n, HIDDEN, dtype=torch.bfloat16)
                 inputs = {}
                 for i, part, x_row, f, _ in results[a]:
@@ -208,9 +210,11 @@ def _drive(
                         "inputs": inputs,
                         "norm_h": _norm(h_prime),
                         "flat": packed.flat[:n].clone(),
-                        "codes": packed.codes[:n].clone(),
+                        # The codes as sent (the words); with one row size the
+                        # encode kernel picks them (packed.codes is None).
+                        "codes": (meta >> CODE_SHIFT) & CODE_MASK,
                         "meta": meta.clone(),
-                        "bytes": packed.totals.clone(),
+                        "bytes": torch.tensor(totals),
                         "exact": exact.float(),
                         "received": back.float(),
                     }
@@ -777,6 +781,105 @@ def test_triton_kernels_match_reference(mode: str, first: str, hidden: int) -> N
         assert torch.equal(h_out, gpu_state[rows_idx].to(torch.bfloat16))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton)")
+@pytest.mark.parametrize(
+    "mode,first",
+    [
+        ("delta_int4", "int4"),
+        ("delta_int8", "int8"),
+        ("x_int4", "bf16"),
+        ("x_int8", "bf16"),
+        ("full_bf16", "bf16"),
+        (
+            "delta_int3",
+            "int4",
+        ),  # sizes differ: offsets given, rows still from the words
+    ],
+)
+def test_triton_one_row_size_paths_match_reference(mode: str, first: str) -> None:
+    # One row size: the encode kernel picks the codes (first visit or not)
+    # and the host updates the visits after it; the decode kernel finds each
+    # row at index * size and reads its state row from its word.
+    from afd_plugin import delta_dispatch_triton
+
+    cfg = DeltaDispatchConfig(mode=mode, first=first)
+    size = cfg.fixed_row_bytes(MODEL_HIDDEN)
+    gen = torch.Generator().manual_seed(5)
+    tokens, rows, rank, max_tokens = 64, 40, 3, 96
+    flat = torch.randperm(3 * tokens, generator=gen)[:rows].sort().values
+    last = torch.randint(-1, 3, (3 * tokens,), generator=gen, dtype=torch.int32)
+    if size:
+        codes, offsets = None, torch.arange(rows) * size
+    else:
+        codes = cfg.row_codes(3, 8, last[flat])
+        sizes = torch.tensor([row_bytes(int(c), MODEL_HIDDEN) for c in codes])
+        offsets = torch.cumsum(sizes, 0) - sizes
+    total = int(offsets[-1]) + cfg.max_row_bytes(MODEL_HIDDEN)
+    h = (torch.randn(tokens, MODEL_HIDDEN, generator=gen) * 3).to(torch.bfloat16)
+    state = torch.randn(3 * tokens, MODEL_HIDDEN, generator=gen) * 3
+    ref_state, ref_last = state.clone(), last.clone()
+    ref_out = torch.zeros(total, dtype=torch.uint8)
+    ref_meta = torch.zeros(rows, dtype=torch.int32)
+    encode_rows_reference(
+        cfg,
+        h,
+        ref_state,
+        ref_last,
+        3,
+        flat,
+        codes,
+        offsets,
+        tokens,
+        rank,
+        ref_out,
+        ref_meta,
+    )
+    gpu_state, gpu_last = state.cuda(), last.cuda()
+    out = torch.zeros(total, dtype=torch.uint8, device="cuda")
+    meta = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    delta_dispatch_triton.encode_rows(
+        cfg,
+        h.cuda(),
+        gpu_state,
+        gpu_last,
+        3,
+        flat.cuda(),
+        None if codes is None else codes.cuda(),
+        offsets.cuda(),
+        tokens,
+        rank,
+        out,
+        meta,
+    )
+    assert torch.equal(out.cpu(), ref_out) and torch.equal(meta.cpu(), ref_meta)
+    torch.testing.assert_close(gpu_state.cpu(), ref_state, rtol=1e-6, atol=1e-6)
+    if cfg.stateful:
+        assert torch.equal(gpu_last.cpu(), ref_last)
+    # One FFN rank's rows (destination-major: the first k), its state rows
+    # from the words: Attention rank * max_tokens + token.
+    k = int((flat < tokens).sum())
+    ffn_state = torch.randn(4 * max_tokens, MODEL_HIDDEN, generator=gen).cuda()
+    h_out = torch.empty(k, MODEL_HIDDEN, dtype=torch.bfloat16, device="cuda")
+    rows_out = torch.empty(k, dtype=torch.int32, device="cuda")
+    delta_dispatch_triton.decode_rows(
+        cfg,
+        out,
+        meta[:k],
+        None if size else offsets[:k].cuda(),
+        None,
+        ffn_state if cfg.stateful else None,
+        h_out,
+        rows_out=rows_out,
+        max_tokens=max_tokens,
+        row_size=size,
+    )
+    want = (rank * max_tokens + flat[:k] % tokens).cuda()
+    assert torch.equal(rows_out.long(), want)
+    if cfg.stateful:
+        assert torch.equal(ffn_state[want], gpu_state[flat[:k].cuda()])
+        assert torch.equal(h_out, ffn_state[want].to(torch.bfloat16))
+
+
 def test_each_forward_starts_with_first_visits() -> None:
     # The first MoE layer of a forward clears the visits: every row is bf16
     # again, whatever the previous forward left.
@@ -792,6 +895,24 @@ def test_each_forward_starts_with_first_visits() -> None:
             out = torch.zeros(int(packed.totals.sum()), dtype=torch.uint8)
             meta = torch.zeros(2 * TOKENS, dtype=torch.int32)
             attn.encode(packed, h, 2 * TOKENS, out, meta, 0)
+    # One row size (first visits int4): the encode kernel picks the codes,
+    # the words carry them.
+    cfg = DeltaDispatchConfig(mode="delta_int4", first="int4")
+    attn = AttentionDeltaState(cfg, MOE_LAYERS, ROUTED_SCALE, 2, TOKENS, HIDDEN)
+    for _forward in range(2):
+        for pos, layer in enumerate(MOE_LAYERS):
+            packed = attn.prepare(layer, 0, order, TOKENS)
+            assert packed.codes is None and packed.totals is None
+            assert packed.row_size == row_bytes(D_INT4, HIDDEN)
+            assert (
+                attn.ffn_bytes(packed, [TOKENS, TOKENS])
+                == [TOKENS * packed.row_size] * 2
+            )
+            out = torch.zeros(2 * TOKENS * packed.row_size, dtype=torch.uint8)
+            meta = torch.zeros(2 * TOKENS, dtype=torch.int32)
+            attn.encode(packed, h, 2 * TOKENS, out, meta, 0)
+            want = H_INT4 if pos == 0 else D_INT4
+            assert set(((meta >> CODE_SHIFT) & CODE_MASK).tolist()) == {want}
 
 
 def test_combine_config_parsing() -> None:
