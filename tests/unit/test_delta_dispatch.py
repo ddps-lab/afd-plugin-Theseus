@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -17,9 +18,11 @@ from afd_plugin.delta_dispatch import (
     D_INT3,
     D_INT4,
     D_INT8,
+    D_NVFP4,
     H_BF16,
     H_INT4,
     H_INT8,
+    H_NVFP4,
     MAX_ATTENTION_RANKS,
     QUANT_GROUP_SIZE,
     RANK_SHIFT,
@@ -42,6 +45,49 @@ ROUTED_SCALE = 1.5
 EPS = 1e-6
 NUM_EXPERTS, TOP_K = 8, 2
 MODEL_HIDDEN = 2048
+# The Triton kernels run on CUDA, or on the CPU in Triton's interpreter
+# (TRITON_INTERPRET=1; slow, and the GPU's E4M3 conversion is not emulated).
+KERNEL_DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else ("cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "")
+)
+needs_kernels = pytest.mark.skipif(
+    not KERNEL_DEVICE, reason="needs CUDA or TRITON_INTERPRET=1 (Triton)"
+)
+# The kernel tests move tensors with .to(KERNEL_DEVICE, copy=True): on the CPU
+# a plain .to() returns the same tensor, and the two sides' states would alias.
+# The E4M3 conversion instructions (Ada and later).
+HARDWARE_E4M3 = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
+    8,
+    9,
+)
+
+
+def _assert_same_model_dtype(got: torch.Tensor, want: torch.Tensor) -> None:
+    """Kernel output in the model dtype vs ``want`` (fp32) cast to it: equal on
+    CUDA; the interpreter truncates fp32 -> bf16 instead of rounding, so there
+    within one bf16 step."""
+    if KERNEL_DEVICE == "cuda":
+        assert torch.equal(got, want.to(got.dtype))
+    else:
+        torch.testing.assert_close(got.float(), want.float(), rtol=2**-7, atol=0)
+
+
+NVFP4_KERNEL_VARIANTS = [
+    ("two_pass", False),
+    ("one_pass", False),
+    pytest.param(
+        "two_pass",
+        True,
+        marks=pytest.mark.skipif(not HARDWARE_E4M3, reason="needs E4M3 hardware"),
+    ),
+    pytest.param(
+        "one_pass",
+        True,
+        marks=pytest.mark.skipif(not HARDWARE_E4M3, reason="needs E4M3 hardware"),
+    ),
+]
 
 
 def _norm_into(out: torch.Tensor, h: torch.Tensor) -> None:
@@ -71,6 +117,36 @@ def _offline_quantize(x: torch.Tensor, bits: int) -> torch.Tensor:
     s = ((hi - lo).clamp_min(1e-12) / n).half().float()
     lo = lo.half().float()
     return (torch.round((g - lo) / s).clamp(0, n) * s + lo).reshape(sh)
+
+
+_OFFLINE_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _offline_round_e2m1(y: torch.Tensor) -> torch.Tensor:
+    """compress.py ``_round_e2m1``, copied."""
+    grid = torch.tensor(_OFFLINE_E2M1, device=y.device)
+    a = y.abs().clamp(max=6.0)
+    lo_i = (torch.searchsorted(grid, a.contiguous(), right=True) - 1).clamp(0, 6)
+    lo, hi = grid[lo_i], grid[lo_i + 1]
+    up = (hi - a < a - lo) | ((hi - a == a - lo) & (lo_i % 2 == 1))
+    return torch.where(up, hi, lo) * torch.sign(y)
+
+
+def _offline_nvfp4(x: torch.Tensor) -> torch.Tensor:
+    """The offline experiment's NVFP4 (compress.py ``_q_nvfp4``), copied."""
+    block = 16
+    sh = x.shape
+    gs = (x.abs().amax(-1, keepdim=True) / (448.0 * 6.0)).clamp_min(1e-30)
+    g = x.reshape(*sh[:-1], sh[-1] // block, block)
+    bs = g.abs().amax(-1, keepdim=True) / 6.0 / gs.unsqueeze(-1)
+    bs = bs.to(torch.float8_e4m3fn).float()
+    scale = bs * gs.unsqueeze(-1)
+    q = torch.where(
+        scale > 0,
+        _offline_round_e2m1(g / scale.clamp_min(1e-30)),
+        torch.zeros_like(g),
+    )
+    return (q * scale).reshape(sh)
 
 
 def _order(owner: torch.Tensor, ids: torch.Tensor, num_ffn: int) -> torch.Tensor:
@@ -251,9 +327,13 @@ def test_config_parsing() -> None:
         "int8",
         2,
     )
-    for mode in ("x_int4", "x_int8"):
+    for mode in ("x_int4", "x_int8", "x_nvfp4"):
         assert DeltaDispatchConfig(mode=mode).sends_x
         assert not DeltaDispatchConfig(mode=mode).stateful
+    cfg = DeltaDispatchConfig.from_mapping({"mode": "delta_nvfp4", "first": "nvfp4"})
+    assert (cfg.mode, cfg.first) == ("delta_nvfp4", "nvfp4")
+    assert cfg.stateful and cfg.uses_nvfp4
+    assert not DeltaDispatchConfig(mode="delta_int4").uses_nvfp4
     cfg = DeltaDispatchConfig.from_mapping({"mode": "delta_int8", "first": "int8"})
     assert (cfg.mode, cfg.first) == ("delta_int8", "int8")
     assert cfg.stateful and not cfg.sends_x
@@ -336,6 +416,9 @@ def test_first_and_revisit_config() -> None:
         {"mode": "full_bf16", "first": "int4"},
         {"mode": "x_int4", "first": "int4"},
         {"mode": "off", "first": "int4"},
+        # NVFP4 rows are 4-bit: an int4 revisit is not wider.
+        {"mode": "delta_nvfp4", "revisit": "int4"},
+        {"mode": "x_nvfp4", "first": "nvfp4"},
     ):
         with pytest.raises(ValueError):
             DeltaDispatchConfig.from_mapping(bad)
@@ -350,6 +433,10 @@ def test_row_formats_and_codes() -> None:
     assert row_bytes(H_INT8, MODEL_HIDDEN) == 2112
     assert row_bytes(D_INT3, MODEL_HIDDEN) == 832
     assert row_bytes(D_INT3, QUANT_GROUP_SIZE) == 52
+    # NVFP4: 4-bit codes, an E4M3 byte per 16 values, the fp32 row scale.
+    assert row_bytes(D_NVFP4, MODEL_HIDDEN) == 1156
+    assert row_bytes(H_NVFP4, MODEL_HIDDEN) == 1156
+    assert row_bytes(D_NVFP4, QUANT_GROUP_SIZE) == 76
     # (min, max) row bytes per config; the existing ones as before.
     bounds = {
         "delta_int4": (DeltaDispatchConfig(mode="delta_int4"), (1088, 4096)),
@@ -387,6 +474,16 @@ def test_row_formats_and_codes() -> None:
             DeltaDispatchConfig(mode="delta_int8", first="int8"),
             (2112, 2112),
         ),
+        "delta_nvfp4": (DeltaDispatchConfig(mode="delta_nvfp4"), (1156, 4096)),
+        "delta_nvfp4 first": (
+            DeltaDispatchConfig(mode="delta_nvfp4", first="nvfp4"),
+            (1156, 1156),
+        ),
+        "delta_nvfp4 first late": (
+            DeltaDispatchConfig(mode="delta_nvfp4", first="nvfp4", late=1),
+            (1156, 2112),
+        ),
+        "x_nvfp4": (DeltaDispatchConfig(mode="x_nvfp4"), (1156, 1156)),
     }
     for name, (cfg, limits) in bounds.items():
         got = (cfg.min_row_bytes(MODEL_HIDDEN), cfg.max_row_bytes(MODEL_HIDDEN))
@@ -435,6 +532,23 @@ def test_row_formats_and_codes() -> None:
             [4, 2, 2, 2, 2],
         ),
         "int3 late": (DeltaDispatchConfig(mode="delta_int3", late=4), [0, 2, 2, 2, 2]),
+        "nvfp4": (DeltaDispatchConfig(mode="delta_nvfp4"), [0, 8, 8, 8, 8]),
+        "nvfp4 first revisit": (
+            DeltaDispatchConfig(mode="delta_nvfp4", first="nvfp4", revisit="int8"),
+            [7, 8, 2, 2, 2],
+        ),
+        "nvfp4 first late": (
+            DeltaDispatchConfig(mode="delta_nvfp4", first="nvfp4", late=4),
+            [7, 2, 2, 2, 2],
+        ),
+        "x_nvfp4": (DeltaDispatchConfig(mode="x_nvfp4"), [8, 8, 8, 8, 8]),
+    }
+    nvfp4_modes = {name for name, (cfg, _) in cases.items() if cfg.uses_nvfp4}
+    assert nvfp4_modes == {
+        "nvfp4",
+        "nvfp4 first revisit",
+        "nvfp4 first late",
+        "x_nvfp4",
     }
     for name, (cfg, want) in cases.items():
         assert cfg.row_codes(5, 9, last).tolist() == want, name
@@ -496,6 +610,39 @@ def test_first_visit_in_int_replaces_the_state(
     assert torch.equal((meta >> CODE_SHIFT) & CODE_MASK, codes)
     ffn_state = torch.full((TOKENS, HIDDEN), 7.0)
     h_out = torch.zeros(TOKENS, HIDDEN)
+    decode_rows_reference(cfg, out, meta, offsets, flat, ffn_state, h_out)
+    assert torch.equal(ffn_state, want) and torch.equal(h_out, want)
+
+
+@pytest.mark.parametrize("first_visit", [False, True])
+def test_nvfp4_matches_offline_experiment(first_visit: bool) -> None:
+    # d_nvfp4: the state moves by the offline NVFP4 of h' - S; h_nvfp4 (first
+    # visit): the state becomes the offline NVFP4 of h'. Rows hold a few large
+    # values; the FFN side rebuilds the same state from the bytes.
+    cfg = DeltaDispatchConfig(mode="delta_nvfp4", first="nvfp4")
+    gen = torch.Generator().manual_seed(7)
+    h = torch.randn(TOKENS, HIDDEN, generator=gen) * 3
+    h[torch.rand(TOKENS, HIDDEN, generator=gen) < 0.01] *= 20
+    h = h.to(torch.bfloat16)
+    state = torch.randn(TOKENS, HIDDEN, generator=gen) * 3
+    before = state.clone()
+    code = H_NVFP4 if first_visit else D_NVFP4
+    size = row_bytes(code, HIDDEN)
+    flat, offsets = torch.arange(TOKENS), torch.arange(TOKENS) * size
+    out = torch.zeros(TOKENS * size, dtype=torch.uint8)
+    meta = torch.zeros(TOKENS, dtype=torch.int32)
+    last = torch.full((TOKENS,), -1, dtype=torch.int32)
+    codes = torch.full((TOKENS,), code, dtype=torch.int32)
+    encode_rows_reference(
+        cfg, h, state, last, 2, flat, codes, offsets, TOKENS, 3, out, meta
+    )
+    if first_visit:
+        want = _offline_nvfp4(h.float())
+    else:
+        want = before + _offline_nvfp4(h.float() - before)
+    assert torch.equal(state, want)
+    assert torch.equal((meta >> CODE_SHIFT) & CODE_MASK, codes)
+    ffn_state, h_out = before.clone(), torch.zeros(TOKENS, HIDDEN)
     decode_rows_reference(cfg, out, meta, offsets, flat, ffn_state, h_out)
     assert torch.equal(ffn_state, want) and torch.equal(h_out, want)
 
@@ -569,6 +716,8 @@ def test_row_words_hold_every_code_token_and_rank() -> None:
         H_INT4: _offline_quantize(h.float(), 4),
         D_INT3: _offline_quantize(h.float(), 3),
         H_INT8: _offline_quantize(h.float(), 8),
+        H_NVFP4: _offline_nvfp4(h.float()),
+        D_NVFP4: _offline_nvfp4(h.float()),
     }
     for code in codes.tolist():
         assert torch.equal(h_out[code], want[code].view(-1)), CODE_FORMATS[code]
@@ -620,6 +769,8 @@ def test_uncompressed_modes_give_norm_of_h_prime(
         ("delta_int3", "int4", "int4", {H_INT4, D_INT3, D_INT4, D_INT8}),
         ("delta_int8", "int8", "", {H_INT8, D_INT8}),
         ("delta_int8", "bf16", "", {H_BF16, D_INT8}),
+        ("delta_nvfp4", "nvfp4", "", {H_NVFP4, D_NVFP4, D_INT8}),
+        ("delta_nvfp4", "bf16", "int8", {H_BF16, D_NVFP4, D_INT8}),
     ],
 )
 def test_quantized_states_stay_identical_across_ffn_ranks(
@@ -683,6 +834,14 @@ def test_x_modes_are_the_plain_quantizer(mode: str, code: int, bits: int) -> Non
             assert torch.equal(x, want.view(-1).to(torch.bfloat16))
 
 
+def test_x_nvfp4_is_the_plain_nvfp4() -> None:
+    for step in _drive(DeltaDispatchConfig(mode="x_nvfp4"), 4, 2, 1):
+        assert set(step["codes"].tolist()) == {D_NVFP4}
+        for (_, t), x in step["inputs"].items():
+            want = _offline_nvfp4(step["norm_h"][t].float().view(1, -1))
+            assert torch.equal(x, want.view(-1).to(torch.bfloat16))
+
+
 def test_missing_rows_are_an_error() -> None:
     cfg = DeltaDispatchConfig(mode="delta_fp32")
     ffn = FFNDeltaState(cfg, MOE_LAYERS, ROUTED_SCALE, HIDDEN, 1, TOKENS)
@@ -694,7 +853,7 @@ def test_missing_rows_are_an_error() -> None:
         attn.prepare(99, 0, torch.arange(TOKENS), TOKENS)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton)")
+@needs_kernels
 @pytest.mark.parametrize("hidden", [MODEL_HIDDEN, QUANT_GROUP_SIZE])
 @pytest.mark.parametrize(
     "mode,first",
@@ -709,13 +868,23 @@ def test_missing_rows_are_an_error() -> None:
         ("delta_int3", "bf16"),
         ("delta_int8", "int8"),
         ("delta_int8", "bf16"),
+        ("delta_nvfp4", "nvfp4"),
+        ("delta_nvfp4", "bf16"),
+        ("x_nvfp4", "bf16"),
     ],
 )
-def test_triton_kernels_match_reference(mode: str, first: str, hidden: int) -> None:
+@pytest.mark.parametrize(("nvfp4_pass", "hardware"), NVFP4_KERNEL_VARIANTS)
+def test_triton_kernels_match_reference(
+    mode: str, first: str, hidden: int, nvfp4_pass: str, hardware: bool
+) -> None:
     from afd_plugin import delta_dispatch_triton
 
-    revisit = {"delta_int4": "int8", "delta_int3": "int4"}.get(mode, "")
+    revisit = {"delta_int4": "int8", "delta_int3": "int4", "delta_nvfp4": "int8"}.get(
+        mode, ""
+    )
     cfg = DeltaDispatchConfig(mode=mode, revisit=revisit, first=first)
+    if not cfg.uses_nvfp4 and (nvfp4_pass, hardware) != ("two_pass", False):
+        pytest.skip("no NVFP4 rows: one kernel structure")
     gen = torch.Generator().manual_seed(2)
     tokens, rows, rank = 64, 40, MAX_ATTENTION_RANKS - 1
     flat = torch.randperm(3 * tokens, generator=gen)[:rows].sort().values
@@ -745,43 +914,52 @@ def test_triton_kernels_match_reference(mode: str, first: str, hidden: int) -> N
         ref_out,
         ref_meta,
     )
-    gpu_state = state.cuda()
-    gpu_last = last.cuda()
-    out = torch.zeros(total, dtype=torch.uint8, device="cuda")
-    meta = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    gpu_state = state.to(KERNEL_DEVICE, copy=True)
+    gpu_last = last.to(KERNEL_DEVICE, copy=True)
+    out = torch.zeros(total, dtype=torch.uint8, device=KERNEL_DEVICE)
+    meta = torch.zeros(rows, dtype=torch.int32, device=KERNEL_DEVICE)
     delta_dispatch_triton.encode_rows(
         cfg,
-        h.cuda(),
+        h.to(KERNEL_DEVICE, copy=True),
         gpu_state,
         gpu_last,
         3,
-        flat.cuda(),
-        codes.cuda(),
-        offsets.cuda(),
+        flat.to(KERNEL_DEVICE, copy=True),
+        codes.to(KERNEL_DEVICE, copy=True),
+        offsets.to(KERNEL_DEVICE, copy=True),
         tokens,
         rank,
         out,
         meta,
+        nvfp4_pass=nvfp4_pass,
+        hardware_e4m3=hardware,
     )
     # Same bytes and words as the reference; the states differ from it only
-    # by the fused multiply-add of the dequantization.
+    # by the fused multiply-add of the int dequantization (NVFP4: none).
     assert torch.equal(out.cpu(), ref_out) and torch.equal(meta.cpu(), ref_meta)
     torch.testing.assert_close(gpu_state.cpu(), ref_state, rtol=1e-6, atol=1e-6)
     if cfg.stateful:
         assert torch.equal(gpu_last.cpu(), ref_last)
     # The FFN kernel rebuilds the Attention kernel's states bit for bit.
-    ffn_state = state.cuda()
-    h_out = torch.empty(rows, hidden, dtype=torch.bfloat16, device="cuda")
+    ffn_state = state.to(KERNEL_DEVICE, copy=True)
+    h_out = torch.empty(rows, hidden, dtype=torch.bfloat16, device=KERNEL_DEVICE)
     delta_dispatch_triton.decode_rows(
-        cfg, out, meta, offsets.cuda(), flat.cuda(), ffn_state, h_out
+        cfg,
+        out,
+        meta,
+        offsets.to(KERNEL_DEVICE, copy=True),
+        flat.to(KERNEL_DEVICE, copy=True),
+        ffn_state,
+        h_out,
+        hardware_e4m3=hardware,
     )
     if cfg.stateful:
-        rows_idx = flat.cuda()
+        rows_idx = flat.to(KERNEL_DEVICE, copy=True)
         assert torch.equal(ffn_state[rows_idx], gpu_state[rows_idx])
-        assert torch.equal(h_out, gpu_state[rows_idx].to(torch.bfloat16))
+        _assert_same_model_dtype(h_out, gpu_state[rows_idx])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton)")
+@needs_kernels
 @pytest.mark.parametrize(
     "mode,first",
     [
@@ -794,15 +972,22 @@ def test_triton_kernels_match_reference(mode: str, first: str, hidden: int) -> N
             "delta_int3",
             "int4",
         ),  # sizes differ: offsets given, rows still from the words
+        ("delta_nvfp4", "nvfp4"),
+        ("x_nvfp4", "bf16"),
     ],
 )
-def test_triton_one_row_size_paths_match_reference(mode: str, first: str) -> None:
+@pytest.mark.parametrize(("nvfp4_pass", "hardware"), NVFP4_KERNEL_VARIANTS)
+def test_triton_one_row_size_paths_match_reference(
+    mode: str, first: str, nvfp4_pass: str, hardware: bool
+) -> None:
     # One row size: the encode kernel picks the codes (first visit or not)
     # and the host updates the visits after it; the decode kernel finds each
     # row at index * size and reads its state row from its word.
     from afd_plugin import delta_dispatch_triton
 
     cfg = DeltaDispatchConfig(mode=mode, first=first)
+    if not cfg.uses_nvfp4 and (nvfp4_pass, hardware) != ("two_pass", False):
+        pytest.skip("no NVFP4 rows: one kernel structure")
     size = cfg.fixed_row_bytes(MODEL_HIDDEN)
     gen = torch.Generator().manual_seed(5)
     tokens, rows, rank, max_tokens = 64, 40, 3, 96
@@ -834,22 +1019,27 @@ def test_triton_one_row_size_paths_match_reference(mode: str, first: str) -> Non
         ref_out,
         ref_meta,
     )
-    gpu_state, gpu_last = state.cuda(), last.cuda()
-    out = torch.zeros(total, dtype=torch.uint8, device="cuda")
-    meta = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    gpu_state, gpu_last = (
+        state.to(KERNEL_DEVICE, copy=True),
+        last.to(KERNEL_DEVICE, copy=True),
+    )
+    out = torch.zeros(total, dtype=torch.uint8, device=KERNEL_DEVICE)
+    meta = torch.zeros(rows, dtype=torch.int32, device=KERNEL_DEVICE)
     delta_dispatch_triton.encode_rows(
         cfg,
-        h.cuda(),
+        h.to(KERNEL_DEVICE, copy=True),
         gpu_state,
         gpu_last,
         3,
-        flat.cuda(),
-        None if codes is None else codes.cuda(),
-        offsets.cuda(),
+        flat.to(KERNEL_DEVICE, copy=True),
+        None if codes is None else codes.to(KERNEL_DEVICE, copy=True),
+        offsets.to(KERNEL_DEVICE, copy=True),
         tokens,
         rank,
         out,
         meta,
+        nvfp4_pass=nvfp4_pass,
+        hardware_e4m3=hardware,
     )
     assert torch.equal(out.cpu(), ref_out) and torch.equal(meta.cpu(), ref_meta)
     torch.testing.assert_close(gpu_state.cpu(), ref_state, rtol=1e-6, atol=1e-6)
@@ -858,29 +1048,34 @@ def test_triton_one_row_size_paths_match_reference(mode: str, first: str) -> Non
     # One FFN rank's rows (destination-major: the first k), its state rows
     # from the words: Attention rank * max_tokens + token.
     k = int((flat < tokens).sum())
-    ffn_state = torch.randn(4 * max_tokens, MODEL_HIDDEN, generator=gen).cuda()
-    want = (rank * max_tokens + flat[:k] % tokens).cuda()
+    ffn_state = torch.randn(4 * max_tokens, MODEL_HIDDEN, generator=gen).to(
+        KERNEL_DEVICE, copy=True
+    )
+    want = (rank * max_tokens + flat[:k] % tokens).to(KERNEL_DEVICE, copy=True)
     # The FFN holds what Attention held before this layer (delta rows add to
     # it; first visits overwrite it).
-    ffn_state[want] = state[flat[:k]].cuda()
-    h_out = torch.empty(k, MODEL_HIDDEN, dtype=torch.bfloat16, device="cuda")
-    rows_out = torch.empty(k, dtype=torch.int32, device="cuda")
+    ffn_state[want] = state[flat[:k]].to(KERNEL_DEVICE, copy=True)
+    h_out = torch.empty(k, MODEL_HIDDEN, dtype=torch.bfloat16, device=KERNEL_DEVICE)
+    rows_out = torch.empty(k, dtype=torch.int32, device=KERNEL_DEVICE)
     delta_dispatch_triton.decode_rows(
         cfg,
         out,
         meta[:k],
-        None if size else offsets[:k].cuda(),
+        None if size else offsets[:k].to(KERNEL_DEVICE, copy=True),
         None,
         ffn_state if cfg.stateful else None,
         h_out,
         rows_out=rows_out,
         max_tokens=max_tokens,
         row_size=size,
+        hardware_e4m3=hardware,
     )
     assert torch.equal(rows_out.long(), want)
     if cfg.stateful:
-        assert torch.equal(ffn_state[want], gpu_state[flat[:k].cuda()])
-        assert torch.equal(h_out, ffn_state[want].to(torch.bfloat16))
+        assert torch.equal(
+            ffn_state[want], gpu_state[flat[:k].to(KERNEL_DEVICE, copy=True)]
+        )
+        _assert_same_model_dtype(h_out, ffn_state[want])
 
 
 def test_each_forward_starts_with_first_visits() -> None:
@@ -942,6 +1137,16 @@ def test_combine_config_parsing() -> None:
     assert cfg.row_bytes_at(4, 27, MODEL_HIDDEN) == 1088
     assert cfg.max_row_bytes(MODEL_HIDDEN) == 2112
     assert CombineConfig(mode="int4").max_row_bytes(MODEL_HIDDEN) == 1088
+    cfg = CombineConfig.from_mapping({"mode": "nvfp4", "early": 1, "late": 2})
+    assert cfg.code == D_NVFP4 and cfg.ef
+    assert [cfg.code_at(p, 27) for p in (0, 1, 24, 25)] == [
+        D_INT8,
+        D_NVFP4,
+        D_NVFP4,
+        D_INT8,
+    ]
+    assert CombineConfig(mode="nvfp4").max_row_bytes(MODEL_HIDDEN) == 1156
+    assert cfg.max_row_bytes(MODEL_HIDDEN) == 2112
     for bad in (
         {"mode": "fp8"},
         {"mode": "int4", "ef": 1},
@@ -954,8 +1159,14 @@ def test_combine_config_parsing() -> None:
             CombineConfig.from_mapping(bad)
 
 
-@pytest.mark.parametrize("code,bits", [(D_INT8, 8), (D_INT4, 4)])
-def test_combine_rows_match_offline_quantizer(code: int, bits: int) -> None:
+def _offline_combine(code: int, x: torch.Tensor) -> torch.Tensor:
+    if code == D_NVFP4:
+        return _offline_nvfp4(x)
+    return _offline_quantize(x, 8 if code == D_INT8 else 4)
+
+
+@pytest.mark.parametrize("code", [D_INT8, D_INT4, D_NVFP4])
+def test_combine_rows_match_offline_quantizer(code: int) -> None:
     # Without error feedback the received value is the offline quantizer's
     # (compress.py) of the partial; with it, of partial + residual, and the
     # new residual is what was cut.
@@ -967,7 +1178,7 @@ def test_combine_rows_match_offline_quantizer(code: int, bits: int) -> None:
     data = torch.zeros(n * size + 5, dtype=torch.uint8)
     deq = torch.empty(n, HIDDEN)
     encode_combine_reference(code, partial, rows, None, data, deq)
-    assert torch.equal(deq, _offline_quantize(partial.float(), bits))
+    assert torch.equal(deq, _offline_combine(code, partial.float()))
     back = torch.empty(n, HIDDEN)
     decode_combine_reference(code, data, back)
     assert torch.equal(back, deq)
@@ -975,15 +1186,15 @@ def test_combine_rows_match_offline_quantizer(code: int, bits: int) -> None:
     before = err.clone()
     encode_combine_reference(code, partial, rows, err, data, deq)
     v = partial.float() + before[rows]
-    assert torch.equal(deq, _offline_quantize(v, bits))
+    assert torch.equal(deq, _offline_combine(code, v))
     assert torch.equal(err[rows], v - deq)
     untouched = torch.ones(2 * TOKENS, dtype=torch.bool)
     untouched[rows] = False
     assert torch.equal(err[untouched], before[untouched])
 
 
-@pytest.mark.parametrize("mode", ["int8", "int4"])
-def test_combine_error_feedback_keeps_the_sum(mode: str) -> None:
+@pytest.mark.parametrize("mode,step", [("int8", 0.2), ("int4", 0.2), ("nvfp4", 0.75)])
+def test_combine_error_feedback_keeps_the_sum(mode: str, step: float) -> None:
     # Over the visits of a forward the received partials add up to the exact
     # ones minus the last residual (sigma-delta): the cut parts are not lost.
     combine = CombineConfig(mode=mode)
@@ -1011,15 +1222,35 @@ def test_combine_error_feedback_keeps_the_sum(mode: str) -> None:
         exact += partial.float()
         received += back
     torch.testing.assert_close(received, exact - ffn._err[0], rtol=0, atol=1e-5)
-    # The residual stays at one quantization step, not the accumulated error.
-    assert float(ffn._err[0].abs().max()) < 0.2
+    # The residual stays at one quantization step (NVFP4: the half gap between
+    # its largest values, 4 and 6, times the block scale), not the
+    # accumulated error.
+    assert float(ffn._err[0].abs().max()) < step
 
 
 @pytest.mark.parametrize(
     "delta_mode",
-    ["delta_int4", "delta_int3", "delta_int8", "delta_fp32", "x_int4", "x_int8"],
+    [
+        "delta_int4",
+        "delta_int3",
+        "delta_int8",
+        "delta_fp32",
+        "x_int4",
+        "x_int8",
+        "delta_nvfp4",
+        "x_nvfp4",
+    ],
 )
-@pytest.mark.parametrize("mode,ef", [("int4", True), ("int8", True), ("int4", False)])
+@pytest.mark.parametrize(
+    "mode,ef",
+    [
+        ("int4", True),
+        ("int8", True),
+        ("int4", False),
+        ("nvfp4", True),
+        ("nvfp4", False),
+    ],
+)
 def test_combine_keeps_both_states_identical(
     delta_mode: str, mode: str, ef: bool
 ) -> None:
@@ -1027,7 +1258,9 @@ def test_combine_keeps_both_states_identical(
     # add what the Attention side received, so the states stay identical; the
     # received partial sums are the offline quantizer's of partial (+ residual).
     revisit = {"delta_int4": "int8", "delta_int3": "int4"}.get(delta_mode, "")
-    first = {"delta_int3": "int4", "delta_int8": "int8"}.get(delta_mode, "bf16")
+    first = {"delta_int3": "int4", "delta_int8": "int8", "delta_nvfp4": "nvfp4"}.get(
+        delta_mode, "bf16"
+    )
     cfg = DeltaDispatchConfig(mode=delta_mode, revisit=revisit, first=first)
     steps = _drive(cfg, 4, 2, 2, CombineConfig(mode=mode, ef=ef), forwards=2)
     for step in steps:
@@ -1041,13 +1274,13 @@ def test_combine_keeps_both_states_identical(
                         a_state[f * TOKENS : (f + 1) * TOKENS],
                     )
         err = (step["received"] - step["exact"]).abs().max()
-        assert 0 < float(err) < 0.5
+        assert 0 < float(err) < (1.0 if mode == "nvfp4" else 0.5)
     if not ef:
-        bits = 8 if mode == "int8" else 4
+        code = CombineConfig(mode=mode).code
         for step in steps:
             assert torch.equal(
                 step["received"],
-                _offline_quantize(step["exact"], bits).to(torch.bfloat16).float(),
+                _offline_combine(code, step["exact"]).to(torch.bfloat16).float(),
             )
 
 
@@ -1121,12 +1354,17 @@ def test_combine_residual_starts_at_zero_every_forward() -> None:
     assert float(ffn._err[0].abs().sum()) == 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA (Triton)")
-@pytest.mark.parametrize("code", [D_INT8, D_INT4])
+@needs_kernels
+@pytest.mark.parametrize("code", [D_INT8, D_INT4, D_NVFP4])
 @pytest.mark.parametrize("ef", [False, True])
-def test_triton_combine_kernels_match_reference(code: int, ef: bool) -> None:
+@pytest.mark.parametrize(("nvfp4_pass", "hardware"), NVFP4_KERNEL_VARIANTS)
+def test_triton_combine_kernels_match_reference(
+    code: int, ef: bool, nvfp4_pass: str, hardware: bool
+) -> None:
     from afd_plugin import delta_dispatch_triton
 
+    if code != D_NVFP4 and (nvfp4_pass, hardware) != ("two_pass", False):
+        pytest.skip("not NVFP4: one kernel structure")
     gen = torch.Generator().manual_seed(8)
     n, slots = 40, 64
     partial = (torch.randn(n, MODEL_HIDDEN, generator=gen) * 3).to(torch.bfloat16)
@@ -1137,11 +1375,18 @@ def test_triton_combine_kernels_match_reference(code: int, ef: bool) -> None:
     ref_deq = torch.empty(n, MODEL_HIDDEN)
     ref_err = err.clone() if ef else None
     encode_combine_reference(code, partial, rows, ref_err, ref_data, ref_deq)
-    data = torch.zeros(n * size, dtype=torch.uint8, device="cuda")
-    deq = torch.empty(n, MODEL_HIDDEN, device="cuda")
-    gpu_err = err.cuda() if ef else None
+    data = torch.zeros(n * size, dtype=torch.uint8, device=KERNEL_DEVICE)
+    deq = torch.empty(n, MODEL_HIDDEN, device=KERNEL_DEVICE)
+    gpu_err = err.to(KERNEL_DEVICE, copy=True) if ef else None
     delta_dispatch_triton.encode_combine(
-        code, partial.cuda(), rows.cuda(), gpu_err, data, deq
+        code,
+        partial.to(KERNEL_DEVICE, copy=True),
+        rows.to(KERNEL_DEVICE, copy=True),
+        gpu_err,
+        data,
+        deq,
+        nvfp4_pass=nvfp4_pass,
+        hardware_e4m3=hardware,
     )
     # Same bytes; deq and the residual differ from the reference only by the
     # fused multiply-add of the dequantization.
@@ -1150,6 +1395,6 @@ def test_triton_combine_kernels_match_reference(code: int, ef: bool) -> None:
     if ef:
         torch.testing.assert_close(gpu_err.cpu(), ref_err, rtol=1e-6, atol=1e-6)
     # The Attention kernel rebuilds exactly what the FFN kernel added.
-    back = torch.empty(n, MODEL_HIDDEN, device="cuda")
-    delta_dispatch_triton.decode_combine(code, data, back)
+    back = torch.empty(n, MODEL_HIDDEN, device=KERNEL_DEVICE)
+    delta_dispatch_triton.decode_combine(code, data, back, hardware_e4m3=hardware)
     assert torch.equal(back, deq)
