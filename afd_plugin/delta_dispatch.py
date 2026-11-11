@@ -42,11 +42,20 @@ packed back to back at the size of their format code:
 * ``5`` ``d_int3``: ``d`` quantized like ``d_int4`` in 3 bits.
 * ``6`` ``h_int8``: ``h'`` itself quantized like ``d_int8`` (a first visit
   with ``first: "int8"``); the state becomes the dequantized value.
+* ``8`` ``d_nvfp4``: ``d`` in NVFP4 (the offline experiment's ``nvfp4``): per
+  row the scale ``gs = max |d| / (E4M3_MAX * E2M1_MAX)`` in fp32, per block of
+  ``NVFP4_BLOCK`` values the scale ``bs = (block max |d| / E2M1_MAX) / gs``
+  rounded to E4M3, and each value ``d / (bs * gs)`` rounded to the nearest
+  E2M1 value (sign + 3 bits, saturating at ``E2M1_MAX``, ties to the even
+  code). A row is the 4-bit codes (two per byte, even index in the low
+  nibble), the E4M3 bytes of its blocks and the fp32 ``gs``.
+* ``7`` ``h_nvfp4``: ``h'`` itself in NVFP4 (a first visit with ``first:
+  "nvfp4"``); the state becomes the dequantized value.
 
 Each row also carries a 4-byte word ``token | code << CODE_SHIFT | rank <<
-RANK_SHIFT``: the token's index in the Attention rank's batch, the row's format
-and the sending Attention rank (so the FFN rank finds the state without the
-per-rank row counts on the GPU).
+RANK_SHIFT``: the token's index in the Attention rank's batch (22 bits), the
+row's format (4 bits) and the sending Attention rank (5 bits), so the FFN rank
+finds the state without the per-rank row counts on the GPU.
 
 Codes by mode (``connector_extra_config = {"delta_dispatch": {...}}``):
 
@@ -55,27 +64,29 @@ Codes by mode (``connector_extra_config = {"delta_dispatch": {...}}``):
   the byte rows).
 * ``delta_fp32``: first visit ``h_bf16``, then ``d_fp32`` (checks the states
   and the closed loop; outputs must equal ``off``).
-* ``delta_int8`` / ``delta_int4`` / ``delta_int3``: first visit ``h_bf16``
-  (``h_int4`` / ``h_int8`` with ``first: "int4"`` / ``"int8"``, on every MoE
-  layer); then ``d_int8`` on the ``early`` first and ``late`` last MoE layers
-  and, with ``revisit`` naming a format wider than the mode's own (``"int8"``;
-  for delta_int3 also ``"int4"``), that format on rows whose last visit to the
-  FFN rank was ``rgap`` or more MoE layers before; else ``d_int8`` /
-  ``d_int4`` / ``d_int3`` (the rules of the offline experiment's
+* ``delta_int8`` / ``delta_int4`` / ``delta_int3`` / ``delta_nvfp4``: first
+  visit ``h_bf16`` (``h_int4`` / ``h_int8`` / ``h_nvfp4`` with ``first:
+  "int4"`` / ``"int8"`` / ``"nvfp4"``, on every MoE layer); then ``d_int8`` on
+  the ``early`` first and ``late`` last MoE layers and, with ``revisit`` naming
+  a format wider than the mode's own (``"int8"``; for delta_int3 also
+  ``"int4"``), that format on rows whose last visit to the FFN rank was
+  ``rgap`` or more MoE layers before; else ``d_int8`` / ``d_int4`` /
+  ``d_int3`` / ``d_nvfp4`` (the rules of the offline experiment's
   ``sim.FFNSim``).
-* ``x_int4`` / ``x_int8``: no state: every row is ``x = Norm(h')`` in int4 /
-  int8 (``d_int4`` / ``d_int8`` of ``x - 0``) and the FFN rank uses the
-  dequantized ``x`` as is (plain quantization, the baselines; int8 stands in
-  for the 8-bit dispatch of other systems).
+* ``x_int4`` / ``x_int8`` / ``x_nvfp4``: no state: every row is ``x =
+  Norm(h')`` in int4 / int8 / NVFP4 (``d_int4`` / ``d_int8`` / ``d_nvfp4`` of
+  ``x - 0``) and the FFN rank uses the dequantized ``x`` as is (plain
+  quantization, the baselines; int8 stands in for the 8-bit dispatch of other
+  systems).
 
 Combine compression (``connector_extra_config = {"combine": {"mode": ...,
 "ef": ...}}``, needs delta dispatch for the rows' tokens): each FFN rank
-returns its partial sum of a row quantized like the int formats above
-(``int8`` or ``int4``; every row of a layer the same size). With ``int4``,
-``early`` / ``late`` put the first ``early`` and the last ``late`` MoE layers
-in ``int8`` (the offline experiment's ``cearly`` / ``clate``: the layers whose
-combine error costs the most). With ``ef`` (error feedback)
-it adds to the partial the residual it cut from that (Attention rank, token)
+returns its partial sum of a row quantized like the formats above
+(``int8``, ``int4`` or ``nvfp4``; every row of a layer the same size). With
+``int4`` / ``nvfp4``, ``early`` / ``late`` put the first ``early`` and the last
+``late`` MoE layers in ``int8`` (the offline experiment's ``cearly`` /
+``clate``: the layers whose combine error costs the most). With ``ef`` (error
+feedback) it adds to the partial the residual it cut from that (Attention rank, token)
 at its previous visit in this forward and keeps the new residual:
 
     v = partial + e,   send Q(v),   e = v - deq(Q(v))
@@ -108,24 +119,50 @@ MODES = (
     "x_int4",
     "x_int8",
     "delta_int8",
+    "delta_nvfp4",
+    "x_nvfp4",
 )
 EXTRA_CONFIG_KEY = "delta_dispatch"
 COMBINE_KEY = "combine"
-COMBINE_MODES = ("off", "int8", "int4")
-H_BF16, D_FP32, D_INT8, D_INT4, H_INT4, D_INT3, H_INT8 = 0, 1, 2, 3, 4, 5, 6
-CODE_FORMATS = ("h_bf16", "d_fp32", "d_int8", "d_int4", "h_int4", "d_int3", "h_int8")
-CODE_BITS = {D_INT8: 8, D_INT4: 4, H_INT4: 4, D_INT3: 3, H_INT8: 8}
+COMBINE_MODES = ("off", "int8", "int4", "nvfp4")
+H_BF16, D_FP32, D_INT8, D_INT4, H_INT4, D_INT3, H_INT8, H_NVFP4, D_NVFP4 = range(9)
+CODE_FORMATS = (
+    "h_bf16",
+    "d_fp32",
+    "d_int8",
+    "d_int4",
+    "h_int4",
+    "d_int3",
+    "h_int8",
+    "h_nvfp4",
+    "d_nvfp4",
+)
+CODE_BITS = {
+    D_INT8: 8,
+    D_INT4: 4,
+    H_INT4: 4,
+    D_INT3: 3,
+    H_INT8: 8,
+    H_NVFP4: 4,
+    D_NVFP4: 4,
+}
+NVFP4_CODES = (H_NVFP4, D_NVFP4)
 # The first-visit formats: h' itself (the state becomes what was sent).
-H_CODES = (H_BF16, H_INT4, H_INT8)
+H_CODES = (H_BF16, H_INT4, H_INT8, H_NVFP4)
 # The format of a quantized delta mode's later visits, and the formats
 # ``first`` and ``revisit`` name.
-DELTA_CODES = {"delta_int8": D_INT8, "delta_int4": D_INT4, "delta_int3": D_INT3}
+DELTA_CODES = {
+    "delta_int8": D_INT8,
+    "delta_int4": D_INT4,
+    "delta_int3": D_INT3,
+    "delta_nvfp4": D_NVFP4,
+}
 # The format of every row of a plain-quantization (stateless) mode.
-X_CODES = {"x_int4": D_INT4, "x_int8": D_INT8}
-FIRST_FORMATS = {"bf16": H_BF16, "int4": H_INT4, "int8": H_INT8}
+X_CODES = {"x_int4": D_INT4, "x_int8": D_INT8, "x_nvfp4": D_NVFP4}
+FIRST_FORMATS = {"bf16": H_BF16, "int4": H_INT4, "int8": H_INT8, "nvfp4": H_NVFP4}
 REVISIT_FORMATS = {"int3": D_INT3, "int4": D_INT4, "int8": D_INT8}
-CODE_SHIFT = 23
-CODE_MASK = 0x7
+CODE_SHIFT = 22
+CODE_MASK = 0xF
 RANK_SHIFT = 26
 MAX_ATTENTION_RANKS = 1 << (31 - RANK_SHIFT)
 TOKEN_MASK = (1 << CODE_SHIFT) - 1
@@ -135,6 +172,16 @@ GROUP_SCALE_BYTES = 2 * torch.float16.itemsize
 # Below this range a group is constant: every value is lo (step 0).
 MIN_GROUP_RANGE = 1e-12
 BITS_PER_BYTE = 8
+# NVFP4: values in E2M1 (sign + 3 bits; magnitudes E2M1_VALUES, the largest
+# E2M1_MAX), one E4M3 scale per block of NVFP4_BLOCK values (largest E4M3_MAX)
+# and one fp32 scale per row, at least NVFP4_MIN_SCALE (a row of zeros).
+NVFP4_BLOCK = 16
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E2M1_MAX = E2M1_VALUES[-1]
+E2M1_SIGN_BIT = 0x8
+E4M3_MAX = 448.0
+NVFP4_MIN_SCALE = 1e-30
+NVFP4_ROW_SCALE_BYTES = torch.float32.itemsize
 
 
 def row_bytes(code: int, hidden: int) -> int:
@@ -145,6 +192,10 @@ def row_bytes(code: int, hidden: int) -> int:
         return 4 * hidden
     if hidden % QUANT_GROUP_SIZE:
         raise ValueError(f"hidden {hidden} is not a multiple of {QUANT_GROUP_SIZE}")
+    if code in NVFP4_CODES:
+        # The 4-bit codes, an E4M3 byte per block, the fp32 row scale.
+        data = hidden * CODE_BITS[code] // BITS_PER_BYTE
+        return data + hidden // NVFP4_BLOCK + NVFP4_ROW_SCALE_BYTES
     data = hidden * CODE_BITS[code] // BITS_PER_BYTE
     return data + hidden // QUANT_GROUP_SIZE * GROUP_SCALE_BYTES
 
@@ -287,6 +338,11 @@ class DeltaDispatchConfig:
             codes.add(REVISIT_FORMATS[self.revisit])
         return tuple(sorted(codes))
 
+    @property
+    def uses_nvfp4(self) -> bool:
+        """Some rows of the mode are NVFP4 (their encode needs the row maximum)."""
+        return any(c in NVFP4_CODES for c in self._codes())
+
     def max_row_bytes(self, hidden: int) -> int:
         return max(row_bytes(c, hidden) for c in self._codes())
 
@@ -320,10 +376,17 @@ class DeltaDispatchConfig:
         return FIRST_FORMATS[self.first], rest
 
 
+# The row format of each combine compression mode, and the modes that can put
+# the first ``early`` and last ``late`` MoE layers in int8.
+COMBINE_CODES = {"int8": D_INT8, "int4": D_INT4, "nvfp4": D_NVFP4}
+COMBINE_INT8_LAYER_MODES = ("int4", "nvfp4")
+
+
 @dataclass(frozen=True)
 class CombineConfig:
-    """Combine compression: ``mode`` off / int8 / int4, ``ef`` error feedback;
-    with int4, ``int8`` on the first ``early`` and last ``late`` MoE layers."""
+    """Combine compression: ``mode`` off / int8 / int4 / nvfp4, ``ef`` error
+    feedback; with int4 / nvfp4, ``int8`` on the first ``early`` and last
+    ``late`` MoE layers."""
 
     mode: str = "off"
     ef: bool = True
@@ -348,8 +411,11 @@ class CombineConfig:
         early, late = int(raw.get("early", 0)), int(raw.get("late", 0))
         if early < 0 or late < 0:
             raise ValueError("combine early and late must be >= 0")
-        if (early or late) and mode != "int4":
-            raise ValueError("combine early/late (int8 layers) apply to mode int4 only")
+        if (early or late) and mode not in COMBINE_INT8_LAYER_MODES:
+            raise ValueError(
+                "combine early/late (int8 layers) apply to modes "
+                f"{COMBINE_INT8_LAYER_MODES} only"
+            )
         return cls(mode=mode, ef=ef, early=early, late=late)
 
     @classmethod
@@ -373,7 +439,7 @@ class CombineConfig:
         layers of ``early`` / ``late``)."""
         if not self.enabled:
             raise ValueError("combine compression is off: no row format")
-        return {"int8": D_INT8, "int4": D_INT4}[self.mode]
+        return COMBINE_CODES[self.mode]
 
     def code_at(self, layer_pos: int, num_layers: int) -> int:
         """The row format at the ``layer_pos``-th of ``num_layers`` MoE layers."""
@@ -414,8 +480,67 @@ def _dequantize_groups(
     return q.float() * step.float() + lo.float()
 
 
+def _e2m1_codes(y: torch.Tensor) -> torch.Tensor:
+    """y fp32 -> uint8 E2M1 codes: the sign in E2M1_SIGN_BIT, below it the
+    index of the nearest of E2M1_VALUES to |y| (saturating at E2M1_MAX; a
+    magnitude halfway between two values takes the even index)."""
+    a = y.abs()
+    index = torch.zeros(y.shape, dtype=torch.uint8, device=y.device)
+    for i in range(len(E2M1_VALUES) - 1):
+        mid = (E2M1_VALUES[i] + E2M1_VALUES[i + 1]) / 2
+        index += ((a > mid) | ((a == mid) & (i % 2 == 1))).to(torch.uint8)
+    return index | ((y < 0).to(torch.uint8) * E2M1_SIGN_BIT)
+
+
+def _e2m1_values(codes: torch.Tensor) -> torch.Tensor:
+    """uint8 E2M1 codes -> fp32 values."""
+    table = torch.tensor(E2M1_VALUES, device=codes.device)
+    mag = table[(codes & (E2M1_SIGN_BIT - 1)).long()]
+    return torch.where((codes & E2M1_SIGN_BIT) != 0, -mag, mag)
+
+
+def _nvfp4_rows(d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """d fp32 [R, hidden] -> (uint8 NVFP4 rows [R, row_bytes], deq fp32
+    [R, hidden]); the arithmetic of the offline experiment's ``_q_nvfp4``."""
+    rows, hidden = d.shape
+    gs = (d.abs().amax(-1, keepdim=True) / (E4M3_MAX * E2M1_MAX)).clamp_min(
+        NVFP4_MIN_SCALE
+    )
+    blocks = d.view(rows, hidden // NVFP4_BLOCK, NVFP4_BLOCK)
+    bs = (blocks.abs().amax(-1, keepdim=True) / E2M1_MAX / gs.unsqueeze(-1)).to(
+        torch.float8_e4m3fn
+    )
+    scale = bs.float() * gs.unsqueeze(-1)
+    codes = torch.where(
+        scale > 0,
+        _e2m1_codes(blocks / scale.clamp_min(NVFP4_MIN_SCALE)),
+        torch.zeros_like(blocks, dtype=torch.uint8),
+    )
+    deq = (_e2m1_values(codes) * scale).view(rows, hidden)
+    codes = codes.view(rows, hidden)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    block_bytes = bs.view(rows, -1).view(torch.uint8)
+    return torch.cat([packed, block_bytes, gs.view(torch.uint8)], dim=1), deq
+
+
+def _nvfp4_dequantized(rows: torch.Tensor, hidden: int) -> torch.Tensor:
+    """uint8 NVFP4 rows [R, row_bytes] -> deq fp32 [R, hidden]."""
+    n = rows.shape[0]
+    blocks = hidden // NVFP4_BLOCK
+    data = hidden * CODE_BITS[D_NVFP4] // BITS_PER_BYTE
+    packed = rows[:, :data]
+    bs = rows[:, data : data + blocks].contiguous().view(torch.float8_e4m3fn)
+    gs = rows[:, data + blocks :].contiguous().view(torch.float32)
+    codes = torch.stack([packed & 0xF, packed >> 4], dim=-1)
+    scale = (bs.float() * gs).unsqueeze(-1)
+    deq = _e2m1_values(codes.view(n, blocks, NVFP4_BLOCK)) * scale
+    return deq.view(n, hidden)
+
+
 def _quantized_rows(code: int, d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """d fp32 [R, hidden] -> (uint8 rows [R, row_bytes], deq fp32 [R, hidden])."""
+    if code in NVFP4_CODES:
+        return _nvfp4_rows(d)
     bits = CODE_BITS[code]
     rows, hidden = d.shape
     groups = hidden // QUANT_GROUP_SIZE
@@ -435,7 +560,9 @@ def _quantized_rows(code: int, d: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 
 
 def _dequantized_rows(code: int, rows: torch.Tensor, hidden: int) -> torch.Tensor:
-    """uint8 rows [R, row_bytes] of an int format -> deq fp32 [R, hidden]."""
+    """uint8 rows [R, row_bytes] of an int or NVFP4 format -> deq fp32 [R, hidden]."""
+    if code in NVFP4_CODES:
+        return _nvfp4_dequantized(rows, hidden)
     bits = CODE_BITS[code]
     n = rows.shape[0]
     groups = hidden // QUANT_GROUP_SIZE
@@ -498,7 +625,7 @@ def encode_rows_reference(
             if cfg.stateful:
                 assert state is not None
                 state[rows_flat] = h.to(torch.bfloat16).float()
-        elif code in (H_INT4, H_INT8):
+        elif code in H_CODES:
             # h' itself: the state becomes what was sent.
             data, deq = _quantized_rows(code, h.float())
             if cfg.stateful:
@@ -1066,12 +1193,15 @@ __all__ = [
     "D_INT3",
     "D_INT4",
     "D_INT8",
+    "D_NVFP4",
     "EXTRA_CONFIG_KEY",
     "H_BF16",
     "H_CODES",
     "H_INT4",
     "H_INT8",
+    "H_NVFP4",
     "MODES",
+    "NVFP4_CODES",
     "QUANT_GROUP_SIZE",
     "RANK_SHIFT",
     "AttentionDeltaState",
