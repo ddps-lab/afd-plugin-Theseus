@@ -58,6 +58,9 @@ from afd_plugin.delta_dispatch import (
     NVFP4_BLOCK,
     NVFP4_CODES,
     NVFP4_MIN_SCALE,
+    NVFP4_ONE_PASS,
+    NVFP4_PASSES,
+    NVFP4_TWO_PASS,
     QUANT_GROUP_SIZE,
     RANK_SHIFT,
     TOKEN_MASK,
@@ -73,10 +76,6 @@ _NVFP4_BLOCK = tl.constexpr(NVFP4_BLOCK)
 _E2M1_MAX = tl.constexpr(E2M1_MAX)
 _NVFP4_ROW_DIVISOR = tl.constexpr(E4M3_MAX * E2M1_MAX)
 _NVFP4_MIN_SCALE = tl.constexpr(NVFP4_MIN_SCALE)
-# How the encode kernels get an NVFP4 row's |max| (see the module docstring).
-NVFP4_TWO_PASS = "two_pass"
-NVFP4_ONE_PASS = "one_pass"
-NVFP4_PASSES = (NVFP4_TWO_PASS, NVFP4_ONE_PASS)
 
 
 @triton.jit
@@ -997,10 +996,12 @@ def encode_rows(
     stateful = cfg.stateful
     state_arg, state_stride = _state_args(state if stateful else None, src)
     in_kernel = codes is None
-    first, rest = cfg.first_rest_codes() if in_kernel else (0, 0)
+    first, rest = cfg.first_rest_codes_at(layer_pos) if in_kernel else (0, 0)
     last_arg = last if (stateful and last is not None) else flat
     code_arg = flat if in_kernel else codes
-    nvfp4 = cfg.uses_nvfp4
+    # Whether rows of this layer can be NVFP4 (an int8 layer of
+    # ``int8_layers`` has none: no row maximum, no NVFP4 branches).
+    nvfp4 = cfg.layer_uses_nvfp4(layer_pos)
     if nvfp4 and nvfp4_pass == NVFP4_ONE_PASS:
         _encode_rows_row_kernel[(rows,)](
             src,
@@ -1091,8 +1092,10 @@ def decode_rows(
     max_tokens: int = 0,
     row_size: int = 0,
     hardware_e4m3: bool = False,
+    nvfp4: bool | None = None,
 ) -> None:
-    """Fused FFN kernel (see ``decode_rows_reference``)."""
+    """Fused FFN kernel (see ``decode_rows_reference``); ``nvfp4``: whether
+    rows can be NVFP4 (default ``cfg.uses_nvfp4``)."""
     rows, hidden = int(meta.shape[0]), h_out.shape[1]
     if not rows:
         return
@@ -1127,7 +1130,7 @@ def decode_rows(
         token_mask=TOKEN_MASK,
         fixed=offsets is None,
         rows_from_meta=from_meta,
-        nvfp4=cfg.uses_nvfp4,
+        nvfp4=cfg.uses_nvfp4 if nvfp4 is None else nvfp4,
         hardware=hardware_e4m3,
     )
 

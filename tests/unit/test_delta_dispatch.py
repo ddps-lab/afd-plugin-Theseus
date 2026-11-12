@@ -285,6 +285,7 @@ def _drive(
                         "attn": a,
                         "inputs": inputs,
                         "norm_h": _norm(h_prime),
+                        "h_prime": h_prime.clone(),
                         "flat": packed.flat[:n].clone(),
                         # The codes as sent (the words); with one row size the
                         # encode kernel picks them (packed.codes is None).
@@ -422,6 +423,115 @@ def test_first_and_revisit_config() -> None:
     ):
         with pytest.raises(ValueError):
             DeltaDispatchConfig.from_mapping(bad)
+
+
+def test_int8_layers_and_nvfp4_options_config() -> None:
+    # A calibrated list of int8 layers (the offline dp= / cp= with pfmt=int8)
+    # in place of early / late, and the NVFP4 kernel options.
+    cfg = DeltaDispatchConfig.from_mapping(
+        {
+            "mode": "delta_nvfp4",
+            "first": "nvfp4",
+            "int8_layers": [6, 0, 3],
+            "nvfp4_pass": "one_pass",
+            "hardware_e4m3": True,
+        }
+    )
+    assert cfg.int8_layers == (0, 3, 6)
+    assert (cfg.nvfp4_pass, cfg.hardware_e4m3) == ("one_pass", True)
+    assert "int8_layers=(0, 3, 6)" in repr(cfg)  # in the settings digest
+    plain = DeltaDispatchConfig.from_mapping({"mode": "delta_nvfp4"})
+    assert (plain.int8_layers, plain.nvfp4_pass, plain.hardware_e4m3) == (
+        (),
+        "two_pass",
+        False,
+    )
+    x = DeltaDispatchConfig.from_mapping({"mode": "x_nvfp4", "int8_layers": [1]})
+    assert x.int8_layers == (1,)
+    # Rows that are int8 already: the list is no rule (same setting).
+    for mode in ("delta_int8", "x_int8"):
+        listed = DeltaDispatchConfig.from_mapping({"mode": mode, "int8_layers": [2]})
+        assert listed == DeltaDispatchConfig.from_mapping({"mode": mode})
+    for bad in (
+        {"mode": "delta_nvfp4", "int8_layers": "0/1"},
+        {"mode": "delta_nvfp4", "int8_layers": [-1]},
+        {"mode": "delta_nvfp4", "int8_layers": [True]},
+        {"mode": "delta_nvfp4", "int8_layers": [1.0]},
+        {"mode": "delta_nvfp4", "int8_layers": [2, 2]},
+        {"mode": "delta_nvfp4", "int8_layers": [1], "early": 1},
+        {"mode": "delta_nvfp4", "int8_layers": [1], "late": 1},
+        {"mode": "delta_int4", "int8_layers": [1], "revisit": "int8"},
+        {"mode": "delta_fp32", "int8_layers": [1]},
+        {"mode": "full_bf16", "int8_layers": [1]},
+        {"mode": "off", "int8_layers": [1]},
+        {"mode": "delta_nvfp4", "nvfp4_pass": "three_pass"},
+        {"mode": "delta_nvfp4", "hardware_e4m3": "yes"},
+    ):
+        with pytest.raises(ValueError):
+            DeltaDispatchConfig.from_mapping(bad)
+    combine = CombineConfig.from_mapping(
+        {"mode": "nvfp4", "int8_layers": [4, 1], "nvfp4_pass": "two_pass"}
+    )
+    assert combine.int8_layers == (1, 4)
+    assert [combine.code_at(p, 7) for p in range(7)] == [
+        D_NVFP4,
+        D_INT8,
+        D_NVFP4,
+        D_NVFP4,
+        D_INT8,
+        D_NVFP4,
+        D_NVFP4,
+    ]
+    assert combine.max_row_bytes(MODEL_HIDDEN) == row_bytes(D_INT8, MODEL_HIDDEN)
+    for bad in (
+        {"mode": "int8", "int8_layers": [1]},
+        {"mode": "off", "int8_layers": [1]},
+        {"mode": "int4", "int8_layers": [1], "early": 2},
+        {"mode": "nvfp4", "int8_layers": [1, 1]},
+        {"mode": "nvfp4", "nvfp4_pass": "fast"},
+        {"mode": "nvfp4", "hardware_e4m3": 1},
+    ):
+        with pytest.raises(ValueError):
+            CombineConfig.from_mapping(bad)
+    # The list must name MoE layers of the model.
+    count = len(MOE_LAYERS)
+    with pytest.raises(ValueError):
+        AttentionDeltaState(
+            DeltaDispatchConfig(mode="delta_nvfp4", int8_layers=(count,)),
+            MOE_LAYERS,
+            ROUTED_SCALE,
+            2,
+            TOKENS,
+            HIDDEN,
+        )
+    with pytest.raises(ValueError):
+        FFNDeltaState(
+            DeltaDispatchConfig(mode="delta_nvfp4"),
+            MOE_LAYERS,
+            ROUTED_SCALE,
+            HIDDEN,
+            1,
+            TOKENS,
+            CombineConfig(mode="nvfp4", int8_layers=(count,)),
+        )
+    # Per layer: an int8 layer's rows are h_int8 / d_int8 (one size), the
+    # other layers' those of the mode.
+    cfg = DeltaDispatchConfig(mode="delta_nvfp4", first="nvfp4", int8_layers=(3,))
+    assert cfg.fixed_row_bytes(MODEL_HIDDEN) == 0
+    assert cfg.layer_row_bytes(3, MODEL_HIDDEN) == row_bytes(D_INT8, MODEL_HIDDEN)
+    assert cfg.layer_row_bytes(2, MODEL_HIDDEN) == row_bytes(D_NVFP4, MODEL_HIDDEN)
+    assert cfg.first_rest_codes_at(3) == (H_INT8, D_INT8)
+    assert cfg.first_rest_codes_at(2) == (H_NVFP4, D_NVFP4)
+    assert cfg.uses_nvfp4 and cfg.layer_uses_nvfp4(2) and not cfg.layer_uses_nvfp4(3)
+    last = torch.tensor([-1, 0, 2], dtype=torch.int32)
+    assert cfg.row_codes(3, 8, last).tolist() == [H_INT8, D_INT8, D_INT8]
+    assert cfg.row_codes(2, 8, last).tolist() == [H_NVFP4, D_NVFP4, D_NVFP4]
+    x = DeltaDispatchConfig(mode="x_nvfp4", int8_layers=(3,))
+    assert x.row_codes(3, 8, last).tolist() == [D_INT8] * 3
+    assert x.first_rest_codes_at(3) == (D_INT8, D_INT8)
+    # Without the list, the per-layer size is the mode's (early / late mix).
+    ruled = DeltaDispatchConfig(mode="delta_nvfp4", first="nvfp4", early=1)
+    assert ruled.layer_row_bytes(4, MODEL_HIDDEN) == 0
 
 
 def test_row_formats_and_codes() -> None:
@@ -842,6 +952,68 @@ def test_x_nvfp4_is_the_plain_nvfp4() -> None:
             assert torch.equal(x, want.view(-1).to(torch.bfloat16))
 
 
+@pytest.mark.parametrize("ef", [False, True])
+def test_int8_layers_follow_the_offline_dp_and_cp(ef: bool) -> None:
+    # Ours NVFP4 with MoE layer positions 1 and 4 in int8 on both sides (the
+    # offline dp=1/4,cp=1/4,pfmt=int8): on those layers a token's first row
+    # at an FFN rank is h_int8 and later ones d_int8, elsewhere h_nvfp4 /
+    # d_nvfp4; every layer keeps one row size; first visits are the offline
+    # quantizer's of h'; the received partial sums are the offline
+    # quantizer's at the layer's width; both sides' states stay identical.
+    listed = (1, 4)
+    cfg = DeltaDispatchConfig(mode="delta_nvfp4", first="nvfp4", int8_layers=listed)
+    combine = CombineConfig(mode="nvfp4", ef=ef, int8_layers=listed)
+    steps = _drive(cfg, 4, 2, 2, combine, forwards=2)
+    seen: set[tuple] = set()
+    forward = -1
+    for step in steps:
+        pos = MOE_LAYERS.index(step["layer"])
+        if pos == 0 and step["stage"] == 0 and step["attn"] == 0:
+            forward += 1
+        wide = pos in listed
+        first_code, rest_code = (H_INT8, D_INT8) if wide else (H_NVFP4, D_NVFP4)
+        size = row_bytes(D_INT8 if wide else D_NVFP4, HIDDEN)
+        assert int(step["bytes"].sum()) == len(step["flat"]) * size
+        for flat, code in zip(
+            step["flat"].tolist(), step["codes"].tolist(), strict=True
+        ):
+            f, t = divmod(flat, TOKENS)
+            key = (forward, step["stage"], step["attn"], f, t)
+            want = rest_code if key in seen else first_code
+            assert code == want
+            seen.add(key)
+            if code in (H_INT8, H_NVFP4):
+                h = step["h_prime"][t].float().view(1, -1)
+                value = _offline_quantize(h, 8) if wide else _offline_nvfp4(h)
+                assert torch.equal(
+                    step["inputs"][(f, t)], _norm(value.to(torch.bfloat16)).view(-1)
+                )
+        if not ef:
+            got = _offline_combine(D_INT8 if wide else D_NVFP4, step["exact"])
+            assert torch.equal(step["received"], got.to(torch.bfloat16).float())
+        if "ffn_states" in step:
+            for f, f_state in enumerate(step["ffn_states"]):
+                for a, a_state in enumerate(step["attn_states"]):
+                    assert torch.equal(
+                        f_state[a * TOKENS : (a + 1) * TOKENS],
+                        a_state[f * TOKENS : (f + 1) * TOKENS],
+                    )
+    assert {H_INT8, D_INT8, H_NVFP4, D_NVFP4} <= {
+        c for s in steps for c in s["codes"].tolist()
+    }
+
+
+def test_x_nvfp4_int8_layers_are_the_plain_int8() -> None:
+    cfg = DeltaDispatchConfig(mode="x_nvfp4", int8_layers=(0, 5))
+    for step in _drive(cfg, 4, 2, 1):
+        wide = MOE_LAYERS.index(step["layer"]) in (0, 5)
+        assert set(step["codes"].tolist()) == {D_INT8 if wide else D_NVFP4}
+        for (_, t), x in step["inputs"].items():
+            norm_h = step["norm_h"][t].float().view(1, -1)
+            want = _offline_quantize(norm_h, 8) if wide else _offline_nvfp4(norm_h)
+            assert torch.equal(x, want.view(-1).to(torch.bfloat16))
+
+
 def test_missing_rows_are_an_error() -> None:
     cfg = DeltaDispatchConfig(mode="delta_fp32")
     ffn = FFNDeltaState(cfg, MOE_LAYERS, ROUTED_SCALE, HIDDEN, 1, TOKENS)
@@ -977,18 +1149,24 @@ def test_triton_kernels_match_reference(
     ],
 )
 @pytest.mark.parametrize(("nvfp4_pass", "hardware"), NVFP4_KERNEL_VARIANTS)
+@pytest.mark.parametrize("int8_layers", [(), (3,), (2,)])
 def test_triton_one_row_size_paths_match_reference(
-    mode: str, first: str, nvfp4_pass: str, hardware: bool
+    mode: str, first: str, nvfp4_pass: str, hardware: bool, int8_layers: tuple
 ) -> None:
     # One row size: the encode kernel picks the codes (first visit or not)
     # and the host updates the visits after it; the decode kernel finds each
-    # row at index * size and reads its state row from its word.
+    # row at index * size and reads its state row from its word. With
+    # int8_layers the rows are encoded at layer position 3: an int8 layer
+    # (3,) has h_int8 / d_int8 rows and no NVFP4 work, another listed layer
+    # (2,) leaves layer 3 to the mode's rows.
     from afd_plugin import delta_dispatch_triton
 
-    cfg = DeltaDispatchConfig(mode=mode, first=first)
+    if int8_layers and mode in ("full_bf16", "delta_int8", "x_int8"):
+        pytest.skip("int8_layers apply to the delta / x modes below int8 only")
+    cfg = DeltaDispatchConfig(mode=mode, first=first, int8_layers=int8_layers)
     if not cfg.uses_nvfp4 and (nvfp4_pass, hardware) != ("two_pass", False):
         pytest.skip("no NVFP4 rows: one kernel structure")
-    size = cfg.fixed_row_bytes(MODEL_HIDDEN)
+    size = cfg.layer_row_bytes(3, MODEL_HIDDEN)
     gen = torch.Generator().manual_seed(5)
     tokens, rows, rank, max_tokens = 64, 40, 3, 96
     flat = torch.randperm(3 * tokens, generator=gen)[:rows].sort().values
@@ -1069,6 +1247,7 @@ def test_triton_one_row_size_paths_match_reference(
         max_tokens=max_tokens,
         row_size=size,
         hardware_e4m3=hardware,
+        nvfp4=cfg.layer_uses_nvfp4(3),
     )
     assert torch.equal(rows_out.long(), want)
     if cfg.stateful:

@@ -79,13 +79,24 @@ Codes by mode (``connector_extra_config = {"delta_dispatch": {...}}``):
   quantization, the baselines; int8 stands in for the 8-bit dispatch of other
   systems).
 
+``int8_layers`` (a list of MoE layer positions, 0 = the first MoE layer; the
+offline experiment's ``dp=`` with ``pfmt=int8``) puts every row of those layers
+in int8 instead of an ``early`` / ``late`` rule: first visits ``h_int8`` and
+later visits ``d_int8`` (x modes ``d_int8``). Every row of a layer then still
+has one size, so such modes keep the one-row-size path per layer.
+``nvfp4_pass`` (``"two_pass"`` / ``"one_pass"``) and ``hardware_e4m3`` choose
+how the Attention side encodes NVFP4 rows (``delta_dispatch_triton.py``; same
+bytes either way; ``hardware_e4m3`` needs Ada or later).
+
 Combine compression (``connector_extra_config = {"combine": {"mode": ...,
 "ef": ...}}``, needs delta dispatch for the rows' tokens): each FFN rank
 returns its partial sum of a row quantized like the formats above
 (``int8``, ``int4`` or ``nvfp4``; every row of a layer the same size). With
 ``int4`` / ``nvfp4``, ``early`` / ``late`` put the first ``early`` and the last
 ``late`` MoE layers in ``int8`` (the offline experiment's ``cearly`` /
-``clate``: the layers whose combine error costs the most). With ``ef`` (error
+``clate``: the layers whose combine error costs the most), or ``int8_layers``
+the listed ones (the offline ``cp=``); ``nvfp4_pass`` / ``hardware_e4m3`` as
+for dispatch, on the FFN side. With ``ef`` (error
 feedback) it adds to the partial the residual it cut from that (Attention rank, token)
 at its previous visit in this forward and keeps the new residual:
 
@@ -182,6 +193,12 @@ E2M1_SIGN_BIT = 0x8
 E4M3_MAX = 448.0
 NVFP4_MIN_SCALE = 1e-30
 NVFP4_ROW_SCALE_BYTES = torch.float32.itemsize
+# How the encode kernels get an NVFP4 row's |max| (``delta_dispatch_triton.py``):
+# two passes (a row-maximum kernel, then the (row, group) kernel) or one pass
+# (one program per row). The settings' ``nvfp4_pass``.
+NVFP4_TWO_PASS = "two_pass"
+NVFP4_ONE_PASS = "one_pass"
+NVFP4_PASSES = (NVFP4_TWO_PASS, NVFP4_ONE_PASS)
 
 
 def row_bytes(code: int, hidden: int) -> int:
@@ -209,6 +226,55 @@ def row_bytes_table(hidden: int, device: torch.device | str) -> torch.Tensor:
     )
 
 
+def _int8_layers(raw: Any, what: str) -> tuple[int, ...]:
+    """``int8_layers``: distinct MoE layer positions (>= 0), sorted."""
+    if raw is None:
+        return ()
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise ValueError(f"{what} int8_layers must be a list of MoE layer positions")
+    out = []
+    for v in raw:
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError(
+                f"{what} int8_layers holds MoE layer positions >= 0, not {v!r}"
+            )
+        out.append(v)
+    if len(set(out)) != len(out):
+        raise ValueError(f"{what} int8_layers repeats a layer: {out}")
+    return tuple(sorted(out))
+
+
+def _nvfp4_options(raw: Mapping[str, Any], what: str) -> tuple[str, bool]:
+    """``nvfp4_pass`` and ``hardware_e4m3`` of the dispatch / combine settings."""
+    nvfp4_pass = str(raw.get("nvfp4_pass", NVFP4_TWO_PASS))
+    if nvfp4_pass not in NVFP4_PASSES:
+        raise ValueError(f"{what} nvfp4_pass {nvfp4_pass!r} not in {NVFP4_PASSES}")
+    hardware = raw.get("hardware_e4m3", False)
+    if not isinstance(hardware, bool):
+        raise ValueError(f"{what} hardware_e4m3 must be true or false")
+    return nvfp4_pass, hardware
+
+
+def _check_int8_layers(int8_layers: Sequence[int], count: int, what: str) -> None:
+    if int8_layers and max(int8_layers) >= count:
+        raise ValueError(
+            f"{what} int8_layers {list(int8_layers)} name positions past the "
+            f"{count} MoE layers"
+        )
+
+
+def check_hardware_e4m3(*configs: Any) -> None:
+    """With ``hardware_e4m3`` the kernels use the E4M3 conversion of Ada (sm_89)
+    and later: refuse an older current CUDA device (no check without CUDA)."""
+    if not any(getattr(c, "hardware_e4m3", False) for c in configs):
+        return
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 9):
+        raise RuntimeError(
+            "hardware_e4m3 needs a GPU of compute capability 8.9 or later, not "
+            f"{torch.cuda.get_device_capability()}"
+        )
+
+
 @dataclass(frozen=True)
 class DeltaDispatchConfig:
     mode: str = "off"
@@ -218,6 +284,12 @@ class DeltaDispatchConfig:
     revisit: str = ""
     rgap: int = 2
     first: str = "bf16"
+    # MoE layer positions whose rows are int8 (first visits h_int8, later ones
+    # d_int8; x modes d_int8), in place of early / late.
+    int8_layers: tuple[int, ...] = ()
+    # How the Attention side encodes NVFP4 rows (same bytes either way).
+    nvfp4_pass: str = NVFP4_TWO_PASS
+    hardware_e4m3: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> DeltaDispatchConfig:
@@ -225,7 +297,17 @@ class DeltaDispatchConfig:
             return cls()
         if not isinstance(raw, Mapping):
             raise TypeError("delta_dispatch must be a mapping")
-        unknown = set(raw) - {"mode", "early", "late", "revisit", "rgap", "first"}
+        unknown = set(raw) - {
+            "mode",
+            "early",
+            "late",
+            "revisit",
+            "rgap",
+            "first",
+            "int8_layers",
+            "nvfp4_pass",
+            "hardware_e4m3",
+        }
         if unknown:
             raise ValueError(f"unknown delta_dispatch keys: {sorted(unknown)}")
         mode = str(raw.get("mode", "off"))
@@ -234,8 +316,24 @@ class DeltaDispatchConfig:
         early, late = int(raw.get("early", 0)), int(raw.get("late", 0))
         revisit, rgap = str(raw.get("revisit", "")), int(raw.get("rgap", 2))
         first = str(raw.get("first", "bf16"))
+        int8_layers = _int8_layers(raw.get("int8_layers"), "delta_dispatch")
+        nvfp4_pass, hardware_e4m3 = _nvfp4_options(raw, "delta_dispatch")
         if early < 0 or late < 0:
             raise ValueError("delta_dispatch early and late must be >= 0")
+        if int8_layers:
+            if mode not in DELTA_CODES and mode not in X_CODES:
+                raise ValueError(
+                    "delta_dispatch int8_layers apply to the quantized delta and "
+                    f"x modes {tuple(DELTA_CODES) + tuple(X_CODES)} only"
+                )
+            if early or late or revisit:
+                raise ValueError(
+                    "delta_dispatch int8_layers replace early/late and do not "
+                    "combine with revisit (as the offline experiment's dp=)"
+                )
+            # The rows of delta_int8 / x_int8 are int8 already.
+            if DELTA_CODES.get(mode, X_CODES.get(mode)) == D_INT8:
+                int8_layers = ()
         if revisit and revisit not in REVISIT_FORMATS:
             raise ValueError(
                 f"delta_dispatch revisit {revisit!r} not in {tuple(REVISIT_FORMATS)}"
@@ -266,7 +364,15 @@ class DeltaDispatchConfig:
                 f"quantized delta modes {tuple(DELTA_CODES)} only"
             )
         return cls(
-            mode=mode, early=early, late=late, revisit=revisit, rgap=rgap, first=first
+            mode=mode,
+            early=early,
+            late=late,
+            revisit=revisit,
+            rgap=rgap,
+            first=first,
+            int8_layers=int8_layers,
+            nvfp4_pass=nvfp4_pass,
+            hardware_e4m3=hardware_e4m3,
         )
 
     @classmethod
@@ -305,6 +411,10 @@ class DeltaDispatchConfig:
         visit to its FFN rank in this forward (``< 0``: first visit)."""
         if self.mode == "full_bf16":
             return torch.full_like(last, H_BF16)
+        if self.int8_at(layer_pos):
+            if self.mode in X_CODES:
+                return torch.full_like(last, D_INT8)
+            return torch.where(last < 0, H_INT8, torch.full_like(last, D_INT8))
         if self.mode in X_CODES:
             return torch.full_like(last, X_CODES[self.mode])
         if self.mode == "delta_fp32":
@@ -322,26 +432,44 @@ class DeltaDispatchConfig:
         # First visits keep their format on the early / late layers too.
         return torch.where(last < 0, FIRST_FORMATS[self.first], rest).to(last.dtype)
 
-    def _codes(self) -> tuple[int, ...]:
-        """The formats the rows of this mode can have."""
+    def int8_at(self, layer_pos: int) -> bool:
+        """The rows of MoE layer position ``layer_pos`` are int8 (``int8_layers``)."""
+        return layer_pos in self.int8_layers
+
+    def _codes(self, int8_layers: bool = True) -> tuple[int, ...]:
+        """The formats the rows of this mode can have (without
+        ``int8_layers``: on the layers outside the list)."""
         fixed = {
             "full_bf16": (H_BF16,),
             "delta_fp32": (H_BF16, D_FP32),
             **{mode: (code,) for mode, code in X_CODES.items()},
         }
         if self.mode in fixed:
-            return fixed[self.mode]
-        codes = {FIRST_FORMATS[self.first], DELTA_CODES[self.mode]}
-        if self.early or self.late:
-            codes.add(D_INT8)
-        if self.revisit:
-            codes.add(REVISIT_FORMATS[self.revisit])
+            codes = set(fixed[self.mode])
+        else:
+            codes = {FIRST_FORMATS[self.first], DELTA_CODES[self.mode]}
+            if self.early or self.late:
+                codes.add(D_INT8)
+            if self.revisit:
+                codes.add(REVISIT_FORMATS[self.revisit])
+        if int8_layers and self.int8_layers:
+            codes |= {D_INT8} if self.mode in X_CODES else {H_INT8, D_INT8}
         return tuple(sorted(codes))
 
     @property
     def uses_nvfp4(self) -> bool:
         """Some rows of the mode are NVFP4 (their encode needs the row maximum)."""
         return any(c in NVFP4_CODES for c in self._codes())
+
+    def layer_uses_nvfp4(self, layer_pos: int) -> bool:
+        """Some rows of MoE layer position ``layer_pos`` can be NVFP4."""
+        if self.int8_at(layer_pos):
+            return False
+        return any(c in NVFP4_CODES for c in self._codes(int8_layers=False))
+
+    def check_layers(self, count: int) -> None:
+        """``int8_layers`` within the model's ``count`` MoE layers."""
+        _check_int8_layers(self.int8_layers, count, "delta_dispatch")
 
     def max_row_bytes(self, hidden: int) -> int:
         return max(row_bytes(c, hidden) for c in self._codes())
@@ -356,6 +484,15 @@ class DeltaDispatchConfig:
         whether the row is a first visit (``first_rest_codes``): a mode with an
         early / late / revisit rule mixes sizes."""
         sizes = {row_bytes(c, hidden) for c in self._codes()}
+        return sizes.pop() if len(sizes) == 1 else 0
+
+    def layer_row_bytes(self, layer_pos: int, hidden: int) -> int:
+        """``fixed_row_bytes`` of MoE layer position ``layer_pos``: with
+        ``int8_layers`` the listed layers' rows (h_int8 and d_int8, the same
+        size) and the other layers' rows each have one size."""
+        if self.int8_at(layer_pos):
+            return row_bytes(D_INT8, hidden)
+        sizes = {row_bytes(c, hidden) for c in self._codes(int8_layers=False)}
         return sizes.pop() if len(sizes) == 1 else 0
 
     def first_rest_codes(self) -> tuple[int, int]:
@@ -375,6 +512,13 @@ class DeltaDispatchConfig:
             raise ValueError(f"{self} has rows of more than one size")
         return FIRST_FORMATS[self.first], rest
 
+    def first_rest_codes_at(self, layer_pos: int) -> tuple[int, int]:
+        """``first_rest_codes`` at MoE layer position ``layer_pos`` (one row
+        size there, ``layer_row_bytes``)."""
+        if self.int8_at(layer_pos):
+            return (D_INT8, D_INT8) if self.mode in X_CODES else (H_INT8, D_INT8)
+        return self.first_rest_codes()
+
 
 # The row format of each combine compression mode, and the modes that can put
 # the first ``early`` and last ``late`` MoE layers in int8.
@@ -386,12 +530,16 @@ COMBINE_INT8_LAYER_MODES = ("int4", "nvfp4")
 class CombineConfig:
     """Combine compression: ``mode`` off / int8 / int4 / nvfp4, ``ef`` error
     feedback; with int4 / nvfp4, ``int8`` on the first ``early`` and last
-    ``late`` MoE layers."""
+    ``late`` MoE layers or on the ``int8_layers`` positions; ``nvfp4_pass`` /
+    ``hardware_e4m3``: how the FFN side encodes NVFP4 rows."""
 
     mode: str = "off"
     ef: bool = True
     early: int = 0
     late: int = 0
+    int8_layers: tuple[int, ...] = ()
+    nvfp4_pass: str = NVFP4_TWO_PASS
+    hardware_e4m3: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> CombineConfig:
@@ -399,7 +547,15 @@ class CombineConfig:
             return cls()
         if not isinstance(raw, Mapping):
             raise TypeError("combine must be a mapping")
-        unknown = set(raw) - {"mode", "ef", "early", "late"}
+        unknown = set(raw) - {
+            "mode",
+            "ef",
+            "early",
+            "late",
+            "int8_layers",
+            "nvfp4_pass",
+            "hardware_e4m3",
+        }
         if unknown:
             raise ValueError(f"unknown combine keys: {sorted(unknown)}")
         mode = str(raw.get("mode", "off"))
@@ -416,7 +572,23 @@ class CombineConfig:
                 "combine early/late (int8 layers) apply to modes "
                 f"{COMBINE_INT8_LAYER_MODES} only"
             )
-        return cls(mode=mode, ef=ef, early=early, late=late)
+        int8_layers = _int8_layers(raw.get("int8_layers"), "combine")
+        if int8_layers and mode not in COMBINE_INT8_LAYER_MODES:
+            raise ValueError(
+                f"combine int8_layers apply to modes {COMBINE_INT8_LAYER_MODES} only"
+            )
+        if int8_layers and (early or late):
+            raise ValueError("combine int8_layers replace early/late")
+        nvfp4_pass, hardware_e4m3 = _nvfp4_options(raw, "combine")
+        return cls(
+            mode=mode,
+            ef=ef,
+            early=early,
+            late=late,
+            int8_layers=int8_layers,
+            nvfp4_pass=nvfp4_pass,
+            hardware_e4m3=hardware_e4m3,
+        )
 
     @classmethod
     def from_extra_config(cls, extra: Mapping[str, Any] | None) -> CombineConfig:
@@ -443,7 +615,11 @@ class CombineConfig:
 
     def code_at(self, layer_pos: int, num_layers: int) -> int:
         """The row format at the ``layer_pos``-th of ``num_layers`` MoE layers."""
-        if layer_pos < self.early or layer_pos >= num_layers - self.late:
+        if (
+            layer_pos < self.early
+            or layer_pos >= num_layers - self.late
+            or layer_pos in self.int8_layers
+        ):
             return D_INT8
         return self.code
 
@@ -451,8 +627,13 @@ class CombineConfig:
         return row_bytes(self.code_at(layer_pos, num_layers), hidden)
 
     def max_row_bytes(self, hidden: int) -> int:
-        codes = {self.code} | ({D_INT8} if self.early or self.late else set())
+        wide = self.early or self.late or self.int8_layers
+        codes = {self.code} | ({D_INT8} if wide else set())
         return max(row_bytes(c, hidden) for c in codes)
+
+    def check_layers(self, count: int) -> None:
+        """``int8_layers`` within the model's ``count`` MoE layers."""
+        _check_int8_layers(self.int8_layers, count, "combine")
 
 
 # ------------------------------------------------------- torch reference
@@ -610,7 +791,7 @@ def encode_rows_reference(
     hidden = src.shape[1]
     tokens = flat % num_tokens
     if codes is None:
-        first, rest = cfg.first_rest_codes()
+        first, rest = cfg.first_rest_codes_at(layer_pos)
         if cfg.stateful and last is not None:
             codes = torch.where(last[flat] < 0, first, rest).to(torch.int32)
         else:
@@ -746,22 +927,30 @@ def decode_combine_reference(code: int, data: torch.Tensor, out: torch.Tensor) -
     out.copy_(_dequantized_rows(code, data[: n * size].view(n, size), hidden))
 
 
-def encode_combine(code: int, *args: Any) -> None:
-    """``encode_combine_reference``, fused on CUDA."""
+def encode_combine(
+    code: int,
+    *args: Any,
+    nvfp4_pass: str = NVFP4_TWO_PASS,
+    hardware_e4m3: bool = False,
+) -> None:
+    """``encode_combine_reference``, fused on CUDA (``nvfp4_pass`` /
+    ``hardware_e4m3``: the kernels' choice, the same bytes)."""
     if args[0].is_cuda:
         from afd_plugin import delta_dispatch_triton
 
-        delta_dispatch_triton.encode_combine(code, *args)
+        delta_dispatch_triton.encode_combine(
+            code, *args, nvfp4_pass=nvfp4_pass, hardware_e4m3=hardware_e4m3
+        )
     else:
         encode_combine_reference(code, *args)
 
 
-def decode_combine(code: int, *args: Any) -> None:
+def decode_combine(code: int, *args: Any, hardware_e4m3: bool = False) -> None:
     """``decode_combine_reference``, fused on CUDA."""
     if args[0].is_cuda:
         from afd_plugin import delta_dispatch_triton
 
-        delta_dispatch_triton.decode_combine(code, *args)
+        delta_dispatch_triton.decode_combine(code, *args, hardware_e4m3=hardware_e4m3)
     else:
         decode_combine_reference(code, *args)
 
@@ -771,16 +960,24 @@ def encode_rows(cfg: DeltaDispatchConfig, *args: Any) -> None:
         # Lazy import: Triton is only needed (and installed) with CUDA.
         from afd_plugin import delta_dispatch_triton
 
-        delta_dispatch_triton.encode_rows(cfg, *args)
+        delta_dispatch_triton.encode_rows(
+            cfg, *args, nvfp4_pass=cfg.nvfp4_pass, hardware_e4m3=cfg.hardware_e4m3
+        )
         return
     encode_rows_reference(cfg, *args)
 
 
-def decode_rows(cfg: DeltaDispatchConfig, *args: Any, **kwargs: Any) -> None:
+def decode_rows(
+    cfg: DeltaDispatchConfig, *args: Any, nvfp4: bool | None = None, **kwargs: Any
+) -> None:
+    """``decode_rows_reference``, fused on CUDA (``nvfp4``: whether rows of
+    the launch can be NVFP4, default ``cfg.uses_nvfp4``)."""
     if args[0].is_cuda:
         from afd_plugin import delta_dispatch_triton
 
-        delta_dispatch_triton.decode_rows(cfg, *args, **kwargs)
+        delta_dispatch_triton.decode_rows(
+            cfg, *args, nvfp4=nvfp4, hardware_e4m3=cfg.hardware_e4m3, **kwargs
+        )
         return
     decode_rows_reference(cfg, *args, **kwargs)
 
@@ -851,11 +1048,14 @@ class AttentionDeltaState:
         self._last: dict[int, torch.Tensor] = {}
         self._totals: dict[int, torch.Tensor] = {}
         self._table: torch.Tensor | None = None
-        # One row size for every row of the mode (0: sizes differ): the
-        # offsets are index * size (``_offsets``, made once) and the codes are
-        # chosen in the encode kernel.
-        self._fixed = cfg.fixed_row_bytes(hidden)
-        self._offsets: torch.Tensor | None = None
+        cfg.check_layers(self.layers.count)
+        self.combine.check_layers(self.layers.count)
+        check_hardware_e4m3(cfg, self.combine)
+        # Per MoE layer position, one row size for every row of the layer (0:
+        # sizes differ): the offsets are index * size (``_offsets``, made once
+        # per size) and the codes are chosen in the encode kernel.
+        self._fixed = [cfg.layer_row_bytes(p, hidden) for p in range(self.layers.count)]
+        self._offsets: dict[int, torch.Tensor] = {}
 
     def _stage(
         self, stage: int, device: torch.device
@@ -893,27 +1093,30 @@ class AttentionDeltaState:
         if pos == 0:
             # A new forward: every token starts with a first visit.
             last.fill_(-1)
-        if self._fixed:
+        fixed = self._fixed[pos]
+        if fixed:
             # One row size: no per-row work here. The sent entries come first
             # in ``order`` and only those are encoded and read back.
-            if self._offsets is None or self._offsets.device != order.device:
-                self._offsets = (
+            offsets = self._offsets.get(fixed)
+            if offsets is None or offsets.device != order.device:
+                offsets = (
                     torch.arange(
                         self.num_ffn * self.max_tokens,
                         dtype=torch.int64,
                         device=order.device,
                     )
-                    * self._fixed
+                    * fixed
                 )
+                self._offsets[fixed] = offsets
             return PackedDispatch(
                 stage,
                 pos,
                 num_tokens,
                 order,
                 None,
-                self._offsets[: order.shape[0]],
+                offsets[: order.shape[0]],
                 None,
-                self._fixed,
+                fixed,
             )
         valid = order < self.num_ffn * num_tokens
         flat = torch.where(valid, order, 0)
@@ -990,7 +1193,9 @@ class AttentionDeltaState:
             )
             self._back[stage] = back
         code = self.combine.code_at(layer_pos, self.layers.count)
-        decode_combine(code, data, back[:num_rows])
+        decode_combine(
+            code, data, back[:num_rows], hardware_e4m3=self.combine.hardware_e4m3
+        )
         return back[:num_rows]
 
     def after_combine(
@@ -1040,10 +1245,16 @@ class FFNDeltaState:
         self._h: dict[int, torch.Tensor] = {}
         self._x: dict[int, torch.Tensor] = {}
         self._table: torch.Tensor | None = None
-        # One row size for every row of the mode (0: sizes differ): the decode
-        # kernel finds each row at index * size. It always reads each row's
-        # state row from its word and writes it here (int32, per stage).
-        self._fixed = cfg.fixed_row_bytes(self.hidden)
+        cfg.check_layers(self.layers.count)
+        self.combine.check_layers(self.layers.count)
+        check_hardware_e4m3(cfg, self.combine)
+        # Per MoE layer position, one row size for every row of the layer (0:
+        # sizes differ): the decode kernel finds each row at index * size. It
+        # always reads each row's state row from its word and writes it here
+        # (int32, per stage).
+        self._fixed = [
+            cfg.layer_row_bytes(p, self.hidden) for p in range(self.layers.count)
+        ]
         self._row_ids: dict[int, torch.Tensor] = {}
 
     def _buffer(
@@ -1099,7 +1310,8 @@ class FFNDeltaState:
             self._rows[stage] = meta.new_empty(0, dtype=torch.int64)
             return x[:out_rows]
         offsets = None
-        if not self._fixed:
+        fixed = self._fixed[pos]
+        if not fixed:
             if self._table is None:
                 self._table = row_bytes_table(self.hidden, device)
             nbytes = self._table[((meta >> CODE_SHIFT) & CODE_MASK).long()]
@@ -1112,7 +1324,12 @@ class FFNDeltaState:
             self._row_ids[stage] = ids
         rows = ids[:n]
         self._rows[stage] = rows
-        kw = {"rows_out": rows, "max_tokens": self.max_tokens, "row_size": self._fixed}
+        kw = {
+            "rows_out": rows,
+            "max_tokens": self.max_tokens,
+            "row_size": fixed,
+            "nvfp4": self.cfg.layer_uses_nvfp4(pos),
+        }
         state = None
         if self.cfg.stateful:
             state = self._state.get(stage)
@@ -1160,7 +1377,16 @@ class FFNDeltaState:
                     self._err[stage] = err
             deq = self._buffer(self._deq, stage, capacity, device, torch.float32)[:n]
             code = self.combine.code_at(self._pos[stage], self.layers.count)
-            encode_combine(code, returned, rows, err, data, deq)
+            encode_combine(
+                code,
+                returned,
+                rows,
+                err,
+                data,
+                deq,
+                nvfp4_pass=self.combine.nvfp4_pass,
+                hardware_e4m3=self.combine.hardware_e4m3,
+            )
             self._crows[stage] = n
             returned = deq
         if self.cfg.stateful and n:
@@ -1202,6 +1428,9 @@ __all__ = [
     "H_NVFP4",
     "MODES",
     "NVFP4_CODES",
+    "NVFP4_ONE_PASS",
+    "NVFP4_PASSES",
+    "NVFP4_TWO_PASS",
     "QUANT_GROUP_SIZE",
     "RANK_SHIFT",
     "AttentionDeltaState",
@@ -1209,6 +1438,7 @@ __all__ = [
     "DeltaDispatchConfig",
     "FFNDeltaState",
     "PackedDispatch",
+    "check_hardware_e4m3",
     "decode_combine_reference",
     "decode_rows_reference",
     "encode_combine_reference",
