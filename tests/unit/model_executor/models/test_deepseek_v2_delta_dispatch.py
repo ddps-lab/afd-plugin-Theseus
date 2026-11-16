@@ -870,6 +870,7 @@ def _host_connector(nixl_routed, *, role_rank: int, max_tokens: int):
     conn.agent = _HostAgent()
     conn.role_rank, conn.max_tokens = role_rank, max_tokens
     conn._writes, conn._pending_combines, conn._notifs = {}, [], {}
+    conn._active_write, conn._queued_writes = {}, {}
     conn._peer_agents, conn._peer_regions = {}, {}
     return conn
 

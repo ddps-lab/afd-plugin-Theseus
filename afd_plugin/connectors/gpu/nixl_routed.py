@@ -68,7 +68,9 @@ and every step starts as soon as its input has arrived):
 
 Every host wait is a polling loop that also drives the posted WRITEs to
 completion, because NIXL sends the notification of a WRITE only when its
-state is checked after it finished. The NIXL agent runs NIXL's progress
+state is checked after it finished. ``AFD_NIXL_SERIAL_WRITES=1`` makes the
+same loops post the WRITEs to one peer one at a time (see the setting).
+The NIXL agent runs NIXL's progress
 thread as well (NIXL's default), unless ``AFD_NIXL_PROGRESS_THREAD=0``: that
 thread polls the UCX worker with no pause and keeps a CPU busy even when
 idle, which on a node with two physical cores slows the main thread's host
@@ -120,6 +122,7 @@ import faulthandler
 import os
 import signal
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -186,6 +189,21 @@ _DEBUG_WAIT_S = 5.0
 # which keeps the UCX worker thread-safe for the micro-batch threads that
 # call it in turn. Unset or 1: NIXL's default, with the thread.
 _PROGRESS_THREAD = os.environ.get("AFD_NIXL_PROGRESS_THREAD", "1") != "0"
+# AFD_NIXL_SERIAL_WRITES=1: keep at most one WRITE in flight per peer. NIXL
+# sends the notification of a WRITE only after a flush of the endpoint that
+# follows its rows, so with several WRITEs to one peer in flight the
+# notification of the first waits behind the rows of the later ones and the
+# peer sees the micro-batch stages arrive together. With this on, a WRITE to
+# a peer that still has one in flight is queued and posted from the polling
+# loops once that one is seen complete. Unset or 0: every WRITE is posted at
+# once (the behaviour before this setting).
+_SERIAL_WRITES = os.environ.get("AFD_NIXL_SERIAL_WRITES", "0") == "1"
+# States of a NIXL transfer (``transfer`` / ``check_xfer_state``).
+XFER_IN_FLIGHT = "PROC"
+XFER_DONE = "DONE"
+XFER_FAILED = "ERR"
+# State reported for a WRITE that is queued behind another one to its peer.
+XFER_QUEUED = "QUEUED"
 
 
 def _agent_name(world_rank: int) -> str:
@@ -242,6 +260,19 @@ class PendingCombineWrite:
     notif: bytes
     # Combine compression: the rows are packed bytes, WRITTEN as one span.
     packed: bool = False
+
+
+@dataclass(frozen=True)
+class QueuedWrite:
+    """A WRITE held back while another one to the same peer is in flight
+    (``AFD_NIXL_SERIAL_WRITES``): the NIXL descriptors of its source and
+    destination and the notification the peer gets with it."""
+
+    slot: int
+    peer: int
+    src: list[tuple[int, int, int]]
+    dst: list[tuple[int, int, int]]
+    notif: bytes
 
 
 class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
@@ -301,8 +332,13 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # Attention: the GPU buffers a stage's rows are packed into before
         # they are copied into the pinned send buffers.
         self._pack: list[torch.Tensor] = []
-        # slot -> WRITE handles posted and not yet seen complete.
+        # slot -> WRITEs not yet seen complete: the NIXL handle of a posted
+        # one, a QueuedWrite for one waiting for its peer.
         self._writes: dict[int, list[Any]] = {}
+        # AFD_NIXL_SERIAL_WRITES: peer -> handle of its WRITE in flight, and
+        # peer -> the WRITEs waiting behind it, in the order they were issued.
+        self._active_write: dict[int, Any] = {}
+        self._queued_writes: dict[int, deque[QueuedWrite]] = {}
         self._notifs: dict[str, list[bytes]] = {}
         # Attention: stage -> plan of the dispatch whose results are pending.
         self._nixl_pending: dict[int, P2pAll2AllPlan] = {}
@@ -451,7 +487,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             self._peer_regions[peer] = regions
         logger.info(
             "NIXL routed AFD connector ready: role=%s world_rank=%d peers=%s "
-            "region_rows=%d slots=%d backend=%s progress_thread=%s",
+            "region_rows=%d slots=%d backend=%s progress_thread=%s "
+            "serial_writes=%s",
             self.afd_config.role,
             self.world_rank,
             list(self._peer_agents),
@@ -459,6 +496,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             self.num_slots,
             NIXL_BACKEND,
             _PROGRESS_THREAD,
+            _SERIAL_WRITES,
         )
         if _DEBUG:
             # kill -USR1 <pid>: every thread's stack, the process keeps running.
@@ -515,18 +553,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             (addr + region_row * row_bytes, num_rows * row_bytes, 0)
             for addr, row_bytes in self._peer_regions[peer]
         ]
-        handle = self.agent.initialize_xfer(
-            "WRITE",
-            self.agent.get_xfer_descs(src, NIXL_MEM_TYPE),
-            self.agent.get_xfer_descs(dst, NIXL_MEM_TYPE),
-            self._peer_agents[peer],
-            notif,
-        )
-        state = self.agent.transfer(handle)
-        _mark(f"afd_nixl.write_post[{slot}:{notif.decode()}:{peer}]")
-        if state == "ERR":
-            raise RuntimeError(f"NIXL WRITE to world rank {peer} failed to post")
-        self._writes.setdefault(slot, []).append(handle)
+        state = self._post_write(QueuedWrite(slot, peer, src, dst, notif))
         self._dbg(
             "WRITE posted slot=%d peer=%d rows=%d region_row=%d notif=%s -> %s",
             slot,
@@ -557,18 +584,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 self._peer_regions[peer], spans, strict=True
             )
         ]
-        handle = self.agent.initialize_xfer(
-            "WRITE",
-            self.agent.get_xfer_descs(src, NIXL_MEM_TYPE),
-            self.agent.get_xfer_descs(dst, NIXL_MEM_TYPE),
-            self._peer_agents[peer],
-            notif,
-        )
-        state = self.agent.transfer(handle)
-        _mark(f"afd_nixl.write_post[{slot}:{notif.decode()}:{peer}]")
-        if state == "ERR":
-            raise RuntimeError(f"NIXL WRITE to world rank {peer} failed to post")
-        self._writes.setdefault(slot, []).append(handle)
+        state = self._post_write(QueuedWrite(slot, peer, src, dst, notif))
         self._dbg(
             "WRITE posted slot=%d peer=%d bytes=%s region_row=%d notif=%s -> %s",
             slot,
@@ -578,6 +594,58 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
             notif,
             state,
         )
+
+    def _post_write(self, write: QueuedWrite) -> str:
+        """Post ``write`` now, or queue it behind the WRITE in flight to its
+        peer when ``AFD_NIXL_SERIAL_WRITES`` is on. Either way it stays in
+        ``_writes`` of its slot until it is seen complete, so the waits on a
+        slot cover a queued WRITE as well."""
+        if _SERIAL_WRITES and write.peer in self._active_write:
+            self._queued_writes.setdefault(write.peer, deque()).append(write)
+            self._writes.setdefault(write.slot, []).append(write)
+            _mark(f"afd_nixl.write_queued[{write.slot}:{write.peer}]")
+            return XFER_QUEUED
+        return self._start_write(write)
+
+    def _start_write(self, write: QueuedWrite) -> str:
+        assert self.agent is not None
+        handle = self.agent.initialize_xfer(
+            "WRITE",
+            self.agent.get_xfer_descs(write.src, NIXL_MEM_TYPE),
+            self.agent.get_xfer_descs(write.dst, NIXL_MEM_TYPE),
+            self._peer_agents[write.peer],
+            write.notif,
+        )
+        state = self.agent.transfer(handle)
+        notif = write.notif.decode()
+        _mark(f"afd_nixl.write_post[{write.slot}:{notif}:{write.peer}]")
+        if state == XFER_FAILED:
+            raise RuntimeError(
+                f"NIXL WRITE to world rank {write.peer} failed to post"
+            )
+        self._writes.setdefault(write.slot, []).append(handle)
+        # A WRITE that completed at the post has sent its notification already
+        # (NIXL sends it there), so it holds nothing back.
+        if _SERIAL_WRITES and state != XFER_DONE:
+            self._active_write[write.peer] = handle
+        return state
+
+    def _start_queued_writes(self, done: list[Any]) -> None:
+        """``AFD_NIXL_SERIAL_WRITES``: the WRITEs of ``done`` have completed;
+        post the queued WRITEs of each of their peers, in the order they were
+        issued, up to the first that stays in flight."""
+        for peer, handle in list(self._active_write.items()):
+            if not any(handle is finished for finished in done):
+                continue
+            del self._active_write[peer]
+            queue = self._queued_writes.get(peer)
+            while queue and peer not in self._active_write:
+                write = queue.popleft()
+                waiting = self._writes[write.slot]
+                waiting.remove(write)
+                if not waiting:
+                    del self._writes[write.slot]
+                self._start_write(write)
 
     def _service_writes(self) -> None:
         """Make progress without blocking: post the partial sums whose experts
@@ -592,14 +660,19 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         # the first unfinished one blocks the later ones as well.
         while self._pending_combines and self._pending_combines[0].ready.query():
             self._post_combine(self._pending_combines.pop(0))
+        done: list[Any] = []
         for slot, handles in list(self._writes.items()):
             remaining: list[Any] = []
             for handle in handles:
-                state = self.agent.check_xfer_state(handle)
-                if state == "PROC":
+                if isinstance(handle, QueuedWrite):
                     remaining.append(handle)
-                elif state == "DONE":
+                    continue
+                state = self.agent.check_xfer_state(handle)
+                if state == XFER_IN_FLIGHT:
+                    remaining.append(handle)
+                elif state == XFER_DONE:
                     self.agent.release_xfer_handle(handle)
+                    done.append(handle)
                     _mark(f"afd_nixl.write_done[{slot}]")
                 else:
                     raise RuntimeError(f"NIXL WRITE ended in state {state}")
@@ -607,6 +680,8 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                 self._writes[slot] = remaining
             else:
                 del self._writes[slot]
+        if _SERIAL_WRITES and done:
+            self._start_queued_writes(done)
 
     def _wait_until(self, done: Callable[[], bool], what: str) -> None:
         """Poll ``done`` (servicing the WRITEs meanwhile) until it holds."""
@@ -629,7 +704,12 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
                     what,
                     time.monotonic() - start,
                     {
-                        slot: [self.agent.check_xfer_state(h) for h in hs]
+                        slot: [
+                            XFER_QUEUED
+                            if isinstance(h, QueuedWrite)
+                            else self.agent.check_xfer_state(h)
+                            for h in hs
+                        ]
                         for slot, hs in self._writes.items()
                     }
                     if self.agent is not None
