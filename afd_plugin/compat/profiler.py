@@ -4,15 +4,18 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
+from vllm.logger import init_logger
+
 if TYPE_CHECKING:
     import torch
 
-logger = logging.getLogger(__name__)
+# Under the vllm logger tree so the INFO lines reach the server log like the
+# connectors' (a bare module logger is not configured by vLLM and was silent).
+logger = init_logger(f"vllm.{__name__}")
 
 AFDGPUProfilerRole = Literal["attention", "ffn"]
 

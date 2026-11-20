@@ -14,6 +14,12 @@ With ``P2pNcclRoutedAFDConnector`` an MoE layer is split as follows:
 Model wrappers build their routed MoE modules from ``RoutedExpertsProxy``,
 ``routed_moe_forward`` and ``run_prerouted_experts`` so that DeepSeek and
 Qwen3 share one implementation of the exchange.
+
+Delta dispatch (``afd_plugin/delta_dispatch.py``, DeepSeek only): the proxy hands
+the connector the residual ``h'`` that the layer's ``ResidualRecordingRMSNorm``
+recorded and the model's ``AttentionDeltaState``; the connector encodes the
+rows once its plan is known and updates the states with the returned partial
+sums.
 """
 
 from __future__ import annotations
@@ -35,10 +41,12 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 from afd_plugin.config import ROUTED_CONNECTORS, AFDConfig
 from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
+from afd_plugin.delta_dispatch import AttentionDeltaState
 from afd_plugin.model_executor.models.forward_context import (
     get_afd_metadata_from_forward_context,
 )
@@ -57,6 +65,14 @@ class RoutedExpertsProxy(nn.Module):
     def __init__(self, *, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        # Delta dispatch: the state shared by the model's routed layers (set by
+        # the model wrapper) and, per stage, the residual h' recorded by the
+        # layer's post_attention_layernorm for the dispatch that follows it.
+        self.delta: AttentionDeltaState | None = None
+        self.h_prime: dict[int, torch.Tensor] = {}
+
+    def record_h_prime(self, residual: torch.Tensor) -> None:
+        self.h_prime[_current_stage_idx()] = residual
 
     def forward(
         self,
@@ -80,7 +96,27 @@ class RoutedExpertsProxy(nn.Module):
         )
         afd_metadata.stage_idx = stage_idx
         connector = cast("P2pNcclRoutedAFDConnector", afd_metadata.connector)
-        a1q, a1q_scale = connector.quantize_for_dispatch(hidden_states)
+        if connector.delta_dispatch.enabled != (self.delta is not None):
+            raise RuntimeError(
+                "delta dispatch is configured on the connector but not wired into "
+                "this model (DeepSeek only), or the other way round",
+            )
+        delta_kwargs = {}
+        if self.delta is None:
+            a1q, a1q_scale = connector.quantize_for_dispatch(hidden_states)
+        else:
+            h_prime = self.h_prime.pop(stage_idx, None)
+            if h_prime is None:
+                raise RuntimeError(
+                    f"layer {self.layer_idx} stage {stage_idx}: no h' recorded by "
+                    "post_attention_layernorm before the dispatch",
+                )
+            a1q, a1q_scale = hidden_states, None
+            delta_kwargs = {
+                "delta": self.delta,
+                "h_prime": h_prime,
+                "layer_idx": self.layer_idx,
+            }
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=self.layer_idx,
             stage_idx=stage_idx,
@@ -93,6 +129,7 @@ class RoutedExpertsProxy(nn.Module):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             a1q_scale=a1q_scale,
+            **delta_kwargs,
         )
         shared_output = shared_experts_fn() if shared_experts_fn is not None else None
         routed_output = connector.recv_ffn_output(
@@ -103,6 +140,42 @@ class RoutedExpertsProxy(nn.Module):
 
     def update_expert_map(self) -> None:
         """Satisfy the native EPLB model interface without local experts."""
+
+
+def _current_stage_idx() -> int:
+    """The micro-batch (stage) the current forward runs (0 without micro-batches),
+    as ``RoutedExpertsProxy.forward`` reads it."""
+    afd_metadata = get_afd_metadata_from_forward_context()
+    if afd_metadata is None:
+        raise RuntimeError("routed AFD requires AFD forward metadata")
+    return int(getattr(get_forward_context(), "ubatch_idx", afd_metadata.stage_idx))
+
+
+class ResidualRecordingRMSNorm(RMSNorm):
+    """``post_attention_layernorm`` of a routed MoE layer under delta dispatch.
+
+    Same normalization as ``RMSNorm``; with a residual it also hands the
+    updated residual (``h'``) to the layer's ``RoutedExpertsProxy``.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float,
+        record: Callable[[torch.Tensor], None],
+    ) -> None:
+        super().__init__(hidden_size, eps=eps)
+        self.record = record
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        out = super().forward(x, residual)
+        if residual is not None:
+            self.record(out[1])
+        return out
 
 
 def routed_moe_forward(
@@ -214,6 +287,7 @@ def run_prerouted_experts(
 
 
 __all__ = [
+    "ResidualRecordingRMSNorm",
     "RoutedExpertsProxy",
     "is_routed_afd",
     "routed_moe_forward",
