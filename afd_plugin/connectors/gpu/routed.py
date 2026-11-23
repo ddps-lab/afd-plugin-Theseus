@@ -925,7 +925,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         if self._layer_owner is None:
             return self.engine.begin_plan(topk_ids, slot=stage)
         owner = None if layer_idx is None else self._layer_owner.get(int(layer_idx))
-        if owner is None:
+        if owner is None or layer_idx is None:
             raise RuntimeError(
                 f"expert placement file {self.expert_placement_file} has no "
                 f"MoE layer {layer_idx}",

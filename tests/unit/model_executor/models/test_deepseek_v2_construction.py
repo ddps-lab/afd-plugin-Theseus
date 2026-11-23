@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import ast
@@ -5,12 +8,17 @@ import hashlib
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
-torch = pytest.importorskip("torch")
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
+else:
+    torch = pytest.importorskip("torch")
+    nn = torch.nn
 pytest.importorskip("vllm")
-nn = torch.nn
 
 from vllm.config import CompilationMode  # noqa: E402
 
@@ -42,7 +50,7 @@ def _stage_type(kind: str):
 
 @pytest.fixture
 def construction_env(monkeypatch):
-    calls = {
+    calls: dict[str, list[str]] = {
         "attention": [],
         "dense": [],
         "gate": [],

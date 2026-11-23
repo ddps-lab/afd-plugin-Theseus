@@ -216,16 +216,16 @@ def _drive(
             # (Attention rank major), rebuilds them and runs its experts.
             results: dict[int, list] = {a: [] for a in range(num_attn)}
             for f in range(num_ffn):
-                datas, words, origin = [], [], []
+                parts, words, origin = [], [], []
                 for a in range(num_attn):
                     _, ids, weights, packed, n, out, meta, totals = sent[a]
                     rows = (packed.flat[:n] // TOKENS == f).nonzero().view(-1)
                     if rows.numel():
                         start = int(packed.offsets[rows[0]])
-                        datas.append(out[start : start + totals[f]])
+                        parts.append(out[start : start + totals[f]])
                         words.append(meta[rows])
                         origin += [(a, int(i)) for i in rows]
-                data = torch.cat(datas) if datas else torch.zeros(0, dtype=torch.uint8)
+                data = torch.cat(parts) if parts else torch.zeros(0, dtype=torch.uint8)
                 word = torch.cat(words) if words else torch.zeros(0, dtype=torch.int32)
                 ffn[f].receive(s, word)
                 launch = len(origin) + 2  # fixed-size launch: two padding rows

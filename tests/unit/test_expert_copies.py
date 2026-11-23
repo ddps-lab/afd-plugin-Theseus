@@ -5,9 +5,14 @@ documented rules, on random placements with copies."""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
-torch = pytest.importorskip("torch")
+if TYPE_CHECKING:
+    import torch
+else:
+    torch = pytest.importorskip("torch")
 
 from afd_plugin.expert_copies import (  # noqa: E402
     MU,
@@ -59,6 +64,7 @@ def _reference(layers, home, num_ranks, ids_per_layer):
                     at_home = sum(1 for e in row if (s >> hm[e]) & 1)
                     key = (cost, -at_home, s)
                     best = key if best is None or key < best else best
+            assert best is not None
             visit.append(best[2])
         fixed = [0] * num_ranks
         for t in range(num_tokens):
@@ -101,7 +107,7 @@ def test_routing_follows_the_rules(num_ranks, top_k, seed):
     # Two forwards, the stages interleaved per layer as in the pipeline: each
     # stage keeps its own previous ranks and every forward starts afresh.
     for _forward in range(2):
-        got = [[], []]
+        got: list[list[torch.Tensor]] = [[], []]
         for pos, layer in enumerate(LAYERS):
             for stage in range(2):
                 got[stage].append(router.route(layer, stages[stage][pos], stage))
