@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import ast
@@ -5,12 +8,17 @@ import hashlib
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
-torch = pytest.importorskip("torch")
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
+else:
+    torch = pytest.importorskip("torch")
+    nn = torch.nn
 pytest.importorskip("vllm")
-nn = torch.nn
 
 from vllm.config import CompilationMode  # noqa: E402
 
@@ -42,7 +50,7 @@ def _stage_type(kind: str):
 
 @pytest.fixture
 def construction_env(monkeypatch):
-    calls = {
+    calls: dict[str, list[str]] = {
         "attention": [],
         "dense": [],
         "gate": [],
@@ -663,3 +671,30 @@ def test_model_constructor_rejects_sequence_parallel_moe_before_allocation(
         adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
 
     assert all(not calls for calls in construction_env.values())
+
+
+@pytest.mark.parametrize("mode", ["off", "delta_fp32"])
+def test_model_constructor_reads_delta_dispatch_from_additional_config(
+    monkeypatch,
+    construction_env,
+    mode,
+):
+    vllm_config = _vllm_config()
+    vllm_config.additional_config = {
+        "afd": {"connector_extra_config": {"delta_dispatch": {"mode": mode}}},
+    }
+    afd_config = AFDConfig(role="attention")
+    monkeypatch.setattr(
+        adapter,
+        "parse_afd_config",
+        lambda *_args, **_kwargs: afd_config,
+    )
+    _patch_model_constructor_dependencies(monkeypatch, construction_env)
+
+    if mode == "off":
+        model = adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")
+        assert model.ffn_delta is None
+    else:
+        # Wired at construction; this topology is not the routed connector.
+        with pytest.raises(ValueError, match="routed connector"):
+            adapter.AFDDeepseekV2Model(vllm_config=vllm_config, prefix="model")

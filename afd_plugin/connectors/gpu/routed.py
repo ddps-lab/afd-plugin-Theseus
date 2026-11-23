@@ -15,8 +15,11 @@ Topology:
     first). With ``E`` routed experts, FFN rank ``r`` owns experts
     ``[r * E / F, (r + 1) * E / F)`` (vLLM's linear expert placement), or the
     ``counts[r]`` experts after those of the lower FFN ranks with
-    ``--expert-placement-counts``, and Attention ranks own no experts. Any
-    ``A`` and ``F`` are allowed.
+    ``--expert-placement-counts``, or, with ``--expert-placement-file``, the
+    experts the file lists for rank ``r`` at each MoE layer (an expert listed
+    on several ranks is a copy: see ``afd_plugin/expert_copies.py``, NIXL
+    connector only); Attention ranks own no experts. Any ``A`` and ``F`` are
+    allowed.
 
 Data plane (per MoE layer and micro-batch stage):
     1. Attention computes gate + top-k, quantizes the activations only when
@@ -61,7 +64,8 @@ Requirements and limitations:
     - Eager mode on both roles: the count exchange is a host sync.
     - FFN role: ``--data-parallel-size F --enable-expert-parallel
       --all2all-backend prerouted``, TP=1, ``E % F == 0`` unless every rank
-      of both roles gets the same ``--expert-placement-counts``.
+      of both roles gets the same ``--expert-placement-counts`` or
+      ``--expert-placement-file``.
     - Attention role: ``compute_gate_on_attention=true``. With TP>1 every
       TP rank dispatches a token slice and the result is all-gathered
       (unverified).
@@ -76,10 +80,12 @@ Requirements and limitations:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import socket
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -90,6 +96,7 @@ from torch.distributed.distributed_c10d import ProcessGroup
 from transformers import PretrainedConfig
 from vllm.distributed.device_communicators.p2p_nccl_all2all import (
     P2pAll2AllEngine,
+    P2pAll2AllPendingPlan,
     P2pAll2AllPlan,
 )
 from vllm.logger import init_logger
@@ -119,7 +126,14 @@ from afd_plugin.connectors.metadata import (
     recv_control_payload,
     send_control_payload,
 )
+from afd_plugin.delta_dispatch import (
+    CODE_FORMATS,
+    CODE_SHIFT,
+    CombineConfig,
+    DeltaDispatchConfig,
+)
 from afd_plugin.distributed import init_afd_process_group
+from afd_plugin.expert_copies import CopyRouter, mask_other_ranks, placement_has_copies
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -379,6 +393,82 @@ def ffn_wire_spec(base: RoutedWireSpec, model: Any) -> RoutedWireSpec:
     )
 
 
+def load_expert_placement(path: str) -> Any:
+    """vLLM's reader of ``--expert-placement-file``, imported on use so that
+    vLLM builds without the option load this module."""
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+        load_expert_placement as load,
+    )
+
+    return load(path)
+
+
+def read_placement_home(path: str) -> dict[int, list[int]] | None:
+    """The optional ``"home"`` entry of an expert placement file (per MoE
+    layer, the home FFN rank of every expert; vLLM does not read it)."""
+    with open(path) as f:
+        home = json.load(f).get("home")
+    if home is None:
+        return None
+    return {int(layer): [int(r) for r in ranks] for layer, ranks in home.items()}
+
+
+def expert_owner_tables(
+    layers: Mapping[int, Sequence[Sequence[int]]],
+    num_experts: int,
+    device: torch.device | str,
+) -> dict[int, torch.Tensor]:
+    """Per MoE layer of an expert placement, the FFN rank owning each expert
+    (int64 ``[num_experts]``): the table the layer's dispatch plan routes by.
+
+    A token visits the one owner of each of its experts; a placement with
+    copies (an expert on several FFN ranks) is routed by ``CopyRouter``.
+    """
+    tables: dict[int, torch.Tensor] = {}
+    for layer, ranks in layers.items():
+        owner = torch.full((num_experts,), -1, dtype=torch.int64)
+        for rank, experts in enumerate(ranks):
+            idx = torch.as_tensor(list(experts), dtype=torch.int64)
+            if bool((owner[idx] >= 0).any()):
+                raise RuntimeError(
+                    f"expert placement layer {layer}: an expert is listed on "
+                    "several FFN ranks; route copies with CopyRouter",
+                )
+            owner[idx] = rank
+        if bool((owner < 0).any()):
+            raise RuntimeError(
+                f"expert placement layer {layer}: experts on no FFN rank"
+            )
+        tables[int(layer)] = owner.to(device)
+    return tables
+
+
+def expert_placement_digest(
+    layers: Mapping[int, Sequence[Sequence[int]]],
+    home: Mapping[int, Sequence[int]] | None = None,
+) -> int:
+    """A nonzero 63-bit digest of a placement (and its home ranks), compared
+    across ranks at init."""
+    text = json.dumps(
+        [
+            sorted((int(k), [list(r) for r in v]) for k, v in layers.items()),
+            sorted((int(k), list(v)) for k, v in (home or {}).items()),
+        ],
+        separators=(",", ":"),
+    )
+    digest = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big") >> 1
+    return digest or 1
+
+
+def wire_settings_digest(delta: DeltaDispatchConfig, combine: CombineConfig) -> int:
+    """A nonzero 63-bit digest of the delta dispatch and combine settings and
+    of the row formats and word layout, compared across ranks at init (both
+    sides must encode and decode alike, also when built from different code)."""
+    text = json.dumps([repr(delta), repr(combine), CODE_FORMATS, CODE_SHIFT])
+    digest = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big") >> 1
+    return digest or 1
+
+
 def _validate_routed_runtime(
     vllm_config: VllmConfig,
     afd_config: AFDConfig,
@@ -397,11 +487,24 @@ def _validate_routed_runtime(
     if int(parallel.prefill_context_parallel_size) != 1:
         raise RuntimeError("P2pNcclRoutedAFDConnector does not support PCP")
     counts = parallel.expert_placement_counts
-    if counts is None and spec.num_experts % ffn_size != 0:
+    placement_file = getattr(parallel, "expert_placement_file", None)
+    if counts is None and placement_file is None and spec.num_experts % ffn_size:
         raise RuntimeError(
             f"P2pNcclRoutedAFDConnector needs num_experts ({spec.num_experts}) "
-            f"divisible by num_ffn_ranks ({ffn_size}) or expert_placement_counts",
+            f"divisible by num_ffn_ranks ({ffn_size}), expert_placement_counts "
+            "or expert_placement_file",
         )
+    if placement_file is not None:
+        placement = load_expert_placement(placement_file)
+        if (placement.num_ranks, placement.num_experts) != (
+            ffn_size,
+            spec.num_experts,
+        ):
+            raise RuntimeError(
+                f"expert placement file {placement_file} is for "
+                f"{placement.num_ranks} FFN ranks and {placement.num_experts} "
+                f"experts, the deployment has {ffn_size} and {spec.num_experts}",
+            )
     if counts is not None and (
         len(counts) != ffn_size or sum(counts) != spec.num_experts
     ):
@@ -470,6 +573,10 @@ class RoutedPrefetch:
 class P2pNcclRoutedAFDConnector(AFDConnectorBase):
     """One-hop Attention -> owning FFN ranks -> Attention connector."""
 
+    # Whether the connector packs the rows itself and can leave each FFN rank
+    # only its experts of a token (needed by expert copies).
+    _carries_copies = False
+
     # Read by the FFN runner and the model wrappers to select the routed path.
     is_routed = True
 
@@ -507,10 +614,27 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         # quantization that FFN role rank 0 derives from its experts kernel.
         self.spec = resolve_wire_spec(vllm_config)
         _validate_routed_runtime(vllm_config, afd_config, self.spec)
+        # Delta dispatch (afd_plugin/delta_dispatch.py); only the NIXL
+        # connector accepts it in connector_extra_config, so it is off here.
+        self.delta_dispatch = DeltaDispatchConfig.from_vllm_config(vllm_config)
+        self.combine = CombineConfig.from_vllm_config(vllm_config)
         self._ffn_model: Any | None = None
         self.num_local_experts = self.spec.num_experts // self.ffn_size
         # Experts per FFN rank when the placement is uneven (None: even).
         self.expert_counts = vllm_config.parallel_config.expert_placement_counts
+        # Per-layer placement (--expert-placement-file): the FFN rank owning
+        # each expert per MoE layer, and its digest checked across ranks.
+        self.expert_placement_file: str | None = getattr(
+            vllm_config.parallel_config, "expert_placement_file", None
+        )
+        self._layer_owner: dict[int, torch.Tensor] | None = None
+        # _layer_owner tables with -1 appended (filled by _begin_plan).
+        self._layer_owner_pad: dict[int, torch.Tensor] = {}
+        self._placement_digest = 0
+        # With copies: the per-pair FFN ranks of the stages whose rows are
+        # being packed (Attention).
+        self._copy_router: CopyRouter | None = None
+        self._copy_rank_of: dict[int, tuple[int, torch.Tensor]] = {}
         self.max_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
         # FFN: rows handed to the experts kernel per stage (fixed-size launch;
         # every token of every Attention rank is the most one stage brings).
@@ -606,6 +730,31 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
                 timeout=timedelta(minutes=30),
             )
         self._exchange_wire_spec()
+        if self.expert_placement_file is not None:
+            placement = load_expert_placement(self.expert_placement_file)
+            home = read_placement_home(self.expert_placement_file)
+            if not placement_has_copies(placement.layers):
+                self._layer_owner = expert_owner_tables(
+                    placement.layers, placement.num_experts, self.device
+                )
+            elif not self._carries_copies:
+                raise RuntimeError(
+                    f"expert placement file {self.expert_placement_file} has "
+                    f"copies; {type(self).__name__} cannot leave each FFN rank "
+                    "only its experts of a token (use NixlRoutedAFDConnector)",
+                )
+            elif not self.is_ffn:
+                self._copy_router = CopyRouter(
+                    placement.layers,
+                    home,
+                    placement.num_experts,
+                    self.ffn_size,
+                    self.spec.top_k,
+                    self.max_tokens,
+                    int(getattr(self, "num_slots", 1)),
+                    self.device,
+                )
+            self._placement_digest = expert_placement_digest(placement.layers, home)
         self._check_expert_counts()
         self.engine = P2pAll2AllEngine(
             group=self.dispatch_pg,
@@ -651,7 +800,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
             self.world_rank,
             self.world_size,
             spec.num_experts,
-            self.expert_counts or self.num_local_experts,
+            self.expert_placement_file or self.expert_counts or self.num_local_experts,
             spec.top_k,
             spec.act_dtype,
             spec.quant_mode,
@@ -726,24 +875,95 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         self.spec = spec
 
     def _check_expert_counts(self) -> None:
-        """Check that every rank routes by the placement of FFN role rank 0.
+        """Check that every rank routes by the placement of FFN role rank 0
+        and uses its delta dispatch / combine settings.
 
-        Attention routes by its own ``--expert-placement-counts`` while the
-        FFN expert maps follow theirs, so the lists must agree everywhere.
+        Attention routes by its own ``--expert-placement-counts`` or
+        ``--expert-placement-file`` while the FFN expert maps follow theirs,
+        so the counts and the file's digest must agree everywhere; both sides
+        encode and decode the rows by their own settings.
         """
         mine = torch.tensor(
-            self.expert_counts or [0] * self.ffn_size,
+            [
+                *(self.expert_counts or [0] * self.ffn_size),
+                self._placement_digest,
+                wire_settings_digest(self.delta_dispatch, self.combine),
+            ],
             dtype=torch.int64,
             device=self.device,
         )
         reference = mine.clone()
         dist.broadcast(reference, src=0, group=self.dispatch_pg)
+        if not torch.equal(reference[-1:], mine[-1:]):
+            raise RuntimeError(
+                "routed AFD: delta dispatch / combine settings differ from FFN "
+                f"rank 0 (this rank {self.delta_dispatch}, {self.combine}); "
+                "pass the same connector_extra_config to every Attention and FFN "
+                "rank",
+            )
         if not torch.equal(reference, mine):
             raise RuntimeError(
-                "routed AFD: expert_placement_counts differ from FFN rank 0 "
-                f"({reference.tolist()}, this rank {mine.tolist()}); pass the "
-                "same list to every Attention and FFN rank",
+                "routed AFD: expert placement differs from FFN rank 0 (counts "
+                f"{reference[:-2].tolist()}, file digest {int(reference[-2])}; "
+                f"this rank {mine[:-2].tolist()}, {int(mine[-2])}); pass the "
+                "same --expert-placement-counts / --expert-placement-file to "
+                "every Attention and FFN rank",
             )
+
+    def _begin_plan(
+        self, topk_ids: torch.Tensor, stage: int, layer_idx: int | None
+    ) -> P2pAll2AllPendingPlan:
+        """Start the dispatch plan of one stage, routed by the layer's expert
+        placement when there is one (otherwise as the engine was built)."""
+        assert self.engine is not None
+        if self._copy_router is not None:
+            if layer_idx is None:
+                raise RuntimeError("expert copies need the dispatch's MoE layer")
+            rank_of = self._copy_router.route(int(layer_idx), topk_ids, stage)
+            self._copy_rank_of[stage] = (int(layer_idx), rank_of)
+            return self.engine.begin_plan(topk_ids, slot=stage, rank_of=rank_of)
+        if self._layer_owner is None:
+            return self.engine.begin_plan(topk_ids, slot=stage)
+        owner = None if layer_idx is None else self._layer_owner.get(int(layer_idx))
+        if owner is None or layer_idx is None:
+            raise RuntimeError(
+                f"expert placement file {self.expert_placement_file} has no "
+                f"MoE layer {layer_idx}",
+            )
+        # The table with one more entry, -1 (no rank), at the end: padding ids
+        # (< 0) clamp to -1 and read it, so the rank of every pair is one
+        # gather (the engine's expert_owner path spends five small kernels
+        # per layer on the padding). Same plan as expert_owner=owner.
+        pads = self.__dict__.setdefault("_layer_owner_pad", {})
+        padded = pads.get(int(layer_idx))
+        if padded is None:
+            padded = pads[int(layer_idx)] = torch.cat([owner, owner.new_full((1,), -1)])
+        rank_of = padded[topk_ids.clamp(min=-1)]
+        return self.engine.begin_plan(topk_ids, slot=stage, rank_of=rank_of)
+
+    def _mask_copied_ids(
+        self,
+        rows_ids: torch.Tensor,
+        stage: int,
+        plan: P2pAll2AllPlan,
+        pending: P2pAll2AllPendingPlan,
+    ) -> None:
+        """With expert copies, replace in the packed rows the experts that
+        another FFN rank computes by one the row's rank does not hold (in
+        place, see ``afd_plugin/expert_copies.py``); no-op otherwise."""
+        routed = self._copy_rank_of.pop(stage, None)
+        if routed is None:
+            return
+        assert self._copy_router is not None
+        layer_idx, rank_of = routed
+        n = plan.num_send
+        dest = torch.div(pending.order[:n], pending.num_tokens, rounding_mode="floor")
+        mask_other_ranks(
+            rows_ids[:n],
+            rank_of.index_select(0, plan.perm),
+            dest,
+            self._copy_router.absent(layer_idx),
+        )
 
     @property
     def is_initialized(self) -> bool:
@@ -822,7 +1042,7 @@ class P2pNcclRoutedAFDConnector(AFDConnectorBase):
         if stage in self._pending:
             raise RuntimeError(f"stage {stage} already has a dispatch in flight")
         engine = self.engine
-        pending = engine.begin_plan(tensors[1], slot=stage)
+        pending = self._begin_plan(tensors[1], stage, context.metadata.layer_idx)
         # Each micro-batch runs its count exchange and dispatch within its own
         # turn and gives the CPU away once, in recv_ffn_output (send, then
         # yield, as vLLM's DBO does with DeepEP low-latency). The next layer's
