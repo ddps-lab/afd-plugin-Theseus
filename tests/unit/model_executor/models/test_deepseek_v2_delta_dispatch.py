@@ -17,12 +17,17 @@ from __future__ import annotations
 
 import ctypes
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
-torch = pytest.importorskip("torch")
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
+else:
+    torch = pytest.importorskip("torch")
+    nn = torch.nn
 pytest.importorskip("vllm")
-nn = torch.nn
 
 from vllm.config import (  # noqa: E402
     CompilationConfig,
@@ -120,7 +125,7 @@ def _afd_config(role: str, num_ffn: int, connector: str) -> AFDConfig:
     )
 
 
-def _routed_shell(cls: type, layer_idx: int) -> nn.Module:
+def _routed_shell(cls: Any, layer_idx: int) -> nn.Module:
     """A routed MoE module without its native construction (the delta wiring
     only looks at its type and, on Attention, its proxy)."""
     mlp = cls.__new__(cls)
@@ -326,6 +331,7 @@ class _Loopback:
         if self.combine.enabled:
             # The connector's steps: bytes gathered in FFN rank order,
             # rebuilt in fp32, into the states, summed in the model dtype.
+            assert packed is not None
             data = torch.cat(compressed)
             received = delta.decode_combine(
                 ubatch_idx, data, plan.num_send, packed.layer_pos

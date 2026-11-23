@@ -983,6 +983,7 @@ def encode_rows(
     rank: int,
     out: torch.Tensor,
     meta: torch.Tensor,
+    *,
     nvfp4_pass: str = NVFP4_TWO_PASS,
     hardware_e4m3: bool = False,
 ) -> None:
@@ -1091,6 +1092,7 @@ def decode_rows(
     rows_out: torch.Tensor | None = None,
     max_tokens: int = 0,
     row_size: int = 0,
+    *,
     hardware_e4m3: bool = False,
     nvfp4: bool | None = None,
 ) -> None:
@@ -1142,6 +1144,7 @@ def encode_combine(
     err: torch.Tensor | None,
     out: torch.Tensor,
     deq: torch.Tensor,
+    *,
     nvfp4_pass: str = NVFP4_TWO_PASS,
     hardware_e4m3: bool = False,
 ) -> None:
@@ -1218,7 +1221,7 @@ def encode_combine(
 
 
 def decode_combine(
-    code: int, data: torch.Tensor, out: torch.Tensor, hardware_e4m3: bool = False
+    code: int, data: torch.Tensor, out: torch.Tensor, *, hardware_e4m3: bool = False
 ) -> None:
     """Fused Attention kernel (see ``decode_combine_reference``)."""
     assert code in COMBINE_CODES, f"combine rows are {COMBINE_CODES}, not {code}"

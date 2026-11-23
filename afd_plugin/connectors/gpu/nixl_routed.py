@@ -620,9 +620,7 @@ class NixlRoutedAFDConnector(P2pNcclRoutedAFDConnector):
         notif = write.notif.decode()
         _mark(f"afd_nixl.write_post[{write.slot}:{notif}:{write.peer}]")
         if state == XFER_FAILED:
-            raise RuntimeError(
-                f"NIXL WRITE to world rank {write.peer} failed to post"
-            )
+            raise RuntimeError(f"NIXL WRITE to world rank {write.peer} failed to post")
         self._writes.setdefault(write.slot, []).append(handle)
         # A WRITE that completed at the post has sent its notification already
         # (NIXL sends it there), so it holds nothing back.
