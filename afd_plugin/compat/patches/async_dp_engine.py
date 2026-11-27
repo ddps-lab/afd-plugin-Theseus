@@ -52,13 +52,12 @@ from afd_plugin.config import is_afd_async_dp, parse_optional_afd_config
 if TYPE_CHECKING:
     from multiprocessing.queues import Queue
 
-    from vllm.config import VllmConfig
+    from vllm.config import ParallelConfig, VllmConfig
     from vllm.v1.engine import EngineCoreRequest
-    from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.utils import (
-        CoreEngineActorManager,
-        CoreEngineProcManager,
+        CoreEngineLaunch,
         EngineZmqAddresses,
+        SignalCallback,
     )
     from vllm.v1.executor import Executor
 

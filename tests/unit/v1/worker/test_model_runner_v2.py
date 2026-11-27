@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -15,7 +16,10 @@ from vllm.forward_context import (  # noqa: E402
     BatchDescriptor,
     ForwardContext,
 )
-from vllm.v1.worker import gpu_model_runner as native_v1  # noqa: E402
+try:  # the pre-V2 runner is gone after vLLM 0.26.0
+    from vllm.v1.worker import gpu_model_runner as native_v1  # noqa: E402
+except ImportError:
+    native_v1 = None
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
 from vllm.v1.worker.gpu_worker import Worker  # noqa: E402
@@ -33,9 +37,12 @@ from afd_plugin.v1.worker import (  # noqa: E402
     attention_worker,
     ffn_worker,
 )
-from afd_plugin.v1.worker.attention_model_runner import (  # noqa: E402
-    AFDAttentionModelRunner,
-)
+try:
+    from afd_plugin.v1.worker.attention_model_runner import (  # noqa: E402
+        AFDAttentionModelRunner,
+    )
+except ImportError:
+    AFDAttentionModelRunner = None
 from afd_plugin.v1.worker.attention_model_runner_v2 import (  # noqa: E402
     AFDAttentionModelRunnerV2,
 )
@@ -287,13 +294,15 @@ def test_pinned_worker_init_device_signature_and_internal_runner_import():
             ),
         ],
     )
-    source = inspect.getsource(upstream_init_device)
-    assert "from vllm.v1.worker.gpu.model_runner import" in source
-    assert "from vllm.v1.worker.gpu_model_runner import" in source
-    assert "GPUModelRunner as GPUModelRunnerV2" in source
-    assert "GPUModelRunnerV2(" in source
-    assert "GPUModelRunnerV1(" in source
-    assert "self.model_runner = GPUModelRunnerV1" in source
+    # vLLM v0.34.0: init_device builds the runner through _make_model_runner,
+    # which imports GPUModelRunner from its module at call time. That local
+    # import is the seam the AFD workers substitute through.
+    assert "_init_workspace_and_model_runner" in inspect.getsource(
+        upstream_init_device
+    )
+    source = inspect.getsource(Worker._make_model_runner)
+    assert "from vllm.v1.worker.gpu.model_runner import GPUModelRunner" in source
+    assert "return GPUModelRunner(self.vllm_config, self.device)" in source
 
 
 def test_v2_fullgraph_replay_hook_restores_manager_instance_after_success():
@@ -1202,6 +1211,10 @@ def test_v2_profile_before_graph_manager_uses_provider_without_replay_hook(
             "dummy_run": False,
             "skip_attn_for_dummy_run": False,
             "is_profile": True,
+            # vLLM v0.34.0 arguments, forwarded with their defaults
+            "context_len": 0,
+            "valid_dummy_state_slots": False,
+            "randomize_inputs": False,
         },
     ]
     assert events == ["control_update", "control_send", "data"]
@@ -1277,6 +1290,8 @@ def test_native_v2_dummy_profile_thin_path_uses_afd_execute_wrapper(
     runner = _runner_for_metadata(events)
     runner.max_num_reqs = 2
     runner.lora_config = None
+    # vLLM v0.34.0: the native dummy run suspends EPLB bookkeeping
+    runner.eplb = SimpleNamespace(suppress=nullcontext)
     runner.is_first_pp_rank = True
     runner.is_last_pp_rank = False
 

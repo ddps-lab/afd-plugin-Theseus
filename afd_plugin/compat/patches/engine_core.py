@@ -29,8 +29,11 @@ from afd_plugin.config import AFDConfig, is_afd_async_dp, parse_optional_afd_con
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.engine import PrefixHashConfig
     from vllm.v1.executor import Executor
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.request import Request
 
 
 # Patch reason: AFD FFN ranks run as connector daemons instead of normal

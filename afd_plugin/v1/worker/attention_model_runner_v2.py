@@ -7,7 +7,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from types import MethodType
-from typing import Any
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -348,7 +347,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # symbol so each native FULL descriptor publishes one warmup and one capture
     # payload before its forward, while the provider installs the pending AFD
     # sidecar without sending control from inside torch.cuda.graph.
-    # Signature: matches vLLM v0.26.0 GPUModelRunner.capture_model exactly.
+    # Signature: matches vLLM v0.34.0 GPUModelRunner.capture_model exactly.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.capture_model; commit
     # 568afb3a13806beb53bb2e6bd518269357b237c0.
@@ -356,7 +355,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # wrapper owns only the temporary AFD lifecycle seam.
     # Removal/upstream plan: delete this wrapper when vLLM exposes graph
     # warmup/capture metadata hooks around prepare_inputs_to_capture.
-    def capture_model(self) -> int:
+    def capture_model(self, *, profile_only: bool = False) -> int:
         # ### PATCH START: publish AFD FULL graph warmup/capture control.
         manager = self.cudagraph_manager
         capture_descs = manager._capture_descs.get(CUDAGraphMode.FULL, [])
@@ -382,7 +381,13 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
                 with use_afd_metadata_provider(
                     self.install_afd_metadata_on_forward_context,
                 ):
-                    result = super().capture_model()
+                    # profile_only (vLLM v0.34.0): the graph-memory profiling
+                    # capture takes the same AFD seam. Only reached with CUDA
+                    # graphs; not exercised yet on v0.34.0.
+                    if profile_only:
+                        result = super().capture_model(profile_only=True)
+                    else:
+                        result = super().capture_model()
                 event_tracker.assert_complete()
             return result
         finally:
@@ -396,7 +401,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     # AFD must install its sidecar at that exact context-construction seam.
     # Patch functionality: delegate all request/input/Attention/KV/sampling/
     # output work to native V2 while temporarily installing AFD metadata.
-    # Signature: matches vLLM v0.26.0 GPUModelRunnerV2.execute_model exactly.
+    # Signature: matches vLLM v0.34.0 GPUModelRunnerV2.execute_model exactly.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.execute_model; commit
     # 568afb3a13806beb53bb2e6bd518269357b237c0.
@@ -412,12 +417,11 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
-        **native_kwargs: Any,
+        context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
+        randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
-        # ``native_kwargs`` carries the arguments vLLM added after v0.26.0
-        # (v0.34.0: context_len, valid_dummy_state_slots, randomize_inputs)
-        # through to the native method untouched.
         step_afd_gpu_profiler(self.prof)
         with _use_afd_execution_context(
             self,
@@ -429,7 +433,9 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
                 dummy_run=dummy_run,
                 skip_attn_for_dummy_run=skip_attn_for_dummy_run,
                 is_profile=is_profile,
-                **native_kwargs,
+                context_len=context_len,
+                valid_dummy_state_slots=valid_dummy_state_slots,
+                randomize_inputs=randomize_inputs,
             )
         # ### PATCH END: scope AFD metadata provider/replay and profiler step.
 
