@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import torch
 
 logger = logging.getLogger(__name__)
@@ -66,12 +68,18 @@ def afd_gpu_profiler_config(role: AFDGPUProfilerRole) -> AFDGPUProfilerConfig:
 
 
 class TriggeredProfiler:
-    """A torch profiler that starts once a trigger file exists.
+    """A torch profiler that starts each time a trigger file appears.
 
     The step-counted schedule of a profiler started at runner init lands
     wherever the request mix puts it; a run script can instead create the
-    trigger file in every Attention and FFN pod once the load it wants to see
-    is running, and all roles then record the same steps from there on.
+    trigger file in every Attention and FFN pod, and all roles then record
+    the same steps from the first step that sees the file.
+
+    One trigger records one schedule (``wait``/``warmup``/``active`` times
+    ``repeat``). When ``window_steps`` is given, the profiler stops after that
+    many steps, removes the trigger file and waits for the file to be created
+    again, so a run script can record several windows from one runner without
+    restarting it. Each window uses a new profiler object from ``factory``.
     """
 
     def __init__(
@@ -79,27 +87,64 @@ class TriggeredProfiler:
         profiler: torch.profiler.profile,
         trigger: str,
         role: AFDGPUProfilerRole,
+        *,
+        factory: Callable[[], torch.profiler.profile] | None = None,
+        window_steps: int | None = None,
     ) -> None:
         self.profiler = profiler
         self.trigger = trigger
         self.role = role
         self.started = False
+        self.windows = 0
+        self._factory = factory
+        self._window_steps = window_steps
+        self._steps_in_window = 0
 
     def step(self) -> None:
         if self.started:
             self.profiler.step()
+            self._steps_in_window += 1
+            if (
+                self._window_steps is not None
+                and self._steps_in_window >= self._window_steps
+            ):
+                self._finish_window()
         elif os.path.exists(self.trigger):
+            if self.windows > 0 and self._factory is not None:
+                self.profiler = self._factory()
             self.profiler.start()
             self.started = True
+            self._steps_in_window = 0
+            self.windows += 1
             logger.info(
-                "AFD GPU %s profiler started: %s exists",
+                "AFD GPU %s profiler started: %s exists (window %d)",
                 self.role,
                 self.trigger,
+                self.windows,
             )
+
+    def _finish_window(self) -> None:
+        # The schedule has already handed its trace to on_trace_ready on the
+        # last step; stop() only releases the profiler.
+        self.profiler.stop()
+        self.started = False
+        try:
+            os.remove(self.trigger)
+        except FileNotFoundError:
+            pass
+        logger.info(
+            "AFD GPU %s profiler window %d done after %d steps; "
+            "waiting for %s again",
+            self.role,
+            self.windows,
+            self._steps_in_window,
+            self.trigger,
+        )
 
     def stop(self) -> None:
         if self.started:
             self.profiler.stop()
+            self.started = False
 
 
 def create_afd_gpu_profiler(
@@ -108,7 +153,8 @@ def create_afd_gpu_profiler(
     """Create a torch profiler when the plugin-owned env enables it.
 
     With ``<prefix>_TRIGGER`` set, the profiler is returned unstarted inside a
-    ``TriggeredProfiler`` and starts at the first step its file exists.
+    ``TriggeredProfiler`` and starts at the first step its file exists; after
+    the schedule's steps it removes the file and waits for the next trigger.
     """
 
     config = afd_gpu_profiler_config(role)
@@ -122,36 +168,54 @@ def create_afd_gpu_profiler(
         role,
         config.trace_dir,
     )
-    profiler = torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(
-            wait=config.wait,
-            warmup=config.warmup,
-            active=config.active,
-            repeat=config.repeat,
-            skip_first=config.skip_first,
-        ),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(config.trace_dir),
-        record_shapes=True,
-        profile_memory=False,
-        with_stack=False,
-        # vLLM DBO runs each micro-batch on its own Python thread, started per
-        # forward; by default the profiler records ops of the starting thread
-        # only, so the micro-batches' ranges and ops would be missing.
-        experimental_config=torch.profiler._ExperimentalConfig(
-            profile_all_threads=True,
-        ),
-    )
+    def make_profiler() -> torch.profiler.profile:
+        return torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=config.wait,
+                warmup=config.warmup,
+                active=config.active,
+                repeat=config.repeat,
+                skip_first=config.skip_first,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(config.trace_dir),
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=False,
+            # vLLM DBO runs each micro-batch on its own Python thread, started
+            # per forward; by default the profiler records ops of the starting
+            # thread only, so the micro-batches' ranges and ops would be missing.
+            experimental_config=torch.profiler._ExperimentalConfig(
+                profile_all_threads=True,
+            ),
+        )
+
+    profiler = make_profiler()
     if config.trigger is not None:
+        # repeat == 0 means "cycle forever" in torch's schedule: no window end.
+        window_steps = (
+            config.skip_first
+            + (config.wait + config.warmup + config.active) * config.repeat
+            if config.repeat > 0
+            else None
+        )
         logger.info(
-            "AFD GPU %s profiler waits for %s before its schedule starts",
+            "AFD GPU %s profiler waits for %s before its schedule starts "
+            "(window steps: %s)",
             role,
             config.trigger,
+            window_steps,
         )
-        return TriggeredProfiler(profiler, config.trigger, role)
+        return TriggeredProfiler(
+            profiler,
+            config.trigger,
+            role,
+            factory=make_profiler,
+            window_steps=window_steps,
+        )
     profiler.start()
     return profiler
 

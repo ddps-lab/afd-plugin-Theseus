@@ -140,6 +140,58 @@ def test_triggered_gpu_profiler_starts_when_trigger_file_exists(monkeypatch, tmp
     assert inner.stopped is True
 
 
+def test_triggered_gpu_profiler_rearms_after_its_window(monkeypatch, tmp_path):
+    profiler_module = _FakeTorchProfiler()
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(profiler=profiler_module),
+    )
+    trigger = tmp_path / "go"
+    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_ENABLE", "1")
+    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_TRIGGER", str(trigger))
+    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_WAIT", "2")
+    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_WARMUP", "1")
+    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_ACTIVE", "3")
+
+    profiler = create_afd_gpu_profiler("ffn")
+    assert isinstance(profiler, TriggeredProfiler)
+    assert profiler_module.profile_calls == 1
+
+    trigger.touch()
+    step_afd_gpu_profiler(profiler)  # start() takes schedule step 0
+    for _ in range(5):
+        step_afd_gpu_profiler(profiler)
+    assert profiler.started is True
+    assert trigger.exists()
+    step_afd_gpu_profiler(profiler)  # 6th step: wait 2 + warmup 1 + active 3
+    assert profiler.started is False
+    assert profiler.windows == 1
+    assert profiler_module.created_profiler.stops == 1
+    assert not trigger.exists()
+
+    # No trigger: further steps do not reach the profiler.
+    steps_before = profiler_module.created_profiler.steps
+    step_afd_gpu_profiler(profiler)
+    assert profiler_module.created_profiler.steps == steps_before
+
+    # A new trigger starts a new profiler object for the second window.
+    trigger.touch()
+    step_afd_gpu_profiler(profiler)
+    assert profiler.started is True
+    assert profiler.windows == 2
+    assert profiler_module.profile_calls == 2
+    for _ in range(6):
+        step_afd_gpu_profiler(profiler)
+    assert profiler.started is False
+    assert profiler_module.created_profiler.stops == 2
+    assert not trigger.exists()
+
+    # Already stopped by the window end: the runner's final stop is a no-op.
+    stop_afd_gpu_profiler(profiler)
+    assert profiler_module.created_profiler.stops == 2
+
+
 def test_triggered_gpu_profiler_never_started_is_not_stopped(monkeypatch, tmp_path):
     profiler_module = _FakeTorchProfiler()
     monkeypatch.setitem(
@@ -181,12 +233,14 @@ class _StepProfiler:
         self.steps = 0
         self.started = False
         self.stopped = False
+        self.stops = 0
 
     def start(self):
         self.started = True
 
     def stop(self):
         self.stopped = True
+        self.stops += 1
 
     def step(self):
         self.steps += 1
@@ -202,6 +256,7 @@ class _FakeTorchProfiler:
         self.schedule_kwargs = None
         self.profile_kwargs = None
         self.trace_dir = None
+        self.profile_calls = 0
 
     def schedule(self, **kwargs):
         self.schedule_kwargs = kwargs
@@ -217,4 +272,5 @@ class _FakeTorchProfiler:
 
     def profile(self, **kwargs):
         self.profile_kwargs = kwargs
+        self.profile_calls += 1
         return self.created_profiler
