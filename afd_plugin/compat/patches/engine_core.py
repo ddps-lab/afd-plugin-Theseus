@@ -591,12 +591,48 @@ class _AFDFFNKVCacheConfig:
 
 
 class _AFDFFNNoopScheduler:
+    """Stands in for the scheduler of an FFN EngineCore, which schedules nothing.
+
+    vLLM's EngineCore reads these attributes during construction and startup
+    (v0.34.0 added the encoder-cache connector and the KV event publisher).
+    """
+
     connector = None
+    ec_connector = None
+    pause_state = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
+        # EngineCore compares pause_state with PauseState.UNPAUSED.
+        with suppress(Exception):
+            from vllm.v1.core.sched.interface import PauseState
+
+            self.pause_state = PauseState.UNPAUSED
 
     def get_kv_connector(self) -> None:
+        return None
+
+    def get_ec_connector(self) -> None:
+        return None
+
+    def get_kv_event_publisher_config(self) -> None:
+        return None
+
+    def make_stats(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def get_request_counts(self) -> tuple[int, int]:
+        return (0, 0)
+
+    def get_kv_cache_usage(self) -> float:
+        return 0.0
+
+    def set_pause_state(self, pause_state: Any) -> None:
+        self.pause_state = pause_state
+
+    def reset_prefix_cache(self, *args: Any, **kwargs: Any) -> bool:
+        return True
+
+    def reset_encoder_cache(self) -> None:
         return None
 
     def shutdown(self) -> None:
