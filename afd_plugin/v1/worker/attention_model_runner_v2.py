@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from types import MethodType
+from typing import Any
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -411,8 +412,12 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
+        **native_kwargs: Any,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
+        # ``native_kwargs`` carries the arguments vLLM added after v0.26.0
+        # (v0.34.0: context_len, valid_dummy_state_slots, randomize_inputs)
+        # through to the native method untouched.
         step_afd_gpu_profiler(self.prof)
         with _use_afd_execution_context(
             self,
@@ -424,6 +429,7 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
                 dummy_run=dummy_run,
                 skip_attn_for_dummy_run=skip_attn_for_dummy_run,
                 is_profile=is_profile,
+                **native_kwargs,
             )
         # ### PATCH END: scope AFD metadata provider/replay and profiler step.
 

@@ -25,6 +25,10 @@ from vllm.model_executor.layers.fused_moe.router.router_factory import (
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models import deepseek_v2 as native
+from vllm.v1.attention.backends.mla.index_group import (
+    SparseMLAIndexGroupBuilder,
+    get_sparse_mla_index_group_max_rows,
+)
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
@@ -461,7 +465,7 @@ class AFDDeepseekV2RoutedFFNMoE(native.DeepseekV2MoE):
         # Gate and shared experts are Attention-owned in the routed layout.
         self.gate = None
         self.shared_experts = None
-        self.experts = fused_moe.FusedMoE(
+        self.experts = fused_moe.FusedMoEFactory(
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -520,6 +524,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
         # ### PATCH START: require an explicit AFD role before allocation.
         afd_config = parse_afd_config(vllm_config, validate=False)
@@ -602,6 +607,12 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                     else native.DeepseekV2Attention
                 )
             )
+            # Same as native v0.34.0: only the MLA attention takes the builder.
+            attn_kwargs = (
+                {"index_group_builder": index_group_builder}
+                if attn_cls is native.DeepseekV2MLAAttention
+                else {}
+            )
             self.self_attn = attn_cls(
                 vllm_config=vllm_config,
                 config=config,
@@ -618,6 +629,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 reduce_results=not self.use_sequence_parallel_moe,
+                **attn_kwargs,
             )
 
             if self.uses_remote_experts and self.routed:
@@ -671,7 +683,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 # so refresh that binding after platform initialization and before
                 # constructing the NPU FFN MoE.
                 if device_type == "npu":
-                    native.FusedMoE = fused_moe.FusedMoE
+                    native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 self.mlp = native.DeepseekV2MoE(
                     config=config,
                     parallel_config=parallel_config,
@@ -904,6 +916,14 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         else:
             topk_indices_buffer = None
         # ### PATCH END
+        index_group_builder = (
+            SparseMLAIndexGroupBuilder(
+                topk_indices_buffer,
+                get_sparse_mla_index_group_max_rows(vllm_config),
+            )
+            if topk_indices_buffer is not None
+            else None
+        )
 
         if native.get_pp_group().is_first_rank:
             self.embed_tokens = native.VocabParallelEmbedding(
@@ -922,10 +942,20 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                index_group_builder=index_group_builder,
             ),
             prefix=f"{prefix}.layers",
         )
         # ### PATCH END
+
+        # Read by the native load_weights (v0.34.0). AFD MoE modules never fuse
+        # the shared experts, so this resolves to the native policy for the
+        # native MoE modules of this role and to none for the AFD ones.
+        self.fused_shared_expert_layers = native.get_fused_shared_expert_layers(
+            self,
+            native.DeepseekV2MoE,
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
+        )
 
         if native.get_pp_group().is_last_rank:
             self.norm = native.RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
