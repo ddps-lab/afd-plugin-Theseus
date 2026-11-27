@@ -6,15 +6,11 @@ from __future__ import annotations
 
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.worker import gpu_model_runner as gpu_model_runner_v1
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 from vllm.v1.worker.gpu_worker import Worker
 
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.attention_model_runner import (
-    AFDAttentionModelRunner,
-    fail_if_unsupported_ubatching,
-)
+from afd_plugin.v1.worker.ubatch_checks import fail_if_unsupported_ubatching
 from afd_plugin.v1.worker.attention_model_runner_v2 import (
     AFDAttentionModelRunnerV2,
 )
@@ -69,7 +65,8 @@ class AFDAttentionWorker(Worker):
             caller="AFDAttentionWorker.init_device",
             expected_role="attention",
         )
-        if self.use_v2_model_runner:
+        # vLLM releases after 0.26 only ship the V2 runner and drop the flag.
+        if getattr(self, "use_v2_model_runner", True):
             validate_gpu_model_runner_v2_config(
                 self.vllm_config,
                 expected_role="attention",
@@ -78,6 +75,13 @@ class AFDAttentionWorker(Worker):
             afd_runner_cls = AFDAttentionModelRunnerV2
             native_runner_module = gpu_model_runner_v2
         else:
+            # Pre-V2 runner (vLLM 0.26 and earlier): imported only when asked for.
+            from vllm.v1.worker import gpu_model_runner as gpu_model_runner_v1
+
+            from afd_plugin.v1.worker.attention_model_runner import (
+                AFDAttentionModelRunner,
+            )
+
             fail_if_unsupported_ubatching(self.vllm_config)
             afd_runner_cls = AFDAttentionModelRunner
             native_runner_module = gpu_model_runner_v1

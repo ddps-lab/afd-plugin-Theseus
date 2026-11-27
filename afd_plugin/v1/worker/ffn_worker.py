@@ -15,7 +15,7 @@ from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.attention_model_runner import fail_if_unsupported_ubatching
+from afd_plugin.v1.worker.ubatch_checks import fail_if_unsupported_ubatching
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 from afd_plugin.validation import (
     assert_compatible_afd_stack,
@@ -77,7 +77,8 @@ class AFDFFNWorker(Worker):
             caller="AFDFFNWorker.init_device",
             expected_role="ffn",
         )
-        if self.use_v2_model_runner:
+        # vLLM releases after 0.26 only ship the V2 runner and drop the flag.
+        if getattr(self, "use_v2_model_runner", True):
             # ### PATCH START: construct the FFN runner through the V2 seam.
             validate_gpu_model_runner_v2_config(
                 self.vllm_config,

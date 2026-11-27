@@ -8,7 +8,13 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+try:
+    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+except ImportError:  # removed after vLLM 0.26; only the CUDA graph path used it
+
+    def set_cudagraph_capturing_enabled(enabled: bool) -> None:
+        return None
+
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config import update_config as update_vllm_config
 from vllm.distributed.parallel_state import get_world_group, graph_capture
@@ -31,9 +37,7 @@ from afd_plugin.connectors import (
     AFDControlPlane,
     AFDDPMetadata,
 )
-from afd_plugin.v1.worker.attention_model_runner import (
-    fail_if_unsupported_ubatching,
-)
+from afd_plugin.v1.worker.ubatch_checks import fail_if_unsupported_ubatching
 from afd_plugin.v1.worker.cuda_graph import (
     AFDGraphRunMode,
     graph_run_mode,
