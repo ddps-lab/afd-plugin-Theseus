@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any, Final
 
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import ROUTED_CONNECTORS, AFDConfig, parse_afd_config
 from afd_plugin.v1.worker.cuda_graph import (
     cudagraph_mode_name,
     validate_cuda_graph_mode,
@@ -48,14 +48,23 @@ def validate_gpu_model_runner_v2_config(
     """
 
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
-    if (
-        device_type != "cuda"
-        or afd_config.connector != "P2pNcclAFDConnector"
-        or afd_config.compute_gate_on_attention
-    ):
+    # Two synchronous connector families drive the runner through a control
+    # plane: the two-hop P2pNcclAFDConnector (gate on FFN) and the one-hop
+    # routed connectors (gate on Attention). The routed work is done by the
+    # model, the connector and GPUFFNModelRunner, not by the Attention runner.
+    two_hop = (
+        afd_config.connector == "P2pNcclAFDConnector"
+        and not afd_config.compute_gate_on_attention
+    )
+    one_hop = (
+        afd_config.connector in ROUTED_CONNECTORS
+        and afd_config.compute_gate_on_attention
+    )
+    if device_type != "cuda" or not (two_hop or one_hop):
         raise RuntimeError(
-            "AFD ModelRunnerV2 requires CUDA, synchronous P2pNcclAFDConnector, and "
-            "compute_gate_on_attention=false",
+            "AFD ModelRunnerV2 requires CUDA and either the synchronous "
+            "P2pNcclAFDConnector with compute_gate_on_attention=false or a "
+            "routed connector with compute_gate_on_attention=true",
         )
 
     parallel = vllm_config.parallel_config
@@ -77,15 +86,18 @@ def validate_gpu_model_runner_v2_config(
             f"AFD ModelRunnerV2 {expected_role} ranks must match DP * TP: "
             f"configured={configured_ranks}, distributed={distributed_ranks}",
         )
+    # Read optional switches with a default: vLLM releases add and drop them
+    # (v0.34.0 has no pass_config.enable_sp).
+    pass_config = vllm_config.compilation_config.pass_config
     if (
         not parallel.enable_expert_parallel
-        or parallel.enable_elastic_ep
-        or parallel.enable_eplb
-        or parallel.use_sequence_parallel_moe
-        or vllm_config.compilation_config.pass_config.enable_sp
+        or getattr(parallel, "enable_elastic_ep", False)
+        or getattr(parallel, "enable_eplb", False)
+        or getattr(parallel, "use_sequence_parallel_moe", False)
+        or getattr(pass_config, "enable_sp", False)
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
-    if parallel.enable_dbo or parallel.use_ubatching:
+    if getattr(parallel, "enable_dbo", False) or getattr(parallel, "use_ubatching", False):
         raise RuntimeError("AFD ModelRunnerV2 does not support DBO or ubatching")
 
     # Keep importing this CPU-safe validation module independent of the vLLM
