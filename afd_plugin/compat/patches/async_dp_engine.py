@@ -43,7 +43,10 @@ from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.core_client import DPAsyncMPClient
 
-from afd_plugin.compat.vllm import TARGET_VLLM_VERSION
+from afd_plugin.compat.vllm import (
+    PINNED_DP_COORDINATOR_VLLM_VERSION,
+    TARGET_VLLM_VERSION,
+)
 from afd_plugin.config import is_afd_async_dp, parse_optional_afd_config
 
 if TYPE_CHECKING:
@@ -65,21 +68,20 @@ if TYPE_CHECKING:
 # Patch functionality: keep upstream startup flow while selecting EngineCoreProc
 # for AFD async Attention configs.
 # Signature: matches upstream; no added parameters.
-def run_engine_core(
-    *args,
-    dp_rank: int = 0,
-    local_dp_rank: int = 0,
-    **kwargs,
-):
-    """Replace MoE DP proc selection for AFD async Attention engines."""
+def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
+    """Launch EngineCore busy loop in background process."""
+    vllm_config: VllmConfig = kwargs["vllm_config"]
+    if logging_config := getattr(vllm_config, "logging_config", None):
+        engine_core_module.configure_logging(logging_config)
 
+    # Ensure we can serialize transformer config after spawning
     engine_core_module.maybe_register_config_serialize_by_value()
 
-    engine_core = None
-    signal_callback = None
+    engine_core: EngineCoreProc | None = None
+    signal_callback: SignalCallback | None = None
+    clean_shutdown = False
     try:
-        vllm_config = kwargs["vllm_config"]
-        parallel_config = vllm_config.parallel_config
+        parallel_config: ParallelConfig = vllm_config.parallel_config
         data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
         if data_parallel:
             parallel_config.data_parallel_rank_local = local_dp_rank
@@ -87,16 +89,14 @@ def run_engine_core(
         else:
             process_title = "EngineCore"
         engine_core_module.set_process_title(process_title)
-        engine_core_module.maybe_init_worker_tracer(
-            "vllm.engine_core",
-            "engine_core",
-            process_title,
-        )
+        engine_core_module.maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
         engine_core_module.decorate_logs()
         if parallel_config.numa_bind:
             engine_core_module.numa_utils.log_current_affinity_state(process_title)
 
         if data_parallel and vllm_config.kv_transfer_config is not None:
+            # modify the engine_id and append the dp_rank to it to ensure
+            # that the kv_transfer_config is unique for each DP rank.
             vllm_config.kv_transfer_config.engine_id = (
                 f"{vllm_config.kv_transfer_config.engine_id}_dp{dp_rank}"
             )
@@ -105,8 +105,55 @@ def run_engine_core(
                 vllm_config.kv_transfer_config.engine_id,
             )
 
+        # declare engine core as None and register signal handler before
+        # engine_core initialization in case engine core process is terminated
+        # in the middle of initialization. For example, frontend process exits
+        # unexpectedly, if signal handler is not registered, engine core process
+        # will use default signal handler which will terminate the process
+        # silently. If engine core model executor has been initialized, it will
+        # not be terminated asap. Register signal handler early and only log a
+        # message will make engine core process alive. engine core process and
+        # its subprocesses(model executor processes) will be force killed in
+        # CoreEngineProcManager.shutdown.
+        engine_core = None
+        # A termination signal can arrive while engine_core is still being
+        # constructed. At that point the request cannot be recorded on
+        # engine_core, so keep it in its own flag and apply it later.
+        shutdown_requested = False
+
+        def wakeup_engine():
+            # Wakes up idle engine via input_queue when shutdown is requested
+            # Not safe in a signal handler - we may interrupt the main thread
+            # while it is holding the non-reentrant input_queue.mutex
+            assert engine_core is not None
+            engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+        def signal_handler(signum, frame):
+            nonlocal shutdown_requested
+            signal_name = engine_core_module.signal.Signals(signum).name
+            engine_core_module.logger.info(
+                "[shutdown] EngineCore: trigger received signal=%s",
+                signal_name,
+            )
+            if signum == engine_core_module.signal.SIGTERM:
+                engine_core_module.get_watch_dog().handle_failure(signal_name)
+            # Record the request first so it survives the construction window.
+            shutdown_requested = True
+            if engine_core is not None:
+                engine_core.shutdown_state = engine_core_module.EngineShutdownState.REQUESTED
+            # signal_callback is armed only after engine_core exists. Don't
+            # trigger it earlier: it is one-shot, and a wakeup cannot be
+            # delivered while there is no input_queue to wake.
+            # For more info: https://github.com/vllm-project/vllm/pull/52299#pullrequestreview-5370255271
+            if signal_callback is not None:
+                signal_callback.trigger()
+
+        engine_core_module.signal.signal(engine_core_module.signal.SIGTERM, signal_handler)
+        engine_core_module.signal.signal(engine_core_module.signal.SIGINT, signal_handler)
+
         parallel_config.data_parallel_index = dp_rank
         if data_parallel and vllm_config.model_config.is_moe:
+            # Set data parallel rank for this engine process.
             parallel_config.data_parallel_rank = dp_rank
             # ### PATCH START: AFD async-DP Attention engine selection
             # Async-DP Attention ranks are connector-driven, so use the regular
@@ -118,66 +165,59 @@ def run_engine_core(
                 engine_core = engine_core_module.DPEngineCoreProc(*args, **kwargs)
             # ### PATCH END: AFD async-DP Attention engine selection
         else:
-            parallel_config.data_parallel_size = 1
-            parallel_config.data_parallel_size_local = 1
-            parallel_config.data_parallel_rank = 0
+            # Non-MoE DP ranks are completely independent, so treat like DP=1.
+            # Note that parallel_config.data_parallel_index will still reflect
+            # the original DP rank.
+            parallel_config.reconfigure_for_independent_dp_rank()
             engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
         assert engine_core is not None
 
-        def wakeup_engine() -> None:
-            # Wakes up idle engine via input_queue when shutdown is requested
-            # Not safe in a signal handler - we may interrupt the main thread
-            # while it is holding the non-reentrant input_queue.mutex
-            engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+        # Apply a signal received during construction before entering the
+        # loop. run_busy_loop calls _handle_shutdown first, so the loop exits
+        # right away instead of blocking on an idle input_queue.
+        if shutdown_requested:
+            engine_core.shutdown_state = engine_core_module.EngineShutdownState.REQUESTED
 
+        # Arm the wakeup callback only now that input_queue exists, so a
+        # later signal can still wake an idle busy loop.
         signal_callback = engine_core_module.SignalCallback(wakeup_engine)
 
-        def signal_handler(signum, frame):
-            signal_name = engine_core_module.signal.Signals(signum).name
-            engine_core_module.logger.info(
-                "[shutdown] EngineCore: trigger received signal=%s",
-                signal_name,
-            )
-            engine_core.shutdown_state = (
-                engine_core_module.EngineShutdownState.REQUESTED
-            )
-            signal_callback.trigger()
-
-        engine_core_module.signal.signal(
-            engine_core_module.signal.SIGTERM,
-            signal_handler,
-        )
-        engine_core_module.signal.signal(
-            engine_core_module.signal.SIGINT,
-            signal_handler,
-        )
-
+        engine_core_module.start_watch_dog(f"engine_{dp_rank}", vllm_config.watchdog_config, engine_core_module.logger)
         engine_core.run_busy_loop()
 
-    except SystemExit:
+    except SystemExit as e:
         engine_core_module.logger.info_once("[shutdown] EngineCore: exiting busy loop")
+        clean_shutdown = (
+            e.code in (None, 0)
+            and engine_core is not None
+            and engine_core.shutdown_state == engine_core_module.EngineShutdownState.SHUTTING_DOWN
+            and not engine_core.has_work()
+            and engine_core.vllm_config.shutdown_timeout == 0
+        )
         raise
-    except Exception as exc:
+    except Exception as e:
         if engine_core is None:
             engine_core_module.logger.exception("EngineCore failed to start.")
         else:
             engine_core_module.logger.exception("EngineCore encountered a fatal error.")
             engine_core._send_engine_dead()
-        raise exc
+        raise e
     finally:
-        engine_core_module.signal.signal(
-            engine_core_module.signal.SIGTERM,
-            engine_core_module.signal.SIG_DFL,
-        )
-        engine_core_module.signal.signal(
-            engine_core_module.signal.SIGINT,
-            engine_core_module.signal.SIG_DFL,
-        )
+        engine_core_module.signal.signal(engine_core_module.signal.SIGTERM, engine_core_module.signal.SIG_DFL)
+        engine_core_module.signal.signal(engine_core_module.signal.SIGINT, engine_core_module.signal.SIG_DFL)
         if signal_callback is not None:
             signal_callback.stop()
         if engine_core is not None:
             engine_core.shutdown()
+        if clean_shutdown:
+            from vllm.platforms import current_platform
+
+            if current_platform.is_rocm():
+                # Cleanup above already unfreezes and collects the heap.
+                # Freeze the surviving graph to skip another slow cyclic-GC
+                # scan during finalization; process exit reclaims it.
+                engine_core_module.gc.freeze()
 
 
 # Patch reason: vLLM enables MoE DP wave coordination when launching DP cores,
@@ -191,17 +231,8 @@ def launch_core_engines(
     executor_class: type[Executor],
     log_stats: bool,
     addresses: EngineZmqAddresses,
-    num_api_servers: int = 1,
-) -> Iterator[
-    tuple[
-        CoreEngineProcManager | CoreEngineActorManager | None,
-        DPCoordinator | None,
-        EngineZmqAddresses,
-        Queue | None,
-    ]
-]:
-    """Disable coordinator wave mode while launching AFD async-DP engines."""
-
+) -> Iterator[CoreEngineLaunch]:
+    """Launch engine and DP coordinator processes as needed."""
     parallel_config = vllm_config.parallel_config
     dp_size = parallel_config.data_parallel_size
     local_engine_count = parallel_config.data_parallel_size_local
@@ -212,14 +243,47 @@ def launch_core_engines(
 
     offline_mode = local_start_index is not None
 
+    # Create a single tensor IPC queue for sharing multimodal tensors between
+    # API servers and engine core. Returns a single queue since we only support
+    # DP=1 for this data flow.
     tensor_queue: Queue | None = None
     multimodal_config = vllm_config.model_config.multimodal_config
     if multimodal_config is not None and multimodal_config.mm_tensor_ipc == "torch_shm":
         tensor_queue = engine_utils_module.get_mp_context().Queue()
 
+    # Run the DP Coordinator process with rank 0 when in online DP mode.
+    # The coordinator is needed for:
+    # 1. Internal/hybrid LB: collecting and publishing queue stats for load balancing
+    # 2. MoE models: wave coordination in addition to stats
     run_coordinator = (
         vllm_config.needs_dp_coordinator and not offline_mode and dp_rank == 0
     )
+
+    coord_store = None
+
+    create_coord_store = (
+        parallel_config.enable_elastic_ep
+        and parallel_config.data_parallel_backend != "ray"
+        and dp_rank == 0
+        and not parallel_config._coord_store_port
+    )
+
+    if create_coord_store:
+        from vllm.distributed.utils import create_tcp_store
+
+        coord_store = create_tcp_store(
+            host,
+            0,
+            is_master=True,
+            world_size=-1,
+            wait_for_workers=False,
+        )
+        parallel_config._coord_store_port = coord_store.port
+        engine_utils_module.logger.info(
+            "Created Elastic EP coordination TCPStore on %s:%d",
+            host,
+            coord_store.port,
+        )
 
     if run_coordinator:
         coordinator = engine_utils_module.DPCoordinator(
@@ -231,6 +295,7 @@ def launch_core_engines(
                 vllm_config.model_config.is_moe and not is_afd_async_dp(vllm_config)
             ),
             # ### PATCH END: AFD async-DP coordinator wave mode
+            logging_config=vllm_config.logging_config,
         )
 
         addresses.coordinator_input, addresses.coordinator_output = (
@@ -240,12 +305,27 @@ def launch_core_engines(
             coordinator.get_stats_publish_address()
         )
 
-        engine_utils_module.logger.info(
-            "Started DP Coordinator process (PID: %d)",
-            coordinator.proc.pid,
-        )
+        engine_utils_module.logger.info("Started DP Coordinator process (PID: %d)", coordinator.proc.pid)
+        if coord_store is not None:
+            coordinator._coord_store = coord_store
     else:
         coordinator = None
+
+    # Hold a coordination TCPStore (alive for this frame) so engines pick DP
+    # master ports at bind time; pre-allocated ports can be taken before use.
+    if (
+        dp_size > 1
+        and not offline_mode
+        and dp_rank == 0
+        and local_engine_count > 0
+        and not parallel_config.enable_elastic_ep
+    ):
+        from vllm.distributed.utils import create_tcp_store
+
+        coord_store = create_tcp_store(
+            host, 0, is_master=True, world_size=-1, wait_for_workers=False
+        )
+        parallel_config._coord_store_port = coord_store.port
 
     if parallel_config.data_parallel_backend == "ray":
         engine_utils_module.logger.info("Starting ray-based data parallel backend")
@@ -257,20 +337,24 @@ def launch_core_engines(
             log_stats=log_stats,
         )
 
-        yield engine_actor_manager, coordinator, addresses, tensor_queue
+        yield engine_utils_module.CoreEngineLaunch(
+            engine_actor_manager, coordinator, addresses, tensor_queue
+        )
         return
 
     if offline_mode:
         assert local_engine_count == 1
-        engines_to_handshake = [
-            engine_utils_module.CoreEngine(index=dp_rank, local=True),
-        ]
+        engines_to_handshake = [engine_utils_module.CoreEngine(index=dp_rank, local=True)]
     elif dp_rank == 0:
+        # Rank 0 holds Coordinator, so it handshakes with all Cores
+        # in both external dplb and internal dplb mode.
+        # Note this also covers the case where we have zero local engines
+        # and rank 0 is headless.
         engines_to_handshake = [
-            engine_utils_module.CoreEngine(index=i, local=(i < local_engine_count))
-            for i in range(dp_size)
+            engine_utils_module.CoreEngine(index=i, local=(i < local_engine_count)) for i in range(dp_size)
         ]
     else:
+        # Rank > 0 handshakes with just the local cores it is managing.
         assert local_engines_only, (
             "Attempting to launch core_engines from dp_rank > 0, but "
             "found internal DPLB, which is incompatible."
@@ -280,17 +364,20 @@ def launch_core_engines(
             for i in range(dp_rank, dp_rank + local_engine_count)
         ]
 
+    # Whether the started engines will handshake only with co-located
+    # front-end processes. In external_dp_lb mode, ranks > 0 handshake with
+    # their co-located frontend and also the rank 0 front-end, and hence this
+    # will be False.
     handshake_local_only = offline_mode or local_engine_count == dp_size
+
+    # NOTE(yongji): handling scaling from intra-node to inter-node
     if parallel_config.enable_elastic_ep:
         handshake_local_only = False
 
-    rpc_port = (
-        parallel_config.data_parallel_rpc_port or engine_utils_module.get_open_port()
-    )
     handshake_address = engine_utils_module.get_engine_client_zmq_addr(
         handshake_local_only,
         host,
-        rpc_port,
+        parallel_config.data_parallel_rpc_port,
     )
 
     if local_engines_only and dp_rank > 0:
@@ -302,10 +389,9 @@ def launch_core_engines(
         client_handshake_address = None
 
     with engine_utils_module.zmq_socket_ctx(
-        local_handshake_address,
-        engine_utils_module.zmq.ROUTER,
-        bind=True,
+        local_handshake_address, engine_utils_module.zmq.ROUTER, bind=True
     ) as handshake_socket:
+        # Start local engines.
         if local_engine_count:
             local_engine_manager = engine_utils_module.CoreEngineProcManager(
                 vllm_config=vllm_config,
@@ -322,17 +408,24 @@ def launch_core_engines(
         else:
             local_engine_manager = None
 
-        yield local_engine_manager, coordinator, addresses, tensor_queue
+        if (
+            coord_store is not None
+            and coordinator is None
+            and (local_engine_manager is not None)
+        ):
+            local_engine_manager._coord_store = coord_store
 
+        launch = engine_utils_module.CoreEngineLaunch(
+            local_engine_manager, coordinator, addresses, tensor_queue
+        )
+        yield launch
         engine_utils_module.wait_for_engine_startup(
             handshake_socket,
-            addresses,
             engines_to_handshake,
             parallel_config,
             dp_size > 1 and vllm_config.model_config.is_moe,
             vllm_config.cache_config,
-            local_engine_manager,
-            coordinator.proc if coordinator else None,
+            launch,
         )
 
 
@@ -663,33 +756,17 @@ def process_input_socket(
 # Patch functionality: preserve request routing and stats updates while skipping
 # FIRST_REQ for AFD async-DP configs.
 # Signature: matches upstream; no added parameters.
-async def add_request_async(
-    self,
-    request: EngineCoreRequest,
-) -> None:
-    """Skip the DP wave ``FIRST_REQ`` notification for AFD async-DP."""
-
+async def add_request_async(self, request: EngineCoreRequest) -> None:
     self._ensure_stats_update_task()
 
     request.current_wave = self.current_wave
     request.client_index = self.client_index
 
+    # The engine that receives it wakes the other ranks if they are idle.
     chosen_engine = self.get_core_engine_for_request(request)
-    to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
-    # ### PATCH START: AFD async-DP request wakeup
-    # Async-DP engines step independently, so skip the coordinator FIRST_REQ
-    # wakeup while preserving normal routing.
-    if not self.engines_running and not is_afd_async_dp(self.vllm_config):
-        req_msg = core_client_module.msgspec.msgpack.encode(
-            ("FIRST_REQ", chosen_engine),
-        )
-        await self.first_req_send_socket.send(req_msg)
-    # ### PATCH END: AFD async-DP request wakeup
+    request = core_client_module._with_packed_prompt(request)
+    await self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
 
-    await to_await
-
-    # The output queue task delivers completed responses and is independent of
-    # the DP-wave FIRST_REQ coordination skipped above.
     self._ensure_output_queue_task()
 
 
@@ -711,7 +788,7 @@ def _should_patch_pinned_dp_coordinator() -> bool:
         version_text = str(vllm.__version__)
     except (AttributeError, ImportError):
         return False
-    return version_text == TARGET_VLLM_VERSION
+    return version_text == PINNED_DP_COORDINATOR_VLLM_VERSION
 
 
 def _is_target_vllm_compatible() -> bool:

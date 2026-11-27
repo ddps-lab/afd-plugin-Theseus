@@ -9,7 +9,10 @@ import warnings
 from importlib.metadata import PackageNotFoundError, version
 from typing import Final
 
-TARGET_VLLM_VERSION: Final[str] = "0.26.0"
+TARGET_VLLM_VERSION: Final[str] = "0.34.0"
+# The copied DP coordinator (compat/patches/async_dp_engine.py) is still the
+# v0.26.0 one; on other releases the native coordinator stays in place.
+PINNED_DP_COORDINATOR_VLLM_VERSION: Final[str] = "0.26.0"
 
 
 def _parse_release(value: str) -> tuple[int, int, int]:
@@ -51,6 +54,7 @@ def assert_vllm_version_supported(*, strict: bool = True) -> None:
 
 
 __all__ = [
+    "PINNED_DP_COORDINATOR_VLLM_VERSION",
     "TARGET_VLLM_VERSION",
     "assert_vllm_version_supported",
     "get_installed_vllm_version",

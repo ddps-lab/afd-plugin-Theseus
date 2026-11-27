@@ -124,13 +124,9 @@ def set_forward_context(
         )
     # ### PATCH END: AFD async-DP forward context metadata
 
-    # Convenience: if cudagraph is used and num_tokens is given, we can just
-    # create a batch descriptor here if not given (there's no harm since if it
-    # doesn't match in the wrapper it'll fall through).
-    if cudagraph_runtime_mode != CUDAGraphMode.NONE and num_tokens is not None:
-        batch_descriptor = batch_descriptor or forward_context_module.BatchDescriptor(
-            num_tokens=num_tokens,
-        )
+    # Preserve the batch size before model-level sequence parallelism.
+    if num_tokens is not None:
+        batch_descriptor = batch_descriptor or forward_context_module.BatchDescriptor(num_tokens=num_tokens)
 
     additional_kwargs = (
         forward_context_module.current_platform.set_additional_forward_context(

@@ -76,6 +76,8 @@ def __init__(
         )
 
     self.log_stats = log_stats
+    # Opaque weight version supplied by the caller.
+    self._weight_version = "default"
 
     # Setup Model.
     self.model_executor = executor_class(vllm_config)
@@ -87,6 +89,8 @@ def __init__(
 
     if core_module.envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
         self._eep_scale_up_before_kv_init()
+
+    core_module.measure_encoder_output_widths(vllm_config, self.collective_rpc)
 
     # Setup KV Caches and update CacheConfig after profiling.
     kv_cache_config = self._initialize_kv_caches(vllm_config)
@@ -118,36 +122,20 @@ def __init__(
         block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
     )
+    self._initialize_effective_attention_block_size()
     self.use_spec_decode = vllm_config.speculative_config is not None
     self.check_for_draft_tokens = (
         self.use_spec_decode or vllm_config.model_config.is_diffusion
     )
     if self.scheduler.connector is not None:  # type: ignore
         self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
+    if self.scheduler.ec_connector is not None:  # type: ignore
+        self.model_executor.init_ec_output_aggregator()
 
-    mm_registry = core_module.MULTIMODAL_REGISTRY
-    self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(vllm_config)
+    self.mm_receiver_cache = core_module.engine_receiver_cache_from_config(vllm_config)
 
-    # If a KV connector is initialized for scheduler, we want to collect
-    # handshake metadata from all workers so the connector in the scheduler
-    # will have the full context
     kv_connector = self.scheduler.get_kv_connector()
-    if kv_connector is not None:
-        # Collect and store KV connector xfer metadata from workers
-        # (after KV cache registration)
-        xfer_handshake_metadata = (
-            self.model_executor.get_kv_connector_handshake_metadata()
-        )
-
-        if xfer_handshake_metadata:
-            # xfer_handshake_metadata is list of dicts from workers
-            # Each dict already has structure {(pp_rank, tp_rank): metadata}
-            # Merge all worker dicts into a single dict
-            content: dict[tuple[int, int], Any] = {}
-            for worker_dict in xfer_handshake_metadata:
-                if worker_dict is not None:
-                    content.update(worker_dict)
-            kv_connector.set_xfer_handshake_metadata_pp_aware(content)
+    self._set_kv_connector_handshake_metadata()
 
     # Setup batch queue for pipeline parallelism.
     # Batch queue for scheduled batches. This enables us to asynchronously
@@ -162,13 +150,12 @@ def __init__(
         )
         self.batch_queue = deque(maxlen=self.batch_queue_size)
 
-    self.is_ec_consumer = (
-        vllm_config.ec_transfer_config is None
-        or vllm_config.ec_transfer_config.is_ec_consumer
-    )
+    self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
     self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
-    self.request_block_hasher = None
+    self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
+    # Lets frontends hash prompt blocks; see EngineCoreRequest.block_hashes.
+    self.prefix_hash_config: PrefixHashConfig | None = None
     if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
         caching_hash_fn = core_module.get_hash_fn_by_name(
             vllm_config.cache_config.prefix_caching_hash_algo
@@ -178,6 +165,13 @@ def __init__(
         self.request_block_hasher = core_module.get_request_block_hasher(
             hash_block_size,
             caching_hash_fn,
+            vllm_config.num_hash_lookahead_tokens,
+        )
+        self.prefix_hash_config = core_module.PrefixHashConfig(
+            hash_algo=vllm_config.cache_config.prefix_caching_hash_algo,
+            hash_block_size=hash_block_size,
+            none_hash=core_module.kv_cache_utils.NONE_HASH,
+            num_lookahead_tokens=vllm_config.num_hash_lookahead_tokens,
         )
 
     self.step_fn = self.step if self.batch_queue is None else self.step_with_batch_queue
@@ -271,6 +265,28 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
             )
             vllm_config.cache_config.enable_prefix_caching = False
 
+    # Resolve the KV cache layout before memory profiling: workers that
+    # capture full cudagraphs initialize a minimal KV cache during it.
+    # Attention-free models resolve the default so layout reads never precede
+    # resolution.
+    if vllm_config.cache_config.enable_extensible_kv_cache:
+        # Disable it, everywhere, where it cannot be used.
+        executor = self.model_executor
+        reason = executor.extensible_kv_cache_unsupported_reason(kv_cache_specs)
+        if reason is not None:
+            executor.disable_extensible_kv_cache(reason)
+    layout = core_module.resolve_kv_cache_layout(
+        vllm_config,
+        self.model_executor.get_supported_kv_cache_layouts(),
+        [s for specs in kv_cache_specs for s in specs.values()],
+    )
+
+    global_kv_cache_groups = core_module.get_global_kv_cache_groups(vllm_config, kv_cache_specs)
+    vllm_config.adjust_dcp_kv_cache_interleave_size(global_kv_cache_groups)
+    self.model_executor.set_kv_cache_layout(
+        layout.name, vllm_config.parallel_config.cp_kv_cache_interleave_size
+    )
+
     has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
     if has_kv_cache:
         if core_module.envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
@@ -295,8 +311,10 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     max_model_len_before = vllm_config.model_config.max_model_len
 
     kv_cache_configs = core_module.get_kv_cache_configs(
-        vllm_config, kv_cache_specs, available_gpu_memory
+        vllm_config, kv_cache_specs, available_gpu_memory, global_kv_cache_groups
     )
+    for kv_cache_config in kv_cache_configs:
+        kv_cache_config.kv_cache_layout = vllm_config.cache_config.kv_cache_layout
 
     # If auto-fit reduced max_model_len, sync the new value to workers.
     # This is needed because workers were spawned before memory profiling
@@ -311,20 +329,76 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
     kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
     if kv_cache_groups:
+        # Exclude groups that opt out of prefix caching (e.g. a circular
+        # buffer, a 1-block/req scratch buffer with a small ring block):
+        # their small block_size would otherwise drag the global block_size
+        # below the real allocator block size and desync it from mamba.
+        participating = [
+            g.kv_cache_spec.block_size
+            for g in kv_cache_groups
+            if g.kv_cache_spec.prefix_cacheable
+        ]
         vllm_config.cache_config.block_size = min(
-            g.kv_cache_spec.block_size for g in kv_cache_groups
+            participating
+            if participating
+            else [g.kv_cache_spec.block_size for g in kv_cache_groups]
         )
-        num_tokens, max_concurrency = core_module.get_kv_cache_capacity(
-            vllm_config,
-            scheduler_kv_cache_config,
-        )
-        vllm_config.cache_config.kv_cache_size_tokens = num_tokens
-        vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
+    # With an extensible KV cache, `num_blocks` is the reserved capacity
+    # until the post-warmup measurement below.
+    extensible = vllm_config.cache_config.enable_extensible_kv_cache
+    if kv_cache_groups and not extensible:
+        core_module.update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
 
     vllm_config.validate_block_size()
 
-    # Initialize kv cache and warmup the execution
+    scheduler_block_size, hash_block_size = core_module.resolve_kv_cache_block_sizes(
+        scheduler_kv_cache_config, vllm_config
+    )
+    cache_hit_alignment_tokens = core_module.resolve_cache_hit_alignment_tokens(
+        scheduler_kv_cache_config,
+        vllm_config,
+        scheduler_block_size,
+        hash_block_size,
+    )
+    # The scheduler's config is a deep copy taken before these are resolved,
+    # so set them there too: the KV connector's scheduler side reads the same
+    # fields as its workers.
+    for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
+        kv_cache_config.hash_block_size = hash_block_size
+        kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+
     self.model_executor.initialize_from_config(kv_cache_configs)
+    compilation_times = []
+    if not core_module.envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+        compilation_times = self.model_executor.compile_or_warm_up_model()
+    if extensible:
+        num_blocks = core_module.finalize_extensible_kv_cache(
+            vllm_config,
+            kv_cache_configs,
+            scheduler_kv_cache_config,
+            compilation_times,
+        )
+        max_model_len = vllm_config.model_config.max_model_len
+        if max_model_len != max_model_len_after:
+            self.collective_rpc("update_max_model_len", args=(max_model_len,))
+        self.model_executor.extend_kv_cache(num_blocks)
+    # Under the extensible KV cache, workers create the connector in
+    # `extend_kv_cache`, so ask for its block count only afterwards.
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if (
+        kv_transfer_config is not None
+        and kv_transfer_config.has_connector("SimpleCPUOffloadConnector")
+        and vllm_config.cache_config.enable_prefix_caching
+    ):
+        aligned_num_cpu_blocks = (
+            self.model_executor.get_simple_cpu_offload_num_blocks()
+        )
+        assert aligned_num_cpu_blocks is not None, (
+            "SimpleCPUOffloadConnector workers must report their block count"
+        )
+        vllm_config.cache_config.simple_cpu_offload_num_blocks = (
+            aligned_num_cpu_blocks
+        )
 
     elapsed = time.time() - start
     compile_time = vllm_config.compilation_config.compilation_time
@@ -360,6 +434,7 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
 # count publication to the independent async Attention loop while preserving the
 # target upstream tag's normal busy loops for all other engines.
 # Signature: matches upstream; no added parameters.
+@core_module.fault_tolerant_wrapper
 def run_busy_loop(self):
     # ### PATCH START: AFD FFN connector busy loop
     # FFN ranks run the connector server loop and poll worker-side failures
@@ -450,8 +525,11 @@ def run_busy_loop(self):
     while self._handle_shutdown():
         # 1) Poll the input queue until there is work to do.
         self._process_input_queue()
+        # Publish request counts before and after GPU step to ensure freshness.
+        self._maybe_publish_request_counts()
         # 2) Step the engine core and return the outputs.
         self._process_engine_step()
+        self._maybe_publish_request_counts()
 
     raise SystemExit
 
