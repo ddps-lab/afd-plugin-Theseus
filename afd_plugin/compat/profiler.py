@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 from dataclasses import dataclass
@@ -113,7 +114,8 @@ class TriggeredProfiler:
             ):
                 self._finish_window()
         elif os.path.exists(self.trigger):
-            if self.windows > 0 and self._factory is not None:
+            if self.profiler is None or (self.windows > 0 and self._factory is not None):
+                assert self._factory is not None
                 self.profiler = self._factory()
             self.profiler.start()
             self.started = True
@@ -131,6 +133,13 @@ class TriggeredProfiler:
         # last step; stop() only releases the profiler.
         self.profiler.stop()
         self.started = False
+        if self._factory is not None:
+            # Free the finished profiler now, while no profiler session is
+            # active. Left to the cyclic garbage collector it is freed at an
+            # arbitrary later step, which can crash in libkineto once the next
+            # session has been started.
+            self.profiler = None  # type: ignore[assignment]
+            gc.collect()
         try:
             os.remove(self.trigger)
         except FileNotFoundError:
@@ -145,7 +154,7 @@ class TriggeredProfiler:
         )
 
     def stop(self) -> None:
-        if self.started:
+        if self.started and self.profiler is not None:
             self.profiler.stop()
             self.started = False
 
