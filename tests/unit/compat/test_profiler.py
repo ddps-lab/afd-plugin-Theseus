@@ -25,6 +25,7 @@ _ENV_NAMES = (
     "AFD_GPU_ATTENTION_PROFILER_SKIP_FIRST",
     "AFD_GPU_ATTENTION_PROFILER_DIR",
     "AFD_GPU_ATTENTION_PROFILER_TRIGGER",
+    "AFD_GPU_ATTENTION_PROFILER_ALL_THREADS",
     "AFD_GPU_FFN_PROFILER_ENABLE",
     "AFD_GPU_FFN_PROFILER_WAIT",
     "AFD_GPU_FFN_PROFILER_WARMUP",
@@ -33,6 +34,7 @@ _ENV_NAMES = (
     "AFD_GPU_FFN_PROFILER_SKIP_FIRST",
     "AFD_GPU_FFN_PROFILER_DIR",
     "AFD_GPU_FFN_PROFILER_TRIGGER",
+    "AFD_GPU_FFN_PROFILER_ALL_THREADS",
     "VLLM_TORCH_PROFILER_DIR",
 )
 
@@ -105,6 +107,23 @@ def test_create_gpu_profiler_uses_configured_schedule(monkeypatch):
         "profile_all_threads": True,
     }
     assert profiler_module.trace_dir == "/tmp/afd-ffn"
+
+
+def test_gpu_profiler_can_record_the_starting_thread_only(monkeypatch):
+    profiler_module = _FakeTorchProfiler()
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(profiler=profiler_module),
+    )
+    monkeypatch.setenv("AFD_GPU_ATTENTION_PROFILER_ENABLE", "1")
+    monkeypatch.setenv("AFD_GPU_ATTENTION_PROFILER_ALL_THREADS", "0")
+
+    assert afd_gpu_profiler_config("attention").all_threads is False
+    assert afd_gpu_profiler_config("ffn").all_threads is True
+    create_afd_gpu_profiler("attention")
+
+    assert profiler_module.profile_kwargs["experimental_config"] is None
 
 
 def test_triggered_gpu_profiler_starts_when_trigger_file_exists(monkeypatch, tmp_path):

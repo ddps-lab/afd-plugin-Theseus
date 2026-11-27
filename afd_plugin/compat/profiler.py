@@ -46,6 +46,8 @@ class AFDGPUProfilerConfig:
     # When set, the profiler (and its wait/warmup/active schedule) starts at
     # the first step on which this file exists instead of at runner init.
     trigger: str | None = None
+    # Record ops of every thread, not only the one that starts the profiler.
+    all_threads: bool = True
 
 
 def afd_gpu_profiler_config(role: AFDGPUProfilerRole) -> AFDGPUProfilerConfig:
@@ -64,6 +66,7 @@ def afd_gpu_profiler_config(role: AFDGPUProfilerRole) -> AFDGPUProfilerConfig:
         ),
         trace_dir=_env_dir(f"{prefix}_DIR", default=_DEFAULT_DIR[role]),
         trigger=os.getenv(f"{prefix}_TRIGGER") or None,
+        all_threads=_env_bool(f"{prefix}_ALL_THREADS", default=True),
     )
 
 
@@ -188,8 +191,12 @@ def create_afd_gpu_profiler(
             # vLLM DBO runs each micro-batch on its own Python thread, started
             # per forward; by default the profiler records ops of the starting
             # thread only, so the micro-batches' ranges and ops would be missing.
-            experimental_config=torch.profiler._ExperimentalConfig(
-                profile_all_threads=True,
+            # <prefix>_ALL_THREADS=0 records the starting thread only, as a
+            # stock vLLM torch profiler does.
+            experimental_config=(
+                torch.profiler._ExperimentalConfig(profile_all_threads=True)
+                if config.all_threads
+                else None
             ),
         )
 
